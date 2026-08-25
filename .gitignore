@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# build outputs
+out/
+dist/
+release/
+
+# caches / tooling
+*.tsbuildinfo
+.vite/
+coverage/
+
+# data archives — owner exports & test fixtures are DATA, never source
+*.dropsync
+test-archives/
+
+# env & secrets (defensive; none expected in this project)
+.env
+.env.*
+*.local
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
+npm-debug.log*
