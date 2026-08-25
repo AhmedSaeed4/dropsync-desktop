@@ -3400,8 +3400,9 @@ function createWindow(): void {
             try {
               const win = mainWindow;
               if (!win || !cloudCtl) throw new Error('window/controller gone');
+              const memTarget = process.env.DROPSYNC_CLOUD_DEV_MEM === 'local' ? 'local' : 'cloud';
               await win.webContents.executeJavaScript(
-                "localStorage.setItem('dropsync.mode.last','cloud')"
+                `localStorage.setItem('dropsync.mode.last','${memTarget}')`
               );
               win.webContents.reload();
               await new Promise((r) => setTimeout(r, 5000)); // [c2] #2 emitted by remounted porch
@@ -3443,6 +3444,9 @@ function createWindow(): void {
               // C1b FIX D — synthetic auth-handler popup through OUR allowlist, end-to-end.
               const c1b = await cloudCtl!.probeSyntheticAuthPopup();
               console.log('[c1b]', JSON.stringify(c1b));
+              // C2 steady state: after all the churn the unauth home must STILL be dressed.
+              await new Promise((r) => setTimeout(r, 5000));
+              console.log('[c2b-steady]', JSON.stringify(cloudCtl!.dressedProbe()));
             } catch (error) {
               console.error('[c1] failed:', error instanceof Error ? error.message : String(error));
             }

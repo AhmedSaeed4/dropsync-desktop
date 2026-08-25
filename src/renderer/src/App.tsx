@@ -83,6 +83,8 @@ function CloudModeShell() {
     return () => window.removeEventListener('dropsync:request-mode-cloud', h);
   }, [switchMode]);
 
+  // Single root element (display:contents) keeps the boot probe's `rootChildren: 1` contract
+  // intact while hosting porch/local/cloud screens plus the fixed-position badge.
   const badge = (
     <ModeBadge
       mode={screen === 'cloud' ? 'cloud' : 'local'}
@@ -97,28 +99,28 @@ function CloudModeShell() {
 
   if (screen === 'porch') {
     return (
-      <>
+      <div className="contents" data-shell="porch">
         <Porch onEnter={(m) => void applyMode(m)} />
         {badge}
-      </>
+      </div>
     );
   }
 
   if (screen === 'cloud') {
     return (
-      <>
+      <div className="contents" data-shell="cloud">
         {/* Cloud view covers everything above the notch band; render a quiet filler beneath. */}
         <div className="fixed inset-0 bg-[#FAF7F2]" />
         {badge}
-      </>
+      </div>
     );
   }
 
   return (
-    <>
+    <div className="contents" data-shell="local">
       <AppBody />
       {badge}
-    </>
+    </div>
   );
 }
 

@@ -120,11 +120,12 @@ const DRESS_CSS = `
   input:focus { outline: none !important; border-color: #1a1a1a !important; }
   button { border-radius: 100px !important; font-family: inherit !important; transition: all .25s ease !important; }
 `;
-/** Read-only check INSIDE the page: does an unauthenticated login surface exist here? Hook =
- * any button whose text matches the site's real sign-in buttons ("Sign in with Google").
- * Misses are harmless (page simply stays undressed). Never typed into, never clicked by us. */
-const LOGIN_UI_CHECK =
-  "[...document.querySelectorAll('button')].some((b) => /sign in with google/i.test(b.textContent || ''))";
+/** Read-only check INSIDE the page: is this visit UNAUTHENTICATED? Signal = absence of
+ * Firebase's standard `firebase:authUser*` localStorage keys (same primitive as C1's
+ * f_c1_authSeen) — stable across site redesigns, unlike button text (the live home hides its
+ * sign-in controls behind a modal/layout variant). Read-only; we never write site storage. */
+const UNAUTH_CHECK =
+  "Object.keys(localStorage).every((k) => !k.startsWith('firebase:authUser'))";
 
 interface DressingState {
   dressed: boolean;
@@ -134,16 +135,8 @@ interface DressingState {
 
 function attachAuthDressing(wc: Electron.WebContents, state: DressingState): void {
   let dressKey: string | null = null;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-  const stopPoll = (): void => {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-  };
   const undress = async (): Promise<void> => {
-    stopPoll();
     if (dressKey) {
       const key = dressKey;
       dressKey = null;
@@ -155,16 +148,36 @@ function attachAuthDressing(wc: Electron.WebContents, state: DressingState): voi
       } catch { /* page may have navigated under us — harmless */ }
     }
   };
-  const evaluate = async (): Promise<void> => {
+  /** One reconciliation step: dress iff on an auth path AND unauthenticated. Runs on
+   * navigation events AND a steady 1.5 s tick (covers React hydration racing did-finish-load
+   * AND popup-completed auth, where keys appear without any navigation). Single-flight:
+   * overlapping ticks could otherwise double-insert CSS. */
+  let ticking = false;
+  const tick = async (): Promise<void> => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      await tickInner();
+    } finally {
+      ticking = false;
+    }
+  };
+  const tickInner = async (): Promise<void> => {
     let onAuthPath = false;
     try {
       const u = new URL(wc.getURL());
       onAuthPath = u.origin === CLOUD_ORIGIN && AUTH_PATHS.has(u.pathname);
     } catch { onAuthPath = false; }
     if (!onAuthPath) return void undress();
-    const hasLoginUI = await wc.executeJavaScript(`!!(${LOGIN_UI_CHECK})`).catch(() => false);
-    if (!hasLoginUI) return void undress(); // authenticated or form gone → normal framed look
-    if (!dressKey) {
+    let isUnauth = true;
+    try {
+      isUnauth = !!(await wc.executeJavaScript(`!!(${UNAUTH_CHECK})`));
+    } catch (error) {
+      console.log('[cloud] tick: execJS threw:', error instanceof Error ? error.message : String(error));
+      isUnauth = false;
+    }
+    const shouldDress = onAuthPath && isUnauth;
+    if (shouldDress && !dressKey) {
       try {
         dressKey = await wc.insertCSS(DRESS_CSS);
         state.dressed = true;
@@ -173,15 +186,15 @@ function attachAuthDressing(wc: Electron.WebContents, state: DressingState): voi
       } catch (error) {
         console.log('[cloud] insertCSS failed:', error instanceof Error ? error.message : String(error));
       }
+    } else if (!shouldDress && dressKey) {
+      await undress(); // authenticated (keys appeared) or off-route → normal framed-site look
     }
-    // Poll while dressed: popup-driven sign-in completes WITHOUT navigation, so removal must
-    // be reactive to the form disappearing, not just to route changes.
-    if (!pollTimer) pollTimer = setInterval(() => void evaluate(), 1500);
   };
-
-  wc.on('did-navigate', () => void evaluate());
-  wc.on('did-navigate-in-page', () => void evaluate());
-  wc.on('did-finish-load', () => void evaluate());
+  const timer = setInterval(() => void tick(), 1500);
+  wc.once('destroyed', () => clearInterval(timer));
+  wc.on('did-navigate', () => void tick());
+  wc.on('did-navigate-in-page', () => void tick());
+  wc.on('did-finish-load', () => void tick());
 }
 
 /**
@@ -436,8 +449,9 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
         return { f_c2_dressedLogin: false, applied: false, removedAfterLeave: false, reappliedOnReturn: false };
       }
       const wc = view.webContents;
-      // Initial evaluate runs on did-finish-load; give it (and its 1.5s poll) a beat.
-      await sleep(2500);
+      // Initial tick runs on did-finish-load; give React hydration + the 1.5 s dressing tick
+      // a comfortable beat before judging `applied`.
+      await sleep(4500);
       const applied = dressing.dressed;
       await wc.executeJavaScript("location.href = '/docs'").catch(() => {});
       for (let i = 0; i < 8 && dressing.dressed; i++) await sleep(500);

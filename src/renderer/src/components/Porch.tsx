@@ -269,34 +269,41 @@ export function Porch({ onEnter }: PorchProps) {
   }, []);
 
   // DEV battery (?c2dev tag written by main under DROPSYNC_CLOUD_DEV=1): emit evidence on
-  // mount AND again when the email probe resolves. Channel is env-gated main-side; rejects
+  // mount AND again when the email probe resolves. StrictMode double-invokes effects, so
+  // identical consecutive signatures are suppressed. Channel is env-gated main-side; rejects
   // elsewhere are swallowed.
+  const lastEmitSig = useRef('');
   useEffect(() => {
     if (!new URLSearchParams(window.location.search).has('c2dev')) return;
-    const emit = (): void => {
-      const ev = buildEvidence({
-        pillInitial,
-        sel: selRef.current,
-        probe,
-        knobEl: document.querySelector('[data-testid="porch-knob"]'),
-        panelEl:
-          panelRefs.current[pillInitial] ??
-          document.querySelector('[data-testid^="porch-panel-"]'),
-      });
-      window.dropsync.mode.devC2?.(ev).catch(() => {});
-    };
-    emit();
+    const ev = buildEvidence({
+      pillInitial,
+      sel: selRef.current,
+      probe,
+      knobEl: document.querySelector('[data-testid="porch-knob"]'),
+      panelEl:
+        panelRefs.current[pillInitial] ??
+        document.querySelector('[data-testid^="porch-panel-"]'),
+    });
+    const sig = JSON.stringify([ev.pillInitial, ev.pillNow, probe.state, probe.email]);
+    if (sig === lastEmitSig.current) return;
+    lastEmitSig.current = sig;
+    window.dropsync.mode.devC2?.(ev).catch(() => {});
   }, [pillInitial, probe]);
 
-  // Headless entry for the battery — runs the REAL pick() path (writes memory key too).
+  // Headless entry for the battery — ENTERS the mode directly (bypasses pick(): when the pill
+  // already sits on the requested mode, pick() would correctly no-op, but the battery wants
+  // the real onEnter path — identical to tapping the card's button).
   useEffect(() => {
     const h = (e: Event): void => {
       const m = (e as CustomEvent<{ mode?: string }>).detail?.mode;
-      if (m === 'cloud' || m === 'local') pick(m);
+      if (m === 'cloud' || m === 'local') {
+        writeLastMode(m);
+        onEnter(m);
+      }
     };
     window.addEventListener(C2_DEV_ENTER, h);
     return () => window.removeEventListener(C2_DEV_ENTER, h);
-  }, [pick]);
+  }, [onEnter]);
 
   return (
     <div
