@@ -3176,9 +3176,24 @@ function createWindow(): void {
           pwInput.dispatchEvent(new Event('input', { bubbles: true }));
           await sleep(200);
           q('Check backup').click();
-          await sleep(1500);
-          const importBtn = q('Import backup');
+          // Wait until the import button exists AND is enabled (inspection round-trip settles).
+          let importBtn = null;
+          let w2 = 0;
+          while (w2 < 15000) {
+            await sleep(500); w2 += 500;
+            const b = q('Import backup');
+            if (b && !b.disabled) { importBtn = b; break; }
+          }
           out.f22b_fix23_uiReady = !!chooseBtn && !!pwInput && !!importBtn;
+          // Rerun-safe unique workspace name (modal prefills '<base> Restored'; override it).
+          const wsName9 = 'R9 Fix23 ' + Date.now();
+          const nameInput = Array.from(document.querySelectorAll('input'))
+            .find((i) => i.type !== 'password' && i.getAttribute('maxlength') === '120');
+          if (nameInput) {
+            setVal.call(nameInput, wsName9);
+            nameInput.dispatchEvent(new Event('input', { bubbles: true }));
+            await sleep(200);
+          }
           importBtn.click();
           let waited = 0;
           while (waited < 30_000) {
@@ -3188,9 +3203,13 @@ function createWindow(): void {
           await sleep(800); // let onImported → setCurrentSpace + refreshSpaces settle
           const spacesAfter = await dropsync.vault.listSpaces();
           out.f22b_fix23_spaceListedImmediately = spacesAfter.length === spacesBefore9 + 1
-            && spacesAfter.some((s) => s.name === 'workspace-test Restored');
+            && spacesAfter.some((s) => s.name === wsName9);
           const headerTexts = Array.from(document.querySelectorAll('header span')).map((s) => (s.textContent || '').trim()).join('|');
-          out.f22b_fix23_headerPill = headerTexts.includes('workspace-test Restored');
+          out.f22b_fix23_headerPill = headerTexts.includes(wsName9);
+          if (!out.f22b_fix23_spaceListedImmediately) {
+            const modal = document.querySelector('.fixed.inset-0');
+            out.f22b_fix23_modalTail = modal ? (modal.textContent || '').replace(/\s+/g, ' ').slice(-140) : 'modal-gone';
+          }
           mo9.disconnect();
           out.f22b_fix23_noLoadingFlicker = !flicker9.seen;
           document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
@@ -3298,6 +3317,8 @@ function createWindow(): void {
         }
         out.f22b_idle_autolock_locked = lockedSeen;
         out.f22b_idle_autolock_waitMs = Date.now() - t0;
+        // The watchdog polls every 8 s — give it a tick to flip the renderer before checking DOM.
+        await sleep(10000);
         out.f22b_idle_autolock_unlockScreen = !!document.querySelector('input[placeholder="Vault password"]');
       } catch (e) { out.f22b_idle_autolock_err = String(e.message || e).slice(0, 60); }
       localStorage.removeItem('dropsync.sit3.dom');
