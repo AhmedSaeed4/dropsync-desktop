@@ -3428,6 +3428,9 @@ function createWindow(): void {
                 persistProof: proof,
                 f_c1_switchStorm: { toggles: modes.length, finalMode: appMode, childViews, badgeDom },
               }));
+              // C1b FIX D — synthetic auth-handler popup through OUR allowlist, end-to-end.
+              const c1b = await cloudCtl!.probeSyntheticAuthPopup();
+              console.log('[c1b]', JSON.stringify(c1b));
             } catch (error) {
               console.error('[c1] failed:', error instanceof Error ? error.message : String(error));
             }

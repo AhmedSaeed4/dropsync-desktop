@@ -27,8 +27,13 @@ const CLOUD_ORIGIN = 'https://drag-drop-app.vercel.app';
 const PARTITION = 'persist:cloud';
 /** Bottom band reserved for the local badge strip (ModeBadge lives in our renderer DOM). */
 export const NOTCH_H = 34;
-/** §3-I2 auth-provider popup allowlist (hostnames). */
+/** §3-I2 auth-provider popup allowlist (hostnames). `dropsync-1773445054.firebaseapp.com` is
+ * the web app's Firebase authDomain (drag-drop-app/.env.local:5 NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
+ * consumed at src/lib/firebase.ts:15) — Firebase signInWithPopup (drag-drop-app/src/lib/auth.ts:26)
+ * opens the handler THERE first, then routes to accounts.google.com and back. No *.web.app or
+ * other auth domains are referenced anywhere in the web app. */
 const AUTH_POPUP_ALLOWLIST = new Set([
+  'dropsync-1773445054.firebaseapp.com',
   'accounts.google.com',
   'accounts.video.google.com',
   'appleid.apple.com',
@@ -52,6 +57,18 @@ export interface CloudController {
   /** Persistence proof WITHOUT credentials: a seed-once localStorage marker in the
    * persist:cloud partition; surviving app restarts proves the partition hits disk. */
   probePersistProof(): Promise<{ present: boolean; seeded: boolean; value: string | null }>;
+  /** C1b FIX D — read-only probe of OUR guard behavior: open the Firebase auth-handler URL
+   * via window.open inside the cloud view; it must pass the allowlist end-to-end and yield a
+   * real child window that reaches did-finish-load. The popup is closed again afterwards so
+   * the no-leak invariant holds. NOTE: OAuth popups are top-level BrowserWindows, NOT
+   * contentView children — window count is the correct leak signal here. */
+  probeSyntheticAuthPopup(): Promise<{
+    f_c1b_popupAllowed: boolean;
+    popupLoadMs: number | null;
+    windowsBefore: number;
+    windowsMax: number;
+    windowsAfter: number;
+  }>;
 }
 
 /** https-only external handoff (I2). Returns true when handed off. */
@@ -66,9 +83,31 @@ function openExternalHttps(url: string): boolean {
   }
 }
 
-/** Attach I2/I3 guards to a webContents (used for the main view AND every auth popup so the
- * allowlist holds transitively through window.open chains). */
-function attachGuards(wc: Electron.WebContents, onFirstLoad: () => void): void {
+/** Popup decision (I2): 'allow' = auth allowlist popup joins the partition; 'external' =
+ * non-auth https handed to the browser; 'deny' = everything else. */
+function decidePopup(url: string): 'allow' | 'external' | 'deny' {
+  try {
+    const u = new URL(url);
+    if (u.protocol === 'https:' && AUTH_POPUP_ALLOWLIST.has(u.hostname)) return 'allow';
+    if (u.protocol === 'https:') return 'external';
+  } catch { /* unparseable → deny */ }
+  return 'deny';
+}
+
+/**
+ * Attach I2/I3 guards to a webContents.
+ * - `strictNav: true`  → MAIN cloud view only: same-origin will-navigate wall stays exactly as
+ *   shipped in C1 (the vault-side wall).
+ * - `strictNav: false` → AUTH POPUPS (and their chains): keep the window-open gate + did-fail-
+ *   load logging, but NO will-navigate preventDefault — the popup's whole job is cross-host
+ *   bouncing (firebaseapp.com ⇄ accounts.google.com); that IS the OAuth protocol, it runs in
+ *   the same sandboxed persist:cloud session, and its terminal state is self-close.
+ */
+function attachGuards(
+  wc: Electron.WebContents,
+  opts: { strictNav: boolean },
+  onFirstLoad: () => void,
+): void {
   let firstLoadSeen = false;
   wc.once('did-finish-load', () => {
     if (!firstLoadSeen) {
@@ -81,33 +120,34 @@ function attachGuards(wc: Electron.WebContents, onFirstLoad: () => void): void {
     console.log('[cloud] did-fail-load:', code, desc, url.slice(0, 120));
   });
   wc.setWindowOpenHandler(({ url }) => {
-    try {
-      const u = new URL(url);
-      if (u.protocol === 'https:' && AUTH_POPUP_ALLOWLIST.has(u.hostname)) {
-        // I3: popup explicitly joins the cloud partition or Google sign-in silently fails.
-        return {
-          action: 'allow',
-          overrideBrowserWindowOptions: { webPreferences: { partition: PARTITION, sandbox: true } },
-        };
-      }
-      if (u.protocol === 'https:') {
-        openExternalHttps(url);
-        return { action: 'deny' };
-      }
-    } catch { /* unparseable → deny */ }
+    // FIX C — every decision path is loud; this class of bug must never be invisible again.
+    const decision = decidePopup(url);
+    console.log('[cloud] popup', decision, url.slice(0, 120));
+    if (decision === 'allow') {
+      // I3: popup explicitly joins the cloud partition or Google sign-in silently fails.
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: { webPreferences: { partition: PARTITION, sandbox: true } },
+      };
+    }
+    if (decision === 'external') openExternalHttps(url);
     return { action: 'deny' };
   });
-  wc.on('did-create-window', (child) => attachGuards(child.webContents, onFirstLoad));
-  wc.on('will-navigate', (e, url) => {
-    try {
-      const u = new URL(url);
-      if (u.origin === CLOUD_ORIGIN) return; // same-origin top-nav is the site's business
-      e.preventDefault();
-      if (!openExternalHttps(url)) console.log('[cloud] denied nav to:', url.slice(0, 120));
-    } catch {
-      e.preventDefault();
-    }
-  });
+  wc.on('did-create-window', (child) => attachGuards(child.webContents, { strictNav: false }, onFirstLoad));
+  if (opts.strictNav) {
+    wc.on('will-navigate', (e, url) => {
+      try {
+        const u = new URL(url);
+        if (u.origin === CLOUD_ORIGIN) return; // same-origin top-nav is the site's business
+        e.preventDefault();
+        console.log('[cloud] nav-denied', url.slice(0, 120));
+        if (!openExternalHttps(url)) console.log('[cloud] nav-denied non-https, dropped');
+      } catch {
+        e.preventDefault();
+        console.log('[cloud] nav-denied unparseable');
+      }
+    });
+  }
 }
 
 export function initCloud(mainWindow: BrowserWindow): CloudController {
@@ -133,7 +173,7 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
       },
     });
     loadStartedAt = Date.now();
-    attachGuards(view.webContents, () => {
+    attachGuards(view.webContents, { strictNav: true }, () => {
       readyMs = Date.now() - loadStartedAt;
       console.log('[cloud] did-finish-load in', readyMs, 'ms');
     });
@@ -192,6 +232,41 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
           return { present: !!v, seeded, value: v };
         })()`
       )) as { present: boolean; seeded: boolean; value: string | null };
+    },
+    probeSyntheticAuthPopup: async () => {
+      const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+      if (!view) {
+        return { f_c1b_popupAllowed: false, popupLoadMs: null, windowsBefore: 0, windowsMax: 0, windowsAfter: 0 };
+      }
+      const wc = view.webContents;
+      const windowsBefore = BrowserWindow.getAllWindows().length;
+      let loaded = false;
+      const loadT0 = Date.now();
+      const created: Electron.BrowserWindow[] = [];
+      const onCreated = (child: Electron.BrowserWindow): void => {
+        created.push(child);
+        child.webContents.once('did-finish-load', () => { loaded = true; });
+      };
+      wc.on('did-create-window', onCreated);
+      await wc.executeJavaScript(
+        "void window.open('https://dropsync-1773445054.firebaseapp.com/__/auth/handler')"
+      );
+      let windowsMax = BrowserWindow.getAllWindows().length;
+      for (let i = 0; i < 20 && !loaded; i++) {
+        await sleep(500);
+        windowsMax = Math.max(windowsMax, BrowserWindow.getAllWindows().length);
+      }
+      const popupLoadMs = loaded ? Date.now() - loadT0 : null;
+      for (const w of created) if (!w.isDestroyed()) w.close();
+      for (let i = 0; i < 10 && BrowserWindow.getAllWindows().length > windowsBefore; i++) await sleep(200);
+      wc.removeListener('did-create-window', onCreated);
+      return {
+        f_c1b_popupAllowed: loaded,
+        popupLoadMs,
+        windowsBefore,
+        windowsMax,
+        windowsAfter: BrowserWindow.getAllWindows().length,
+      };
     },
   };
 }
