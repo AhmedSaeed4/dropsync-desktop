@@ -1039,7 +1039,13 @@ function createWindow(): void {
       // NOTE: deliberately NO Navigator.prototype override — stage 2's later ONLINE-path drill
       // restores connectivity by deleting the instance property, which would expose a
       // prototype getter and break it (round-5 regression caught + reverted same round).
-      const noteH3 = cardH3s().find((h) => h.getAttribute('title') === 'RT Note');
+      // Bounded retry (round-9 hardening): this was the ONLY single-shot card lookup left in
+      // the chain — with vault B grown to 65 records the first paint raced hydration on slow
+      // WSL disks and the guard early-returned 'RT Note card not found', silently ending the
+      // whole stage chain (no localStorage advance, no reload). Same pattern as the Forever
+      // Note loop above.
+      let noteH3 = null;
+      for (let i = 0; i < 20 && !noteH3; i++) { await sleep(1000); noteH3 = cardH3s().find((h) => h.getAttribute('title') === 'RT Note'); }
       if (!noteH3) { out.youtube = 'RT Note card not found'; return done(out, '2'); }
       noteH3.closest('.cursor-pointer').dispatchEvent(new MouseEvent('click', { bubbles: true }));
       await sleep(700);
@@ -3393,6 +3399,18 @@ async function sit3BootUnlock(): Promise<void> {
   if (process.env.DROPSYNC_SIT3_BOOT_UNLOCK !== '1') return;
   try {
     await manager.unlock('/tmp/ds-e2e-sit3-vault-B', 'sit3-vault-pw-B');
+    // Fixture hygiene (round 9): timer drills of past rounds left AGING expirations on reused
+    // fixture cards. When one crosses its line mid-round the card vanishes from the personal
+    // list and the DOM chain early-returns ('RT Note card not found'), silently stalling every
+    // later stage — exactly what happened on 2026-08-25 (RT Note) with RT Target due next.
+    // Drill-critical cards must never age out; imported-archive fixtures keep their timers.
+    const NEVER_EXPIRE = new Set(['RT Note', 'RT Target', 'Loc7', 'Loc9']);
+    for (const rec of manager.allRecords()) {
+      if (rec.expiresAt && NEVER_EXPIRE.has(rec.name)) {
+        await manager.mutatePublic({ op: 'drop.put', drop: { ...rec, expiresAt: null } });
+        console.log('[sit3-boot] cleared fixture expiry on:', rec.name);
+      }
+    }
     console.log('[sit3-boot] vault B pre-unlocked');
   } catch (error) {
     console.error('[sit3-boot] pre-unlock failed:', error instanceof Error ? error.message : String(error));
