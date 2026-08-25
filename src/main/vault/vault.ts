@@ -342,42 +342,73 @@ export class VaultManager {
       this.verifier as Uint8Array<ArrayBuffer>
     );
     if (!check) throw new Error('The current password is wrong.');
-    await this.flushNow();
-
     const rewrapped = await rewrapVaultKeys(newPassword, this.keys.dekRaw);
-    // Rewrite: NEW header + NEW verifier + SAME snapshot region + SAME journal.
-    const raw = await fsp.readFile(this.vaultFilePath);
-    const buf = new Uint8Array(raw);
-    const oldPrefix = decodeVaultHeaderPrefix(buf);
-    if (!oldPrefix) throw new Error('The vault file is damaged.');
-    const dv = new DataView(buf.buffer, buf.byteOffset);
-    const vLen = 16 + dv.getUint32(oldPrefix.headerBytesLength + 12, true);
-    const snapStart = oldPrefix.headerBytesLength + vLen + 4;
-    const snapLen = dv.getUint32(oldPrefix.headerBytesLength + vLen, true);
-    const rest = buf.slice(snapStart, buf.length);
-    if (rest.length < snapLen) throw new Error('The vault file is damaged.');
-    const tmpBody = new Uint8Array(rewrapped.headerBytes.byteLength + rewrapped.verifier.byteLength + rest.byteLength);
-    tmpBody.set(rewrapped.headerBytes, 0);
-    tmpBody.set(rewrapped.verifier, rewrapped.headerBytes.byteLength);
-    tmpBody.set(rest, rewrapped.headerBytes.byteLength + rewrapped.verifier.byteLength);
 
-    const tmp = `${this.vaultFilePath}.pwtmp`;
-    const handle = await fsp.open(tmp, 'w');
-    try {
-      await handle.write(Buffer.from(tmpBody.buffer, tmpBody.byteOffset, tmpBody.byteLength));
-      await handle.sync();
-      await handle.close();
-    } catch (error) {
-      await handle.close().catch(() => {});
-      await fsp.unlink(tmp).catch(() => {});
-      throw error;
+    // FIX 24 — a header swap must never copy AAD-bound artifacts. Journal records seal with
+    // the OUTER header bytes as their AAD (indexStore.sealJournalRecord → concatBytes(header-
+    // Bytes, 'journal')), so carrying them past a fresh header (new salt ⇒ different bytes)
+    // bricks the vault: next unlock replays them under the NEW headerBytes ⇒ GCM auth failure
+    // ⇒ "the vault index is missing or damaged" under BOTH passwords. The snapshot region is
+    // immune — it binds only its INLINE snapHdr bytes (sealIndexRegion). So the whole swap now
+    // runs INSIDE persistChain (a reminder tick or any mutation can neither interleave nor
+    // survive): force a full compaction, verify zero journal bytes on disk (retry once), then
+    // tmp+fsync+rename exactly as before. O(1) rewrap preserved — only the bounded journal is
+    // folded into the snapshot; no drop payload is ever re-encrypted.
+    let failure: unknown = null;
+    this.persistChain = this.persistChain.then(async () => {
+      try {
+        await this.compactForHeaderSwap();
+
+        // Header swap over a journal-free file.
+        const raw = await fsp.readFile(this.vaultFilePath);
+        const buf = new Uint8Array(raw);
+        const oldPrefix = decodeVaultHeaderPrefix(buf);
+        if (!oldPrefix) throw new Error('The vault file is damaged.');
+        const dv = new DataView(buf.buffer, buf.byteOffset);
+        const vLen = 16 + dv.getUint32(oldPrefix.headerBytesLength + 12, true);
+        const snapLenFieldOffset = oldPrefix.headerBytesLength + vLen; // outer [u32le snapLen]
+        const snapLen = dv.getUint32(snapLenFieldOffset, true);
+        const snapStart = snapLenFieldOffset + 4;
+        if (snapStart + snapLen !== buf.length) {
+          throw new Error('The vault file changed during the password change.');
+        }
+        // Second #24 root (found by the harness): the original swap sliced from snapStart —
+        // WITHOUT the 4-byte snapshot length prefix — and never re-emitted it, so every
+        // header-swapped file parsed as damaged at next unlock regardless of journal state.
+        // Carry [u32 snapLen][snapshot region] verbatim; the region itself is self-describing.
+        const rest = buf.slice(snapLenFieldOffset, buf.length);
+        const tmpBody = new Uint8Array(rewrapped.headerBytes.byteLength + rewrapped.verifier.byteLength + rest.byteLength);
+        tmpBody.set(rewrapped.headerBytes, 0);
+        tmpBody.set(rewrapped.verifier, rewrapped.headerBytes.byteLength);
+        tmpBody.set(rest, rewrapped.headerBytes.byteLength + rewrapped.verifier.byteLength);
+
+        const tmp = `${this.vaultFilePath}.pwtmp`;
+        const handle = await fsp.open(tmp, 'w');
+        try {
+          await handle.write(Buffer.from(tmpBody.buffer, tmpBody.byteOffset, tmpBody.byteLength));
+          await handle.sync();
+          await handle.close();
+        } catch (error) {
+          await handle.close().catch(() => {});
+          await fsp.unlink(tmp).catch(() => {});
+          throw error;
+        }
+        await fsp.rename(tmp, this.vaultFilePath);
+
+        this.header = rewrapped.header;
+        this.headerBytes = rewrapped.headerBytes;
+        this.verifier = rewrapped.verifier;
+        this.keys = rewrapped.keys;
+      } catch (error) {
+        failure = error;
+      }
+    });
+    await this.persistChain;
+    if (failure !== null) {
+      // Reset the queue so one failed change doesn't poison every future operation.
+      this.persistChain = Promise.resolve();
+      throw failure;
     }
-    await fsp.rename(tmp, this.vaultFilePath);
-
-    this.header = rewrapped.header;
-    this.headerBytes = rewrapped.headerBytes;
-    this.verifier = rewrapped.verifier;
-    this.keys = rewrapped.keys;
   }
 
   /** Settings → "Move vault": relocate DropSync.vault under a new parent folder. */
@@ -420,21 +451,59 @@ export class VaultManager {
   /** Force-compaction now: fresh sealed snapshot, journal emptied. Serialized via persistChain. */
   async flushNow(): Promise<void> {
     this.persistChain = this.persistChain.then(async () => {
-      if (!this.keys || !this.index || !this.headerBytes || !this.verifier) return;
-      if (this.journalBytesCount === 0 && this.snapshotRegionLength > 0) return;
-      this.snapshotRegionLength = await compactVaultFile(
-        this.fsmod,
-        this.vaultFilePath,
-        this.headerBytes as Uint8Array<ArrayBuffer>,
-        this.verifier as Uint8Array<ArrayBuffer>,
-        this.keys.dek,
-        this.index
-      );
-      this.journalBytesCount = 0;
+      await this.compactLocked(false);
     }).catch((error) => {
       console.error('[vault] compaction failed:', error);
     });
     return this.persistChain;
+  }
+
+  /** Compaction core — MUST run inside persistChain. force=false keeps the old early-return
+   * (nothing to fold); force=true compacts regardless of the journal threshold (FIX 24). */
+  private async compactLocked(force: boolean): Promise<void> {
+    if (!this.keys || !this.index || !this.headerBytes || !this.verifier) return;
+    if (!force && this.journalBytesCount === 0 && this.snapshotRegionLength > 0) return;
+    this.snapshotRegionLength = await compactVaultFile(
+      this.fsmod,
+      this.vaultFilePath,
+      this.headerBytes as Uint8Array<ArrayBuffer>,
+      this.verifier as Uint8Array<ArrayBuffer>,
+      this.keys.dek,
+      this.index
+    );
+    this.journalBytesCount = 0;
+  }
+
+  /** FIX 24 — fold EVERY pending journal record into a fresh snapshot right now (threshold
+   * ignored), then prove from disk that nothing journal-bound remains. One retry absorbs a
+   * mutation that raced ahead of us in the queue; a second dirty read is fatal — proceeding
+   * would brick the vault at next unlock. Runs ONLY inside persistChain; THROWS on failure
+   * (unlike flushNow, a header swap must never continue on a silently failed compaction). */
+  private async compactForHeaderSwap(): Promise<void> {
+    if (!this.keys || !this.index || !this.headerBytes || !this.verifier) {
+      throw new Error('Vault is locked.');
+    }
+    await this.compactLocked(true);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const pending = await this.pendingJournalBytesOnDisk();
+      if (pending === 0) return;
+      if (attempt > 0) break;
+      await this.compactLocked(true);
+    }
+    throw new Error('The vault could not be consolidated before the password change.');
+  }
+
+  /** Disk truth: how many journal bytes physically sit past the snapshot region. */
+  private async pendingJournalBytesOnDisk(): Promise<number> {
+    const raw = await fsp.readFile(this.vaultFilePath);
+    const buf = new Uint8Array(raw);
+    const prefix = decodeVaultHeaderPrefix(buf);
+    if (!prefix) throw new Error('The vault file is damaged.');
+    const dv = new DataView(buf.buffer, buf.byteOffset);
+    const vLen = 16 + dv.getUint32(prefix.headerBytesLength + 12, true);
+    const snapStart = prefix.headerBytesLength + vLen + 4;
+    const snapLen = dv.getUint32(prefix.headerBytesLength + vLen, true);
+    return Math.max(0, buf.length - (snapStart + snapLen));
   }
 
   private async mutate(op: JournalOp): Promise<void> {
