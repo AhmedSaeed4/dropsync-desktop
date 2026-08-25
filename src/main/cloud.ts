@@ -1,0 +1,212 @@
+/**
+ * Cloud mode core (PART C1) — the REAL deployed site embedded as a WebContentsView.
+ *
+ * Security invariants binding this file (CLOUD-MODE-PLAN I1–I3, I6):
+ * - I1: the cloud view runs in session 'persist:cloud' with NO preload key AT ALL — zero
+ *   window.dropsync access from site/popup contents, proven by f_c1_isolationGuard.
+ * - I2: top-level navigation stays on the site origin; child windows ONLY for auth providers
+ *   (Google/Apple/Microsoft accounts); other http(s) popups go to https-only shell.openExternal;
+ *   everything else is denied.
+ * - I3: popups inherit 'persist:cloud' explicitly — Google sign-in cookies must match or
+ *   sign-in silently fails.
+ * - I6: probes are env-gated (DROPSYNC_CLOUD_DEV=1); nothing here ships user-facing behavior
+ *   beyond what C1 specifies.
+ *
+ * Badge notch ruling (planner §4): a WebContentsView always paints above our renderer HTML,
+ * so instead of an overlay we RESERVE space — the view's bounds are the window content bounds
+ * minus one notch band at the bottom edge of height NOTCH_H; our renderer stays visible there
+ * and ModeBadge draws the dot+word strip bottom-right. A true L-shaped corner is impossible
+ * with one rectangular WebContentsView; the freed BOTTOM BAND is the rectangular decomposition
+ * (flagged in the report). One view max, created lazily on first show, reused forever after.
+ */
+
+import { BrowserWindow, session, shell, WebContentsView } from 'electron';
+
+export const CLOUD_URL = 'https://drag-drop-app.vercel.app';
+const CLOUD_ORIGIN = 'https://drag-drop-app.vercel.app';
+const PARTITION = 'persist:cloud';
+/** Bottom band reserved for the local badge strip (ModeBadge lives in our renderer DOM). */
+export const NOTCH_H = 34;
+/** §3-I2 auth-provider popup allowlist (hostnames). */
+const AUTH_POPUP_ALLOWLIST = new Set([
+  'accounts.google.com',
+  'accounts.video.google.com',
+  'appleid.apple.com',
+  'login.microsoftonline.com',
+]);
+
+export interface CloudController {
+  show(): void;
+  hide(): void;
+  isVisible(): boolean;
+  /** Probe data for DROPSYNC_CLOUD_DEV: did-finish-load latency for the site origin, if loaded. */
+  probeState(): { readyMs: number | null; url: string | null };
+  /** f_c1_isolationGuard — evaluate INSIDE the cloud contents (I1: no bridge may exist). */
+  probeIsolation(): Promise<{ dropsyncType: string; hasPreloadKey: true }>;
+  /**
+   * f_c1_authSeen — READ-ONLY signed-in marker inside the persist:cloud session. Marker chain
+   * per spec §5.5: Firebase auth localStorage keys first, then an account/avatar DOM chip.
+   * Evidence returned raw so the battery can judge; no guessing beyond these two signals.
+   */
+  probeAuthSeen(): Promise<{ firebaseAuthKeys: number; accountChip: boolean }>;
+  /** Persistence proof WITHOUT credentials: a seed-once localStorage marker in the
+   * persist:cloud partition; surviving app restarts proves the partition hits disk. */
+  probePersistProof(): Promise<{ present: boolean; seeded: boolean; value: string | null }>;
+}
+
+/** https-only external handoff (I2). Returns true when handed off. */
+function openExternalHttps(url: string): boolean {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== 'https:') return false;
+    void shell.openExternal(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Attach I2/I3 guards to a webContents (used for the main view AND every auth popup so the
+ * allowlist holds transitively through window.open chains). */
+function attachGuards(wc: Electron.WebContents, onFirstLoad: () => void): void {
+  let firstLoadSeen = false;
+  wc.once('did-finish-load', () => {
+    if (!firstLoadSeen) {
+      firstLoadSeen = true;
+      onFirstLoad();
+    }
+  });
+  wc.on('did-fail-load', (_e, code, desc, url) => {
+    // C1: log only — Chromium's default error page is accepted (friendly card is C3).
+    console.log('[cloud] did-fail-load:', code, desc, url.slice(0, 120));
+  });
+  wc.setWindowOpenHandler(({ url }) => {
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'https:' && AUTH_POPUP_ALLOWLIST.has(u.hostname)) {
+        // I3: popup explicitly joins the cloud partition or Google sign-in silently fails.
+        return {
+          action: 'allow',
+          overrideBrowserWindowOptions: { webPreferences: { partition: PARTITION, sandbox: true } },
+        };
+      }
+      if (u.protocol === 'https:') {
+        openExternalHttps(url);
+        return { action: 'deny' };
+      }
+    } catch { /* unparseable → deny */ }
+    return { action: 'deny' };
+  });
+  wc.on('did-create-window', (child) => attachGuards(child.webContents, onFirstLoad));
+  wc.on('will-navigate', (e, url) => {
+    try {
+      const u = new URL(url);
+      if (u.origin === CLOUD_ORIGIN) return; // same-origin top-nav is the site's business
+      e.preventDefault();
+      if (!openExternalHttps(url)) console.log('[cloud] denied nav to:', url.slice(0, 120));
+    } catch {
+      e.preventDefault();
+    }
+  });
+}
+
+export function initCloud(mainWindow: BrowserWindow): CloudController {
+  let view: WebContentsView | null = null;
+  let shown = false;
+  let readyMs: number | null = null;
+  let loadStartedAt = 0;
+
+  /** Bounds = content bounds minus the bottom badge band (planner §4, rectangular form). */
+  const applyBounds = (): void => {
+    if (!view) return;
+    const b = mainWindow.getContentBounds();
+    view.setBounds({ x: 0, y: 0, width: b.width, height: Math.max(0, b.height - NOTCH_H) });
+  };
+
+  const ensureView = (): WebContentsView => {
+    if (view) return view;
+    view = new WebContentsView({
+      webPreferences: {
+        partition: PARTITION,
+        sandbox: true,
+        // I1: deliberately NO `preload` key AT ALL — zero window.dropsync in cloud contents.
+      },
+    });
+    loadStartedAt = Date.now();
+    attachGuards(view.webContents, () => {
+      readyMs = Date.now() - loadStartedAt;
+      console.log('[cloud] did-finish-load in', readyMs, 'ms');
+    });
+    void view.webContents.loadURL(CLOUD_URL); // stock UA — never spoofed
+    // Keep session cookies on disk (persist:) so sign-in survives app + dev-server restarts.
+    void session.fromPartition(PARTITION);
+    return view;
+  };
+
+  const show = (): void => {
+    const v = ensureView();
+    if (!shown) {
+      mainWindow.contentView.addChildView(v);
+      shown = true;
+    }
+    applyBounds();
+    v.setVisible(true);
+    v.webContents.focus();
+  };
+
+  const hide = (): void => {
+    if (view && shown) {
+      mainWindow.contentView.removeChildView(view);
+      shown = false;
+    }
+    if (mainWindow.isFocused()) mainWindow.webContents.focus();
+  };
+
+  return {
+    show,
+    hide,
+    isVisible: () => shown,
+    probeState: () => ({ readyMs, url: view ? CLOUD_URL : null }),
+    probeIsolation: async () => {
+      if (!view) return { dropsyncType: 'no-view', hasPreloadKey: true as const };
+      const dropsyncType = await view.webContents.executeJavaScript('typeof window.dropsync');
+      return { dropsyncType, hasPreloadKey: true as const };
+    },
+    probeAuthSeen: async () => {
+      if (!view) return { firebaseAuthKeys: -1, accountChip: false };
+      return (await view.webContents.executeJavaScript(
+        `(async () => ({
+          firebaseAuthKeys: Object.keys(localStorage).filter((k) => k.startsWith('firebase:authUser')).length,
+          accountChip: !!document.querySelector('[data-testid*="account" i], [aria-label*="account" i], [aria-label*="avatar" i], img[alt*="avatar" i]'),
+        }))()`
+      )) as { firebaseAuthKeys: number; accountChip: boolean };
+    },
+    probePersistProof: async () => {
+      if (!view) return { present: false, seeded: false, value: null };
+      return (await view.webContents.executeJavaScript(
+        `(async () => {
+          const k = 'dropsync.c1.persistProof';
+          let v = localStorage.getItem(k);
+          const seeded = !v;
+          if (!v) { v = 'seed-' + Date.now(); localStorage.setItem(k, v); }
+          return { present: !!v, seeded, value: v };
+        })()`
+      )) as { present: boolean; seeded: boolean; value: string | null };
+    },
+  };
+}
+
+// Registered by index.ts once per window: keeps the notch glued across geometry changes.
+export function attachCloudResizeTracking(
+  mainWindow: BrowserWindow,
+  controller: CloudController,
+): void {
+  const handler = (): void => {
+    if (controller.isVisible()) controller.show(); // re-apply bounds via the same path
+  };
+  mainWindow.on('resize', handler);
+  mainWindow.on('maximize', handler);
+  mainWindow.on('unmaximize', handler);
+  mainWindow.on('enter-full-screen', handler);
+  mainWindow.on('leave-full-screen', handler);
+}

@@ -58,6 +58,11 @@ const api: DropsyncBridge = {
   youtube: {
     refreshTitles: (spaceId: string) => invoke('youtube:refreshTitles', spaceId),
   },
+  mode: {
+    get: () => invoke<'cloud' | 'local'>('mode:get'),
+    set: (next: 'cloud' | 'local') => invoke<'cloud' | 'local'>('mode:set', next),
+    devProbe: () => invoke<unknown>('mode:devProbe'),
+  },
   shell: {
     openExternal: (url: string) => invoke('shell:openExternal', url),
   },

@@ -15,6 +15,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
 import { VaultManager } from './vault/vault.ts';
+import { initCloud, attachCloudResizeTracking, type CloudController } from './cloud';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -65,6 +66,9 @@ const manager = new VaultManager();
 app.setAppUserModelId('com.dropsync.desktop');
 
 let mainWindow: BrowserWindow | null = null;
+/** C1 — cloud-mode controller (created with the window; mode:* handlers below drive it). */
+let cloudCtl: CloudController | null = null;
+let appMode: 'cloud' | 'local' = 'local'; // relaunch always starts Local in C1 (remember-last-mode = C2)
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({    width: 1440,
@@ -82,6 +86,9 @@ function createWindow(): void {
     },
   });
   mainWindow.once('ready-to-show', () => mainWindow?.show());
+  // C1: cloud view lifecycle + notch-safe bounds tracking (resize/maximize/full-screen).
+  cloudCtl = initCloud(mainWindow);
+  attachCloudResizeTracking(mainWindow, cloudCtl);
   // Polish sweep #1: the window title is ALWAYS "DropSync" — renderer document.title changes
   // (dev overlays, hash routes) are ignored.
   mainWindow.on('page-title-updated', (event) => event.preventDefault());
@@ -3376,6 +3383,41 @@ function createWindow(): void {
             .catch((error) => console.error('[s4] failed:', error instanceof Error ? error.message : String(error)));
         }, 4000);
       }
+      // DROPSYNC_CLOUD_DEV=1 → C1 cloud probes. This is ALSO the headless entry: the battery
+      // can drive cloud purely over the bridge — `dropsync.mode.set('cloud'|'local')` from the
+      // LOCAL renderer context switches modes (badge-free), and `dropsync.mode.devProbe?.()`
+      // returns the f_c1_* evidence below. Without DROPSYNC_CLOUD_DEV=1, devProbe is not
+      // registered and switching happens through the ModeBadge UI only.
+      if (process.env.DROPSYNC_CLOUD_DEV === '1') {
+        setTimeout(() => {
+          void (async () => {
+            try {
+              await manager.lock(); // leaving Local locks instantly — same internal path
+              appMode = 'cloud';
+              cloudCtl?.show();
+              let readyMs: number | null = null;
+              for (let i = 0; i < 60 && readyMs === null; i++) {
+                await new Promise((r) => setTimeout(r, 1000));
+                readyMs = cloudCtl?.probeState().readyMs ?? null;
+              }
+              const iso = await cloudCtl!.probeIsolation();
+              const auth = await cloudCtl!.probeAuthSeen();
+              const proof = await cloudCtl!.probePersistProof();
+              console.log('[c1]', JSON.stringify({
+                f_c1_cloudReady: readyMs !== null,
+                readyMs,
+                f_c1_isolationGuard: iso.dropsyncType === 'undefined',
+                dropsyncType: iso.dropsyncType,
+                f_c1_authSeen: auth.firebaseAuthKeys > 0 || auth.accountChip,
+                authSeenRaw: auth,
+                persistProof: proof,
+              }));
+            } catch (error) {
+              console.error('[c1] failed:', error instanceof Error ? error.message : String(error));
+            }
+          })();
+        }, 3000);
+      }
     });
   }
   // Renderer dev server URL is injected by electron-vite via ELECTRON_RENDERER_URL.
@@ -3561,6 +3603,37 @@ function registerIpc(): void {
     return manager.status();
   });
   handle('vault:lock', () => manager.lock());
+
+  // ---- C1 cloud mode --------------------------------------------------------------------
+  // Switch to Cloud: seal the vault via the EXISTING internal lock path (same as
+  // SettingsModal "Lock now" → handle('vault:lock') → manager.lock(), and idle auto-lock
+  // → vault.ts:879 void this.lock()), then raise the view. Entering Cloud NEVER requires
+  // a vault: lock() on a none/locked state is a harmless no-op seal.
+  handle('mode:get', () => appMode);
+  handle('mode:set', async (_e, next: 'cloud' | 'local') => {
+    if (next !== 'cloud' && next !== 'local') throw new Error('Invalid mode.');
+    if (next === appMode) return appMode;
+    if (next === 'cloud') {
+      await manager.lock(); // leaving Local locks it instantly — no prompt (§3)
+      appMode = 'cloud';
+      if (!cloudCtl) throw new Error('Cloud controller unavailable.');
+      cloudCtl.show();
+    } else {
+      appMode = 'local';
+      cloudCtl?.hide();
+    }
+    return appMode;
+  });
+  // DEV-ONLY probes (I6): never registered without DROPSYNC_CLOUD_DEV=1.
+  if (process.env.DROPSYNC_CLOUD_DEV === '1') {
+    handle('mode:devProbe', async () => {
+      if (!cloudCtl) throw new Error('Cloud controller unavailable.');
+      const st = cloudCtl.probeState();
+      const isolation = await cloudCtl.probeIsolation();
+      const authSeen = await cloudCtl.probeAuthSeen();
+      return { mode: appMode, ...st, isolation, authSeen };
+    });
+  }
   handle('vault:changePassword', (_e, oldPassword: string, newPassword: string) => manager.changePassword(oldPassword, newPassword));
   handle('vault:status', () => manager.status());
   handle('vault:probeFolder', (_e, folder: string) => manager.probeFolder(folder));

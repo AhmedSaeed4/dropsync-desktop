@@ -198,6 +198,14 @@ export interface DropsyncBridge {
   youtube: {
     refreshTitles(spaceId: string): Promise<RefreshTitlesResultDTO>;
   };
+  /** C1 — desktop mode. Cloud = embedded real site; Local = the encrypted vault UI. */
+  mode: {
+    get(): Promise<'cloud' | 'local'>;
+    /** 'cloud' seals the vault via the existing lock path; 'local' reveals the entry branch. */
+    set(next: 'cloud' | 'local'): Promise<'cloud' | 'local'>;
+    /** DEV-ONLY (DROPSYNC_CLOUD_DEV=1) — f_c1_* evidence; unregistered otherwise. */
+    devProbe?(): Promise<unknown>;
+  };
   shell: {
     openExternal(url: string): Promise<boolean>;
   };
