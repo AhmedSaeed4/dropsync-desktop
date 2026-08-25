@@ -69,6 +69,8 @@ let mainWindow: BrowserWindow | null = null;
 /** C1 — cloud-mode controller (created with the window; mode:* handlers below drive it). */
 let cloudCtl: CloudController | null = null;
 let appMode: 'cloud' | 'local' = 'local'; // relaunch always starts Local in C1 (remember-last-mode = C2)
+/** Assigned by registerIpc — shared by mode:set and the DEV probe's switch storm. */
+let applyCloudMode: (next: 'cloud' | 'local') => Promise<'cloud' | 'local'> = async () => appMode;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({    width: 1440,
@@ -3403,6 +3405,19 @@ function createWindow(): void {
               const iso = await cloudCtl!.probeIsolation();
               const auth = await cloudCtl!.probeAuthSeen();
               const proof = await cloudCtl!.probePersistProof();
+              // Rapid double-switch storm: Cloud→Local→Cloud ×3 with no settling time —
+              // exactly one WebContentsView, reused, never orphaned (§6).
+              const modes: string[] = [];
+              const win = mainWindow;
+              if (!win) throw new Error('window gone');
+              for (let i = 0; i < 3; i++) {
+                modes.push(await applyCloudMode('local'));
+                modes.push(await applyCloudMode('cloud'));
+              }
+              const childViews = win.contentView.children.length;
+              const badgeDom = await win.webContents.executeJavaScript(
+                '(() => { const b = document.querySelector(\'button[aria-label^="Mode:"]\'); return b ? (b.textContent || "").trim() : null; })()'
+              );
               console.log('[c1]', JSON.stringify({
                 f_c1_cloudReady: readyMs !== null,
                 readyMs,
@@ -3411,6 +3426,7 @@ function createWindow(): void {
                 f_c1_authSeen: auth.firebaseAuthKeys > 0 || auth.accountChip,
                 authSeenRaw: auth,
                 persistProof: proof,
+                f_c1_switchStorm: { toggles: modes.length, finalMode: appMode, childViews, badgeDom },
               }));
             } catch (error) {
               console.error('[c1] failed:', error instanceof Error ? error.message : String(error));
@@ -3609,8 +3625,7 @@ function registerIpc(): void {
   // SettingsModal "Lock now" → handle('vault:lock') → manager.lock(), and idle auto-lock
   // → vault.ts:879 void this.lock()), then raise the view. Entering Cloud NEVER requires
   // a vault: lock() on a none/locked state is a harmless no-op seal.
-  handle('mode:get', () => appMode);
-  handle('mode:set', async (_e, next: 'cloud' | 'local') => {
+  const applyMode = async (next: 'cloud' | 'local'): Promise<'cloud' | 'local'> => {
     if (next !== 'cloud' && next !== 'local') throw new Error('Invalid mode.');
     if (next === appMode) return appMode;
     if (next === 'cloud') {
@@ -3623,7 +3638,10 @@ function registerIpc(): void {
       cloudCtl?.hide();
     }
     return appMode;
-  });
+  };
+  applyCloudMode = applyMode;
+  handle('mode:get', () => appMode);
+  handle('mode:set', (_e, next: 'cloud' | 'local') => applyCloudMode(next));
   // DEV-ONLY probes (I6): never registered without DROPSYNC_CLOUD_DEV=1.
   if (process.env.DROPSYNC_CLOUD_DEV === '1') {
     handle('mode:devProbe', async () => {
