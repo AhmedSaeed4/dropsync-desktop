@@ -15,7 +15,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
 import { VaultManager } from './vault/vault.ts';
-import { initCloud, attachCloudResizeTracking, type CloudController } from './cloud';
+import { initCloud, attachCloudResizeTracking, probeCloudSessionEmail, type CloudController } from './cloud';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -71,6 +71,9 @@ let cloudCtl: CloudController | null = null;
 let appMode: 'cloud' | 'local' = 'local'; // relaunch always starts Local in C1 (remember-last-mode = C2)
 /** Assigned by registerIpc — shared by mode:set and the DEV probe's switch storm. */
 let applyCloudMode: (next: 'cloud' | 'local') => Promise<'cloud' | 'local'> = async () => appMode;
+/** DEV-only: the C1/C2 battery reloads the renderer (memory test) — this guard keeps its
+ * did-finish-load handler from re-triggering the whole sequence on every reload. */
+let cloudDevBatteryStarted = false;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({    width: 1440,
@@ -3385,31 +3388,40 @@ function createWindow(): void {
             .catch((error) => console.error('[s4] failed:', error instanceof Error ? error.message : String(error)));
         }, 4000);
       }
-      // DROPSYNC_CLOUD_DEV=1 → C1 cloud probes. This is ALSO the headless entry: the battery
-      // can drive cloud purely over the bridge — `dropsync.mode.set('cloud'|'local')` from the
-      // LOCAL renderer context switches modes (badge-free), and `dropsync.mode.devProbe?.()`
-      // returns the f_c1_* evidence below. Without DROPSYNC_CLOUD_DEV=1, devProbe is not
-      // registered and switching happens through the ModeBadge UI only.
-      if (process.env.DROPSYNC_CLOUD_DEV === '1') {
+      // DROPSYNC_CLOUD_DEV=1 → C1/C2 cloud battery. C2: launch is PORCH-FIRST, so the battery
+      // (1) lets the porch paint + emit [c2] passively, (2) sets dropsync.mode.last='cloud' and
+      // RELOADS — porch remounts and must report pillInitial 'cloud' (memory-remember), then
+      // (3) drives the REAL renderer path into Cloud via the porch's dev event, which runs the
+      // same choose() code a user tap would. All f_c1_* evidence below is unchanged.
+      if (process.env.DROPSYNC_CLOUD_DEV === '1' && !cloudDevBatteryStarted) {
+        cloudDevBatteryStarted = true;
         setTimeout(() => {
           void (async () => {
             try {
-              await manager.lock(); // leaving Local locks instantly — same internal path
-              appMode = 'cloud';
-              cloudCtl?.show();
+              const win = mainWindow;
+              if (!win || !cloudCtl) throw new Error('window/controller gone');
+              await win.webContents.executeJavaScript(
+                "localStorage.setItem('dropsync.mode.last','cloud')"
+              );
+              win.webContents.reload();
+              await new Promise((r) => setTimeout(r, 5000)); // [c2] #2 emitted by remounted porch
+              await win.webContents.executeJavaScript(
+                "window.dispatchEvent(new CustomEvent('dropsync:c2-dev-enter',{detail:{mode:'cloud'}}))"
+              );
               let readyMs: number | null = null;
               for (let i = 0; i < 60 && readyMs === null; i++) {
                 await new Promise((r) => setTimeout(r, 1000));
-                readyMs = cloudCtl?.probeState().readyMs ?? null;
+                readyMs = cloudCtl.probeState().readyMs ?? null;
               }
-              const iso = await cloudCtl!.probeIsolation();
-              const auth = await cloudCtl!.probeAuthSeen();
-              const proof = await cloudCtl!.probePersistProof();
+              const iso = await cloudCtl.probeIsolation();
+              const auth = await cloudCtl.probeAuthSeen();
+              const proof = await cloudCtl.probePersistProof();
+              // C2 dressed login: applied on unauth home → removed off-route → reapplied on return.
+              const dressed = await cloudCtl.probeDressedSequence();
+              console.log('[c2b]', JSON.stringify(dressed));
               // Rapid double-switch storm: Cloud→Local→Cloud ×3 with no settling time —
               // exactly one WebContentsView, reused, never orphaned (§6).
               const modes: string[] = [];
-              const win = mainWindow;
-              if (!win) throw new Error('window gone');
               for (let i = 0; i < 3; i++) {
                 modes.push(await applyCloudMode('local'));
                 modes.push(await applyCloudMode('cloud'));
@@ -3443,10 +3455,12 @@ function createWindow(): void {
   if (process.env.ELECTRON_RENDERER_URL) {
     // Sitting-2 battery AND the Sitting-3 round-trip need the dev-only __EXCAL hook — tag the
     // URL so main.tsx enables it. FIX 14's cache-size probe rides the same flag for DOM checks.
-    const devUrl = process.env.DROPSYNC_E2E_S2 === '1' || process.env.DROPSYNC_E2E_SIT3 === '1'
-      || process.env.DROPSYNC_SIT3_DOMCHECKS === '1'
-      ? `${process.env.ELECTRON_RENDERER_URL}?e2eHooks`
-      : process.env.ELECTRON_RENDERER_URL;
+    // C2: the porch battery evidence emitter is tagged with `c2dev` under DROPSYNC_CLOUD_DEV.
+    const wantsHooks = process.env.DROPSYNC_E2E_S2 === '1' || process.env.DROPSYNC_E2E_SIT3 === '1'
+      || process.env.DROPSYNC_SIT3_DOMCHECKS === '1';
+    const devUrl = `${process.env.ELECTRON_RENDERER_URL}${wantsHooks ? '?e2eHooks' : ''}${
+      process.env.DROPSYNC_CLOUD_DEV === '1' ? (wantsHooks ? '&' : '?') + 'c2dev' : ''
+    }`;
     void mainWindow.loadURL(devUrl);
   } else {
     void mainWindow.loadFile(join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/index.html'));
@@ -3645,6 +3659,8 @@ function registerIpc(): void {
   applyCloudMode = applyMode;
   handle('mode:get', () => appMode);
   handle('mode:set', (_e, next: 'cloud' | 'local') => applyCloudMode(next));
+  // C2 porch — read-only hidden-view email discovery. USER-FACING feature: registered always.
+  handle('mode:probeEmail', () => probeCloudSessionEmail());
   // DEV-ONLY probes (I6): never registered without DROPSYNC_CLOUD_DEV=1.
   if (process.env.DROPSYNC_CLOUD_DEV === '1') {
     handle('mode:devProbe', async () => {
@@ -3653,6 +3669,9 @@ function registerIpc(): void {
       const isolation = await cloudCtl.probeIsolation();
       const authSeen = await cloudCtl.probeAuthSeen();
       return { mode: appMode, ...st, isolation, authSeen };
+    });
+    handle('mode:c2Evidence', (_e, evidence: unknown) => {
+      console.log('[c2]', JSON.stringify(evidence));
     });
   }
   handle('vault:changePassword', (_e, oldPassword: string, newPassword: string) => manager.changePassword(oldPassword, newPassword));

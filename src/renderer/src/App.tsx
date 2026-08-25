@@ -19,6 +19,8 @@ import { isTextFileDrop, drawingMediaKind } from './lib/dropsHelpers';
 import { invalidatePreviewPayload, clearPreviewPayloadCache, putCachedPreviewPayload } from './lib/previewPayloadCache';
 import { Toast } from './components/shared/Toast';
 import { ModeBadge, type DesktopMode } from './components/ModeBadge';
+import { Porch } from './components/Porch';
+import { requestModeSwitch } from './lib/modeSwitchGuard';
 import type { CreateExpirationOptionDTO, DropDTO, UpdateMetaPatchDTO } from '../../preload/apiTypes';
 
 export default function App() {
@@ -30,59 +32,84 @@ export default function App() {
 }
 
 /**
- * C1 — mode shell. Wraps the whole app OUTSIDE the status branches so the badge is visible in
- * ALL local states (no-vault / locked / unlocked) and while the cloud view is up (it shows
- * through the reserved bottom band, main/cloud.ts NOTCH_H).
- *
- * Switch-to-Cloud: main seals the vault via the existing lock path; here we just flip state.
- * Switch-to-Local: cloud hides and we force an instant store resync (refreshAll re-reads
- * status) so the renderer lands on the normal entry branch — UnlockScreen if a vault exists,
- * FirstRunSetup if none. NEVER straight into drops. The planner ruling for "Desktop settings"
- * from Cloud: switch to Local first (Cloud already locked), then open the existing
- * SettingsModal as soon as the user is back in an unlocked session (pendingSettings latch).
+ * C2 — launch is PORCH-FIRST: the porch shows before ANY mode entry (pill memory via
+ * localStorage `dropsync.mode.last`, first-ever ⇒ Local). Choosing a mode glides to it:
+ * Local re-parents the EXISTING entry branches (FirstRunSetup / UnlockScreen, M7 offer
+ * included — internals unchanged, AppBody untouched); Cloud runs the C1 path (mode:set seals
+ * the vault when unlocked, then the embedded view). Mid-session switching stays with the
+ * badge + the new SettingsModal line and now routes through the unsaved-work guard
+ * (lib/modeSwitchGuard) so editors confirm "Discard changes?" before any switch proceeds.
+ * Auto-lock still lands on UnlockScreen — never back on the porch. Badge visible in ALL
+ * states incl. the porch; cloud view shows through the reserved bottom band as in C1.
  */
 function CloudModeShell() {
   const { status, refreshAll } = useVaultStore();
-  const [mode, setModeState] = useState<DesktopMode | null>(null);
+  const [screen, setScreen] = useState<'porch' | 'local' | 'cloud'>('porch');
   const pendingSettingsRef = useRef(false);
-
-  useEffect(() => {
-    void window.dropsync.mode.get().then(setModeState);
-  }, []);
 
   // "Desktop settings" from Cloud: auto-open the existing SettingsModal once Local is back
   // AND the vault is unlocked again (returning always requires the password first).
   useEffect(() => {
-    if (mode === 'local' && status === 'unlocked' && pendingSettingsRef.current) {
+    if (screen === 'local' && status === 'unlocked' && pendingSettingsRef.current) {
       pendingSettingsRef.current = false;
       window.dispatchEvent(new CustomEvent('dropsync:open-settings'));
     }
-  }, [mode, status]);
+  }, [screen, status]);
 
-  const setMode = useCallback(async (next: DesktopMode): Promise<void> => {
-    await window.dropsync.mode.set(next);
-    setModeState(next);
-    if (next === 'local') await refreshAll(); // instant entry-branch resync (status may have flipped to locked)
-  }, [refreshAll]);
+  /** Actual transition: main seals/raises/hides; renderer flips + resyncs on Local return. */
+  const applyMode = useCallback(
+    async (next: DesktopMode): Promise<void> => {
+      if (next === screen) return;
+      await window.dropsync.mode.set(next);
+      setScreen(next);
+      if (next === 'local') await refreshAll(); // instant entry-branch resync (status may have flipped)
+    },
+    [screen, refreshAll]
+  );
 
-  if (mode === null) {
-    // First paint before mode:get resolves — keep the window quiet cream (matches app bg).
-    return <div className="fixed inset-0 bg-[#FAF7F2]" />;
+  /** Guarded switch — if an editor has unsaved changes its OWN discard-confirm runs first
+   * and fires the continuation after "Discard"; otherwise we proceed immediately. */
+  const switchMode = useCallback(
+    (next: DesktopMode): void => {
+      requestModeSwitch(() => void applyMode(next));
+    },
+    [applyMode]
+  );
+
+  // SettingsModal "Switch to Cloud" line rides the event bus (same style as open-settings).
+  useEffect(() => {
+    const h = (): void => switchMode('cloud');
+    window.addEventListener('dropsync:request-mode-cloud', h);
+    return () => window.removeEventListener('dropsync:request-mode-cloud', h);
+  }, [switchMode]);
+
+  const badge = (
+    <ModeBadge
+      mode={screen === 'cloud' ? 'cloud' : 'local'}
+      onSwitch={() => switchMode(screen === 'cloud' ? 'local' : 'cloud')}
+      onOpenSettings={() => {
+        pendingSettingsRef.current = screen === 'cloud';
+        if (screen === 'cloud') switchMode('local'); // planner ruling: Local first; modal opens after unlock
+        else window.dispatchEvent(new CustomEvent('dropsync:open-settings'));
+      }}
+    />
+  );
+
+  if (screen === 'porch') {
+    return (
+      <>
+        <Porch onEnter={(m) => void applyMode(m)} />
+        {badge}
+      </>
+    );
   }
 
-  if (mode === 'cloud') {
+  if (screen === 'cloud') {
     return (
       <>
         {/* Cloud view covers everything above the notch band; render a quiet filler beneath. */}
         <div className="fixed inset-0 bg-[#FAF7F2]" />
-        <ModeBadge
-          mode="cloud"
-          onSwitch={() => void setMode('local')}
-          onOpenSettings={() => {
-            pendingSettingsRef.current = true;
-            void setMode('local'); // planner ruling: Local first; modal opens after unlock
-          }}
-        />
+        {badge}
       </>
     );
   }
@@ -90,11 +117,7 @@ function CloudModeShell() {
   return (
     <>
       <AppBody />
-      <ModeBadge
-        mode="local"
-        onSwitch={() => void setMode('cloud')}
-        onOpenSettings={() => window.dispatchEvent(new CustomEvent('dropsync:open-settings'))}
-      />
+      {badge}
     </>
   );
 }
@@ -746,6 +769,8 @@ function AppBody() {
         <SettingsModal
           onClose={() => setShowSettings(false)}
           onLockNow={() => void handleLockNow()}
+          // C2 §2: same guarded path as the badge menu (unsaved-editor confirm included).
+          onSwitchToCloud={() => window.dispatchEvent(new CustomEvent('dropsync:request-mode-cloud'))}
           onVaultMoved={() => {
             // FIX 3: the ONLY refresh wired to Settings — a moved vault means a new folder and
             // the shell must re-probe. Every other close path is silent (zero refetch).

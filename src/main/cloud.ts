@@ -69,6 +69,23 @@ export interface CloudController {
     windowsMax: number;
     windowsAfter: number;
   }>;
+  /** C2 dressed-login probe evidence: current dressing flag + apply/remove counters. */
+  dressedProbe(): DressingState;
+  /** C2 f_c2_dressedLogin — full dance WITHOUT credentials: on unauth home the dressing must
+   * be applied; leaving the auth route removes it; returning reapplies it. Drives real
+   * same-origin top-nav inside the cloud view and polls the dressing flag. */
+  probeDressedSequence(): Promise<{
+    f_c2_dressedLogin: boolean;
+    applied: boolean;
+    removedAfterLeave: boolean;
+    reappliedOnReturn: boolean;
+  }>;
+}
+
+/** C2 — read-only porch session discovery result (never fakes an email). */
+export interface CloudSessionProbe {
+  signedIn: boolean;
+  email: string | null;
 }
 
 /** https-only external handoff (I2). Returns true when handed off. */
@@ -82,6 +99,148 @@ function openExternalHttps(url: string): boolean {
     return false;
   }
 }
+
+// ---- C2 Option A "dressed login" -------------------------------------------------------
+// When the cloud view sits on an UNAUTHENTICATED login surface, apply display-only styling via
+// webContents.insertCSS(): hide the site's header/footer/marketing chrome, cream backdrop,
+// rounded-full inputs/buttons. The REAL form stays functional — credentials go keyboard→site
+// directly; zero middleman handling. Defensive rule: a missed selector just renders normally.
+// Dressing is removed once authenticated/off the route so the normal framed-site look returns.
+
+/** Site paths that can host the login surface. The real site's sign-in lives on `/` when
+ * signed out (drag-drop-app/src/app/page.tsx renders the Google button + auth modal there);
+ * extra patterns are future-proofing only. */
+const AUTH_PATHS = new Set(['/', '/login', '/signin', '/auth']);
+
+const DRESS_CSS = `
+  html, body { background: #FAF7F2 !important; color: #1a1a1a !important; }
+  header, footer, nav { display: none !important; }
+  body { display: flex !important; align-items: center; justify-content: center; min-height: 100vh !important; }
+  input, textarea, select { border-radius: 100px !important; background: #FAF7F2 !important; color: #1a1a1a !important; border-color: rgba(26,26,26,.25) !important; }
+  input:focus { outline: none !important; border-color: #1a1a1a !important; }
+  button { border-radius: 100px !important; font-family: inherit !important; transition: all .25s ease !important; }
+`;
+/** Read-only check INSIDE the page: does an unauthenticated login surface exist here? Hook =
+ * any button whose text matches the site's real sign-in buttons ("Sign in with Google").
+ * Misses are harmless (page simply stays undressed). Never typed into, never clicked by us. */
+const LOGIN_UI_CHECK =
+  "[...document.querySelectorAll('button')].some((b) => /sign in with google/i.test(b.textContent || ''))";
+
+interface DressingState {
+  dressed: boolean;
+  appliedCount: number;
+  removedCount: number;
+}
+
+function attachAuthDressing(wc: Electron.WebContents, state: DressingState): void {
+  let dressKey: string | null = null;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+  const stopPoll = (): void => {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  };
+  const undress = async (): Promise<void> => {
+    stopPoll();
+    if (dressKey) {
+      const key = dressKey;
+      dressKey = null;
+      state.dressed = false;
+      state.removedCount += 1;
+      console.log('[cloud] dressing removed');
+      try {
+        await wc.removeInsertedCSS(key);
+      } catch { /* page may have navigated under us — harmless */ }
+    }
+  };
+  const evaluate = async (): Promise<void> => {
+    let onAuthPath = false;
+    try {
+      const u = new URL(wc.getURL());
+      onAuthPath = u.origin === CLOUD_ORIGIN && AUTH_PATHS.has(u.pathname);
+    } catch { onAuthPath = false; }
+    if (!onAuthPath) return void undress();
+    const hasLoginUI = await wc.executeJavaScript(`!!(${LOGIN_UI_CHECK})`).catch(() => false);
+    if (!hasLoginUI) return void undress(); // authenticated or form gone → normal framed look
+    if (!dressKey) {
+      try {
+        dressKey = await wc.insertCSS(DRESS_CSS);
+        state.dressed = true;
+        state.appliedCount += 1;
+        console.log('[cloud] dressing applied');
+      } catch (error) {
+        console.log('[cloud] insertCSS failed:', error instanceof Error ? error.message : String(error));
+      }
+    }
+    // Poll while dressed: popup-driven sign-in completes WITHOUT navigation, so removal must
+    // be reactive to the form disappearing, not just to route changes.
+    if (!pollTimer) pollTimer = setInterval(() => void evaluate(), 1500);
+  };
+
+  wc.on('did-navigate', () => void evaluate());
+  wc.on('did-navigate-in-page', () => void evaluate());
+  wc.on('did-finish-load', () => void evaluate());
+}
+
+/**
+ * C2 email discovery (read-only): a HIDDEN temporary WebContentsView on persist:cloud loads
+ * the site origin and reads the signed-in marker studied in C1 (firebase:authUser keys);
+ * the email is extracted ONLY if trivially available in that storage JSON. NEVER writes site
+ * storage; the view is destroyed after reading. Uncertain ⇒ {signedIn:false} — the porch then
+ * renders the neutral card; we do NOT fake an email. Runs async, never blocks porch paint.
+ */
+export async function probeCloudSessionEmail(): Promise<{
+  signedIn: boolean;
+  email: string | null;
+}> {
+  const temp = new WebContentsView({
+    webPreferences: {
+      partition: PARTITION,
+      sandbox: true,
+      // I1: NO preload key at all.
+    },
+  });
+  try {
+    temp.webContents.setWindowOpenHandler(() => ({ action: 'deny' })); // hidden view: no popups
+    const loaded = await Promise.race([
+      new Promise<boolean>((resolve) => {
+        temp.webContents.once('did-finish-load', () => resolve(true));
+        temp.webContents.once('did-fail-load', (_e, _c, desc) => {
+          console.log('[cloud] email-probe did-fail-load:', desc);
+          resolve(false);
+        });
+      }),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 20_000)),
+    ]);
+    if (!loaded) return { signedIn: false, email: null };
+    // Settle briefly so Firebase can restore its authUser localStorage entry post-hydration.
+    await new Promise((r) => setTimeout(r, 2500));
+    return (await temp.webContents.executeJavaScript(
+      `(async () => {
+        const keys = Object.keys(localStorage).filter((k) => k.startsWith('firebase:authUser'));
+        for (const k of keys) {
+          try {
+            const v = JSON.parse(localStorage.getItem(k) || '{}');
+            if (typeof v.email === 'string' && v.email.includes('@')) {
+              return { signedIn: true, email: v.email };
+            }
+          } catch {}
+        }
+        return { signedIn: false, email: null };
+      })()`
+    )) as { signedIn: boolean; email: string | null };
+  } catch {
+    return { signedIn: false, email: null };
+  } finally {
+    try {
+      temp.webContents.close(); // destroy the hidden view after reading
+    } catch { /* already gone */ }
+  }
+}
+
+
 
 /** Popup decision (I2): 'allow' = auth allowlist popup joins the partition; 'external' =
  * non-auth https handed to the browser; 'deny' = everything else. */
@@ -155,6 +314,7 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
   let shown = false;
   let readyMs: number | null = null;
   let loadStartedAt = 0;
+  const dressing: DressingState = { dressed: false, appliedCount: 0, removedCount: 0 };
 
   /** Bounds = content bounds minus the bottom badge band (planner §4, rectangular form). */
   const applyBounds = (): void => {
@@ -177,6 +337,7 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
       readyMs = Date.now() - loadStartedAt;
       console.log('[cloud] did-finish-load in', readyMs, 'ms');
     });
+    attachAuthDressing(view.webContents, dressing);
     void view.webContents.loadURL(CLOUD_URL); // stock UA — never spoofed
     // Keep session cookies on disk (persist:) so sign-in survives app + dev-server restarts.
     void session.fromPartition(PARTITION);
@@ -266,6 +427,29 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
         windowsBefore,
         windowsMax,
         windowsAfter: BrowserWindow.getAllWindows().length,
+      };
+    },
+    dressedProbe: () => ({ ...dressing }),
+    probeDressedSequence: async () => {
+      const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+      if (!view) {
+        return { f_c2_dressedLogin: false, applied: false, removedAfterLeave: false, reappliedOnReturn: false };
+      }
+      const wc = view.webContents;
+      // Initial evaluate runs on did-finish-load; give it (and its 1.5s poll) a beat.
+      await sleep(2500);
+      const applied = dressing.dressed;
+      await wc.executeJavaScript("location.href = '/docs'").catch(() => {});
+      for (let i = 0; i < 8 && dressing.dressed; i++) await sleep(500);
+      const removedAfterLeave = !dressing.dressed;
+      await wc.executeJavaScript("location.href = '/'").catch(() => {});
+      for (let i = 0; i < 12 && !dressing.dressed; i++) await sleep(500);
+      const reappliedOnReturn = dressing.dressed;
+      return {
+        f_c2_dressedLogin: applied && removedAfterLeave && reappliedOnReturn,
+        applied,
+        removedAfterLeave,
+        reappliedOnReturn,
       };
     },
   };

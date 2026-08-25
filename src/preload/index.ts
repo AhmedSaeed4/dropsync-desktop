@@ -61,7 +61,9 @@ const api: DropsyncBridge = {
   mode: {
     get: () => invoke<'cloud' | 'local'>('mode:get'),
     set: (next: 'cloud' | 'local') => invoke<'cloud' | 'local'>('mode:set', next),
+    probeEmail: () => invoke<{ signedIn: boolean; email: string | null }>('mode:probeEmail'),
     devProbe: () => invoke<unknown>('mode:devProbe'),
+    devC2: (evidence: unknown) => invoke<void>('mode:c2Evidence', evidence),
   },
   shell: {
     openExternal: (url: string) => invoke('shell:openExternal', url),

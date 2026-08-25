@@ -203,8 +203,12 @@ export interface DropsyncBridge {
     get(): Promise<'cloud' | 'local'>;
     /** 'cloud' seals the vault via the existing lock path; 'local' reveals the entry branch. */
     set(next: 'cloud' | 'local'): Promise<'cloud' | 'local'>;
+    /** C2 porch — read-only hidden-view session/email discovery (async, never blocks paint). */
+    probeEmail(): Promise<{ signedIn: boolean; email: string | null }>;
     /** DEV-ONLY (DROPSYNC_CLOUD_DEV=1) — f_c1_* evidence; unregistered otherwise. */
     devProbe?(): Promise<unknown>;
+    /** DEV-ONLY — porch battery evidence relay ([c2] console line); unregistered otherwise. */
+    devC2?(evidence: unknown): Promise<void>;
   };
   shell: {
     openExternal(url: string): Promise<boolean>;
