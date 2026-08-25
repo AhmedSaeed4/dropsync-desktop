@@ -8,6 +8,7 @@
  */
 
 import { app, BrowserWindow, ipcMain, dialog, Notification, protocol, shell, net } from 'electron';
+import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
@@ -166,7 +167,24 @@ function createWindow(): void {
 `;
         void mainWindow?.webContents
           .executeJavaScript(e2e, true)
-          .then((report) => console.log('[e2e]', report))
+          .then(async (report) => {
+            console.log('[e2e]', report);
+            // FIX 24 permanent regression harness — every S1 round also drives the real vault
+            // engine headlessly through a full password change (dirty + empty journal branches).
+            try {
+              const { promisify } = await import('node:util');
+              const script = join(fileURLToPath(new URL('.', import.meta.url)), '../../scripts/vault-pw-harness.ts');
+              const out = await promisify(execFile)(process.execPath, [script], {
+                timeout: 180_000,
+                env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+              });
+              for (const line of out.stdout.split('\n')) {
+                if (line.includes('[pw-harness]')) console.log(line.trim());
+              }
+            } catch (error) {
+              console.error('[pw-harness] failed:', error instanceof Error ? error.message : error);
+            }
+          })
           .catch((error) => console.error('[e2e] failed:', error));
       }
 
@@ -3129,6 +3147,58 @@ function createWindow(): void {
         await closeOverlays9();
         await sleep(300);
       };
+      // ===== FIX 23 probe (Round 9): import as a NEW WORKSPACE through the REAL ImportModal
+      // UI (dialog:pickOpen stubbed, env-gated main-side), then assert — with NO manual
+      // refresh — that (a) the engine list grew by one under the modal's auto name,
+      // (b) the header pill already shows the new workspace (onImported wiring), and
+      // (c) no loading skeleton flickered (refreshSpaces no-blink contract).
+      try {
+        const spacesBefore9 = (await dropsync.vault.listSpaces()).length;
+        const flicker9 = { seen: false };
+        const mo9 = new MutationObserver((muts) => {
+          for (const m of muts) for (const n of m.addedNodes) {
+            if (n.nodeType === 1 && /animate-pulse/.test((n.className || '') + '')) flicker9.seen = true;
+          }
+        });
+        mo9.observe(document.body, { childList: true, subtree: true });
+        const impTrig = Array.from(document.querySelectorAll('button')).find((b) => (b.textContent || '').trim() === 'Import workspace');
+        if (!impTrig) { out.f22b_fix23_open = 'no-trigger'; }
+        else {
+          impTrig.click();
+          await sleep(400);
+          const q = (txt) => Array.from(document.querySelectorAll('button')).find((b) => (b.textContent || '').trim() === txt);
+          const chooseBtn = q('Choose a .dropsync file…');
+          chooseBtn.click(); // stub resolves the fixture path instantly
+          await sleep(500);
+          const pwInput = document.querySelector('input[autocomplete="current-password"]');
+          const setVal = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          setVal.call(pwInput, 'test-archive-pw');
+          pwInput.dispatchEvent(new Event('input', { bubbles: true }));
+          await sleep(200);
+          q('Check backup').click();
+          await sleep(1500);
+          const importBtn = q('Import backup');
+          out.f22b_fix23_uiReady = !!chooseBtn && !!pwInput && !!importBtn;
+          importBtn.click();
+          let waited = 0;
+          while (waited < 30_000) {
+            await sleep(1000); waited += 1000;
+            if ((await dropsync.vault.listSpaces()).length > spacesBefore9) break;
+          }
+          await sleep(800); // let onImported → setCurrentSpace + refreshSpaces settle
+          const spacesAfter = await dropsync.vault.listSpaces();
+          out.f22b_fix23_spaceListedImmediately = spacesAfter.length === spacesBefore9 + 1
+            && spacesAfter.some((s) => s.name === 'workspace-test Restored');
+          const headerTexts = Array.from(document.querySelectorAll('header span')).map((s) => (s.textContent || '').trim()).join('|');
+          out.f22b_fix23_headerPill = headerTexts.includes('workspace-test Restored');
+          mo9.disconnect();
+          out.f22b_fix23_noLoadingFlicker = !flicker9.seen;
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          await sleep(400);
+          await gotoSpace9('Personal'); // restore the space the drawing cells expect
+        }
+      } catch (e) { out.f22b_fix23_err = String(e.message || e).slice(0, 80); }
+
       // ===== CREATE-mode cells =====
       const seedCommitSelect9 = async () => {
         const s = await seedTextViaDblclick9();
@@ -3213,6 +3283,23 @@ function createWindow(): void {
         });
         out.f22b_fontStatus = JSON.stringify({ tally, perFam });
       } catch (e) { out.f22b_fontStatus = 'err'; }
+      // FIX 25 battery probe — poller-vs-idle-lock. The renderer status-watchdog has been
+      // running the whole stage (vault unlocked via UI). Configure the MINIMUM idle lock (1 min),
+      // then go quiet: only the watchdog's vault:status polls fire — the EXEMPT channel must not
+      // reset lastActivity, so main locks within ~60-70 s and the watchdog flips to UnlockScreen.
+      try {
+        await dropsync.vault.settingsSet({ autoLockMinutes: 1 }); // t0 (this call touches, as a real action would)
+        const t0 = Date.now();
+        let lockedSeen = false;
+        while (Date.now() - t0 < 95_000) {
+          await sleep(5000);
+          const st = await dropsync.vault.status(); // exempt channel
+          if (st.state !== 'unlocked') { lockedSeen = true; break; }
+        }
+        out.f22b_idle_autolock_locked = lockedSeen;
+        out.f22b_idle_autolock_waitMs = Date.now() - t0;
+        out.f22b_idle_autolock_unlockScreen = !!document.querySelector('input[placeholder="Vault password"]');
+      } catch (e) { out.f22b_idle_autolock_err = String(e.message || e).slice(0, 60); }
       localStorage.removeItem('dropsync.sit3.dom');
       out.stage = '9';
       return JSON.stringify(out);
@@ -3378,9 +3465,17 @@ function registerMediaProtocol(): void {
 
 // ------------------------------------------------------------------ IPC
 
+/** FIX 25 — channels exempt from activity tracking. The renderer's status-watch poll
+ * (store/vault.tsx, every 8 s while unlocked) exists to DETECT main-side locks; counting it as
+ * user activity perpetually reset lastActivity, so the idle auto-lock could never fire. Audit:
+ * the only other always-on renderer timer (30 s heartbeat) touches local state only — no IPC;
+ * UndoToast/useNow are local too; media streams ride the protocol handler, not ipcMain.handle.
+ * Real user actions keep touching as before (exports also touch explicitly in exporter.ts). */
+const ACTIVITY_EXEMPT_CHANNELS = new Set<string>(['vault:status']);
+
 function handle(channel: string, listener: (event: Electron.IpcMainInvokeEvent, ...args: never[]) => unknown): void {
   ipcMain.handle(channel, async (event, ...args) => {
-    manager.touch(); // every renderer call counts as activity for idle auto-lock
+    if (!ACTIVITY_EXEMPT_CHANNELS.has(channel)) manager.touch(); // renderer call = activity for idle auto-lock
     try {
       return await Promise.resolve(listener(event, ...(args as never[])));
     } catch (error) {
@@ -3603,12 +3698,18 @@ function registerIpc(): void {
   });
 
   // ---- dialogs
-  handle('dialog:pickOpen', (_e, options: { title?: string; extensions?: string[] }) =>
-    dialog.showOpenDialog(requireWindow(), {
+  handle('dialog:pickOpen', (_e, options: { title?: string; extensions?: string[] }) => {
+    // DOM-harness stub (env-gated twice): let the battery drive the REAL ImportModal without a
+    // native dialog. Only active with DROPSYNC_SIT3_DOMCHECKS + an explicit fixture path.
+    if (process.env.DROPSYNC_SIT3_DOMCHECKS === '1' && process.env.DROPSYNC_FAKE_PICK_OPEN) {
+      return Promise.resolve(process.env.DROPSYNC_FAKE_PICK_OPEN);
+    }
+    return dialog.showOpenDialog(requireWindow(), {
       title: options.title || 'Choose a file',
       properties: ['openFile'],
       filters: options.extensions ? [{ name: 'Files', extensions: options.extensions }] : undefined,
-    }).then((r) => (r.canceled ? null : r.filePaths[0] ?? null)));
+    }).then((r) => (r.canceled ? null : r.filePaths[0] ?? null));
+  });
   handle('dialog:pickOpenMultiple', (_e, options: { title?: string; extensions?: string[] }) =>
     dialog.showOpenDialog(requireWindow(), {
       title: options.title || 'Choose files',
