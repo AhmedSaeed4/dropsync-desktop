@@ -33,7 +33,7 @@ function AppBody() {
   const {
     status, folder, checking, theme, spaces, currentSpaceId, currentSpaceName,
     categories, drops, loading, settings,
-    refreshAll, refreshDrops, patchDropInPlace, patchDropsInPlace, appendDropInPlace, removeDropInPlace, upsertCategoryInPlace,
+    refreshAll, refreshSpaces, refreshDrops, patchDropInPlace, patchDropsInPlace, appendDropInPlace, removeDropInPlace, upsertCategoryInPlace,
     setCurrentSpace, setTheme, handleUnlocked, handleLocked, startCreateFlow, pickCreateFolder,
     fetchTextPayload, getMediaUrl,
   } = store;
@@ -640,6 +640,10 @@ function AppBody() {
             if (result.spaceId && result.spaceId !== 'personal') {
               clearPreviewPayloadCache(); // import = structural (FIX 13 residual contract)
               setCurrentSpace(result.spaceId);
+              // FIX 23 — the import created a NEW workspace; refresh the spaces list so the
+              // switcher (and the header pill) show it immediately instead of waiting for the
+              // next unrelated refresh. Spaces-only: no drops reload, no loading flicker.
+              void refreshSpaces();
             } else {
               // Imports are structural moments (many new drops/categories at once) — the full
               // refresh is intentional here, and the cache clear keeps the preview honest.

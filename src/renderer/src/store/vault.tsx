@@ -36,6 +36,10 @@ interface VaultStoreValue {
   theme: 'light' | 'dark' | 'minimal';
 
   refreshAll: () => Promise<void>;
+  /** FIX 23 — spaces list ONLY: status + listSpaces + setSpacesRaw. No drops reload, no
+   * settings touch, loading never flips — used after import so the switcher lists a newly
+   * created workspace in the same breath as setCurrentSpace, with zero visual event. */
+  refreshSpaces: () => Promise<void>;
   /**
    * First-run CREATE folder pick: dialog → prepareFolder → remember the folder WITHOUT flipping
    * screens (status stays 'none'). Resolves picked:null on cancel; hasVault:true means the picked
@@ -161,6 +165,16 @@ export function VaultStoreProvider({ children }: { children: ReactNode }) {
     setCurrentSpaceId(active);
     await refreshDropsInternal(active ?? 'personal');
   }, [refreshDropsInternal]);
+
+  // FIX 23 — see interface doc. Deliberately NOT refreshAll: import completion must not
+  // refetch drops or flip loading (no-blink contract); only the switcher list changes.
+  const refreshSpaces = useCallback(async () => {
+    const s = await window.dropsync.vault.status();
+    setStatus(s.state);
+    setFolder(s.folder);
+    if (s.state !== 'unlocked') return;
+    setSpacesRaw(await window.dropsync.vault.listSpaces());
+  }, []);
 
   /**
    * First-run CREATE flow: picking a folder must NOT decide which screen you're on. The old path
@@ -311,6 +325,7 @@ export function VaultStoreProvider({ children }: { children: ReactNode }) {
     settings,
     theme,
     refreshAll,
+    refreshSpaces,
     pickCreateFolder,
     refreshDrops,
     patchDropInPlace,
