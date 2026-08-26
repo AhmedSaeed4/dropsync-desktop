@@ -44,6 +44,9 @@ export interface CloudController {
   show(): void;
   hide(): void;
   isVisible(): boolean;
+  /** FIX 2 — re-assert the view bounds (content bounds minus the badge band), idempotently.
+   * Cheap to call often; only writes + logs when the bounds actually drift. No focus steal. */
+  syncBounds(): void;
   /** Probe data for DROPSYNC_CLOUD_DEV: did-finish-load latency for the site origin, if loaded. */
   probeState(): { readyMs: number | null; url: string | null };
   /** f_c1_isolationGuard — evaluate INSIDE the cloud contents (I1: no bridge may exist). */
@@ -120,12 +123,89 @@ const DRESS_CSS = `
   input:focus { outline: none !important; border-color: #1a1a1a !important; }
   button { border-radius: 100px !important; font-family: inherit !important; transition: all .25s ease !important; }
 `;
-/** Read-only check INSIDE the page: is this visit UNAUTHENTICATED? Signal = absence of
- * Firebase's standard `firebase:authUser*` localStorage keys (same primitive as C1's
- * f_c1_authSeen) — stable across site redesigns, unlike button text (the live home hides its
- * sign-in controls behind a modal/layout variant). Read-only; we never write site storage. */
-const UNAUTH_CHECK =
-  "Object.keys(localStorage).every((k) => !k.startsWith('firebase:authUser'))";
+/** Hard timeout (ms) for ANY in-page probe, so a hung `executeJavaScript` can never wedge the
+ * single-flight dressing ticker (or leave a hidden read hanging). */
+const PROBE_TIMEOUT_MS = 2000;
+
+/** Race a promise against a hard timeout. `timeoutValue` resolves if the promise is still pending
+ * when the timer fires — so callers can treat it as "doubt, fail open". */
+function withTimeout<T>(promise: Promise<T>, timeoutValue: T): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => setTimeout(() => resolve(timeoutValue), PROBE_TIMEOUT_MS)),
+  ]);
+}
+
+/** Shape returned by CLOUD_PAGE_PROBE (evaluated inside the cloud contents). */
+interface PageProbe {
+  /** The site's signed-in shell (`#app-shell`) exists — STRONG signed-in marker. */
+  appShell: boolean;
+  /** Legacy `firebase:authUser*` localStorage keys present (cheap secondary signal). */
+  keys: number;
+  /** appShell OR keys. */
+  signedIn: boolean;
+  /** A VISIBLE "Sign in with Google" control is present AND the signed-in shell is absent. */
+  surface: boolean;
+  /** Best-effort email off the signed-in page's account chip / legacy storage; null if not
+   * confidently readable (never faked). */
+  email: string | null;
+}
+
+/**
+ * DOM-truth page probe, evaluated INSIDE the cloud contents (read-only; we never write site
+ * storage). Replaces the old localStorage-only `firebase:authUser*` unauth check, which the live
+ * site defeats because Firebase now persists auth in IndexedDB (`firebaseLocalStorageDb`), NOT
+ * localStorage — so the old signal ALWAYS answered "signed out" and glued the costume onto the
+ * SIGNED-IN home page (the white page + side-squish). New signals (see PageProbe). Decision rule
+ * (attachAuthDressing): dress ONLY on positive evidence (auth route + shell absent + login surface
+ * present); ANY doubt fails OPEN to the site's normal look.
+ */
+const CLOUD_PAGE_PROBE = `
+(async () => {
+  let appShell = false, keys = 0, signedIn = false, surface = false, email = null;
+  try { appShell = !!document.querySelector('#app-shell'); } catch {}
+  try {
+    const all = Object.keys(localStorage);
+    keys = all.filter((k) => k.startsWith('firebase:authUser')).length;
+  } catch {}
+  signedIn = appShell || keys > 0;
+  if (!appShell) {
+    try {
+      const els = Array.from(document.querySelectorAll('button, a'));
+      for (let i = 0; i < els.length; i++) {
+        const el = els[i];
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t.indexOf('sign in with google') !== -1 && (el.offsetParent !== null || el.getClientRects().length > 0)) {
+          surface = true; break;
+        }
+      }
+    } catch {}
+  }
+  if (signedIn) {
+    try {
+      const chip = document.querySelector('[data-testid*="account" i], [aria-label*="account" i], [aria-label*="avatar" i], img[alt*="avatar" i]');
+      const label = chip ? (chip.getAttribute('aria-label') || chip.getAttribute('title') || (chip.textContent || '')) : '';
+      const m = label.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}/);
+      if (m) email = m[0];
+    } catch {}
+    if (!email) {
+      try {
+        const all = Object.keys(localStorage);
+        for (let i = 0; i < all.length; i++) {
+          const k = all[i];
+          if (k.startsWith('firebase:authUser')) {
+            try {
+              const v = JSON.parse(localStorage.getItem(k) || '{}');
+              if (typeof v.email === 'string' && v.email.indexOf('@') !== -1) { email = v.email; break; }
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+  }
+  return { appShell: appShell, keys: keys, signedIn: signedIn, surface: surface, email: email };
+})()
+`;
 
 interface DressingState {
   dressed: boolean;
@@ -136,22 +216,26 @@ interface DressingState {
 function attachAuthDressing(wc: Electron.WebContents, state: DressingState): void {
   let dressKey: string | null = null;
 
-  const undress = async (): Promise<void> => {
+  const logDecision = (change: 'APPLIED' | 'REMOVED', reason: string, extra: Record<string, unknown>): void => {
+    console.log('[cloud] dressing', change, '-', reason, JSON.stringify(extra));
+  };
+  const undress = async (reason: string): Promise<void> => {
     if (dressKey) {
       const key = dressKey;
       dressKey = null;
       state.dressed = false;
       state.removedCount += 1;
-      console.log('[cloud] dressing removed');
+      logDecision('REMOVED', reason, { url: wc.getURL() });
       try {
         await wc.removeInsertedCSS(key);
       } catch { /* page may have navigated under us — harmless */ }
     }
   };
-  /** One reconciliation step: dress iff on an auth path AND unauthenticated. Runs on
-   * navigation events AND a steady 1.5 s tick (covers React hydration racing did-finish-load
-   * AND popup-completed auth, where keys appear without any navigation). Single-flight:
-   * overlapping ticks could otherwise double-insert CSS. */
+  /** One reconciliation step: dress ONLY on positive evidence that this is the UNAUTHENTICATED
+   * login surface. Runs on navigation events AND a steady 1.5 s tick (covers React hydration
+   * racing did-finish-load AND popup-completed auth, where the shell appears without navigation).
+   * Single-flight: overlapping ticks could otherwise double-insert CSS. Every in-page probe is
+   * wrapped in a 2 s hard timeout so the flag can never wedge on a hung promise. */
   let ticking = false;
   const tick = async (): Promise<void> => {
     if (ticking) return;
@@ -168,26 +252,43 @@ function attachAuthDressing(wc: Electron.WebContents, state: DressingState): voi
       const u = new URL(wc.getURL());
       onAuthPath = u.origin === CLOUD_ORIGIN && AUTH_PATHS.has(u.pathname);
     } catch { onAuthPath = false; }
-    if (!onAuthPath) return void undress();
-    let isUnauth = true;
+    if (!onAuthPath) return void undress('off-route');
+    // DOM-truth probe with a hard timeout. `null` = the probe did NOT resolve in time → doubt →
+    // fail OPEN (remove the costume; never wedge the flag).
+    let probe: PageProbe | null = null;
     try {
-      isUnauth = !!(await wc.executeJavaScript(`!!(${UNAUTH_CHECK})`));
+      probe = await withTimeout<PageProbe | null>(
+        wc.executeJavaScript(CLOUD_PAGE_PROBE) as Promise<PageProbe>,
+        null,
+      );
     } catch (error) {
       console.log('[cloud] tick: execJS threw:', error instanceof Error ? error.message : String(error));
-      isUnauth = false;
+      return void undress('exec-error');
     }
-    const shouldDress = onAuthPath && isUnauth;
+    if (!probe) return void undress('probe-timeout');
+    // Dress ONLY on positive evidence: on an auth route AND NOT signed-in AND a visible "Sign in
+    // with Google" control is present. The signed-in marker = `#appShell` OR any legacy
+    // `firebase:authUser*` localStorage key (so injecting such a key — the f_c2d_dressFailSafe probe
+    // — correctly REMOVES the costume). Everything else (signed-in, probe timeout, exec error,
+    // off-route) removes the costume. This is the fail-open guarantee: the signed-in app never wears
+    // the disguise.
+    const shouldDress = onAuthPath && !probe.signedIn && probe.surface;
     if (shouldDress && !dressKey) {
       try {
         dressKey = await wc.insertCSS(DRESS_CSS);
         state.dressed = true;
         state.appliedCount += 1;
-        console.log('[cloud] dressing applied');
+        logDecision('APPLIED', 'login-surface-detected', {
+          route: wc.getURL(),
+          appShell: probe.appShell,
+          keys: probe.keys,
+          surface: probe.surface,
+        });
       } catch (error) {
         console.log('[cloud] insertCSS failed:', error instanceof Error ? error.message : String(error));
       }
     } else if (!shouldDress && dressKey) {
-      await undress(); // authenticated (keys appeared) or off-route → normal framed-site look
+      undress('authenticated-or-no-surface');
     }
   };
   const timer = setInterval(() => void tick(), 1500);
@@ -198,11 +299,12 @@ function attachAuthDressing(wc: Electron.WebContents, state: DressingState): voi
 }
 
 /**
- * C2 email discovery (read-only): a HIDDEN temporary WebContentsView on persist:cloud loads
- * the site origin and reads the signed-in marker studied in C1 (firebase:authUser keys);
- * the email is extracted ONLY if trivially available in that storage JSON. NEVER writes site
- * storage; the view is destroyed after reading. Uncertain ⇒ {signedIn:false} — the porch then
- * renders the neutral card; we do NOT fake an email. Runs async, never blocks porch paint.
+ * C2 email discovery (read-only): a HIDDEN temporary WebContentsView on persist:cloud loads the
+ * site origin and reads the SAME corrected DOM-truth probe used by the dressing detector
+ * (`#app-shell` presence OR a legacy `firebase:authUser` localStorage key ⇒ signed in). The email
+ * is extracted from the signed-in page's account chip (best effort; never faked). If not
+ * confidently readable ⇒ {signedIn:true, email:null} → honest neutral porch card. NEVER writes
+ * site storage; the view is destroyed after reading. Runs async, never blocks porch paint.
  */
 export async function probeCloudSessionEmail(): Promise<{
   signedIn: boolean;
@@ -228,22 +330,18 @@ export async function probeCloudSessionEmail(): Promise<{
       new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 20_000)),
     ]);
     if (!loaded) return { signedIn: false, email: null };
-    // Settle briefly so Firebase can restore its authUser localStorage entry post-hydration.
+    // Settle briefly so React can mount the signed-in shell + restore auth post-hydration.
     await new Promise((r) => setTimeout(r, 2500));
-    return (await temp.webContents.executeJavaScript(
-      `(async () => {
-        const keys = Object.keys(localStorage).filter((k) => k.startsWith('firebase:authUser'));
-        for (const k of keys) {
-          try {
-            const v = JSON.parse(localStorage.getItem(k) || '{}');
-            if (typeof v.email === 'string' && v.email.includes('@')) {
-              return { signedIn: true, email: v.email };
-            }
-          } catch {}
-        }
-        return { signedIn: false, email: null };
-      })()`
-    )) as { signedIn: boolean; email: string | null };
+    // Read signed-in state via the SAME corrected DOM-truth probe (IndexedDB-backed Firebase auth
+    // no longer hides behind a missing localStorage key). Email comes from the signed-in page's
+    // account chip, never faked; if not confidently readable we report signed-in + null email →
+    // honest neutral card. NEVER fabricate an address.
+    const probe = await withTimeout<PageProbe | null>(
+      temp.webContents.executeJavaScript(CLOUD_PAGE_PROBE) as Promise<PageProbe>,
+      null,
+    );
+    if (probe && probe.signedIn) return { signedIn: true, email: probe.email };
+    return { signedIn: false, email: null };
   } catch {
     return { signedIn: false, email: null };
   } finally {
@@ -329,11 +427,20 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
   let loadStartedAt = 0;
   const dressing: DressingState = { dressed: false, appliedCount: 0, removedCount: 0 };
 
-  /** Bounds = content bounds minus the bottom badge band (planner §4, rectangular form). */
-  const applyBounds = (): void => {
+  /** Bounds = content bounds minus the bottom badge band (planner §4, rectangular form). Idempotent:
+   * compares against the view's current bounds and only writes (logging) when they actually differ,
+   * so the resize handlers, the deferred re-apply, and the watchdog can all call it freely with no
+   * focus steal and no log spam. */
+  const syncBounds = (): void => {
     if (!view) return;
+    if (mainWindow.isDestroyed()) return;
     const b = mainWindow.getContentBounds();
-    view.setBounds({ x: 0, y: 0, width: b.width, height: Math.max(0, b.height - NOTCH_H) });
+    const expected = { x: 0, y: 0, width: b.width, height: Math.max(0, b.height - NOTCH_H) };
+    const cur = view.getBounds();
+    if (cur.x !== expected.x || cur.y !== expected.y || cur.width !== expected.width || cur.height !== expected.height) {
+      view.setBounds(expected);
+      console.log('[cloud] bounds set', JSON.stringify({ from: cur, to: expected }));
+    }
   };
 
   const ensureView = (): WebContentsView => {
@@ -363,7 +470,7 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
       mainWindow.contentView.addChildView(v);
       shown = true;
     }
-    applyBounds();
+    syncBounds();
     v.setVisible(true);
     v.webContents.focus();
   };
@@ -376,10 +483,20 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
     if (mainWindow.isFocused()) mainWindow.webContents.focus();
   };
 
+  // Bounds watchdog (FIX 2c): even if WSLg swallows EVERY resize/maximize/full-screen event, a 1 s
+  // tick re-asserts the correct bounds while the view is visible. syncBounds is idempotent + guarded
+  // so it never touches a destroyed window and only logs on a real drift.
+  const boundsWatchdog = setInterval(() => {
+    if (mainWindow.isDestroyed()) return;
+    if (view && shown) syncBounds();
+  }, 1000);
+  mainWindow.once('closed', () => clearInterval(boundsWatchdog));
+
   return {
     show,
     hide,
     isVisible: () => shown,
+    syncBounds,
     probeState: () => ({ readyMs, url: view ? CLOUD_URL : null }),
     probeIsolation: async () => {
       if (!view) return { dropsyncType: 'no-view', hasPreloadKey: true as const };
@@ -474,8 +591,13 @@ export function attachCloudResizeTracking(
   mainWindow: BrowserWindow,
   controller: CloudController,
 ): void {
+  // FIX 2a/b: re-apply bounds via syncBounds() (NO focus steal) and re-apply at 0/100/400 ms —
+  // WSLg may deliver the final size late, so the deferred re-apply guarantees the view follows.
   const handler = (): void => {
-    if (controller.isVisible()) controller.show(); // re-apply bounds via the same path
+    if (!controller.isVisible()) return;
+    controller.syncBounds();
+    setTimeout(() => controller.syncBounds(), 100);
+    setTimeout(() => controller.syncBounds(), 400);
   };
   mainWindow.on('resize', handler);
   mainWindow.on('maximize', handler);
