@@ -10,7 +10,7 @@
 import { app, BrowserWindow, ipcMain, dialog, Notification, protocol, shell, net } from 'electron';
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';import { createWriteStream } from 'node:fs';
+import { fileURLToPath } from 'node:url';import { createWriteStream, mkdirSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
@@ -3400,12 +3400,50 @@ function createWindow(): void {
             try {
               const win = mainWindow;
               if (!win || !cloudCtl) throw new Error('window/controller gone');
-              const memTarget = process.env.DROPSYNC_CLOUD_DEV_MEM === 'local' ? 'local' : 'cloud';
+              // C2b FIX 4 precondition: guarantee a vault exists and is LOCKED so the porch
+              // embeds the real UnlockScreen (not FirstRunSetup) when the pill sits on Local.
+              // The manager boots folder-less in dev profiles, so force the sequence:
+              // ensure dir → prepare → create-if-missing → unlock (loads folder) → lock (seals).
+              mkdirSync('/tmp/ds-c2b-vault', { recursive: true });
+              const vState = await win.webContents.executeJavaScript(
+                `(async () => {
+                   const d = window.dropsync;
+                   await d.vault.prepareFolder('/tmp/ds-c2b-vault').catch(() => {});
+                   try { await d.vault.create('/tmp/ds-c2b-vault', 'c2b-vault-pw'); } catch {}
+                   await d.vault.unlock('/tmp/ds-c2b-vault', 'c2b-vault-pw');
+                   await d.vault.lock();
+                   return JSON.stringify(await d.vault.status());
+                 })()`
+              );
+              console.log('[c2-pre]', JSON.stringify({ vaultState: vState }));
+              // Memory rule, LOCAL leg first (also the f_c2_localEmbedded window: pill on Local
+              // with the locked vault ⇒ UnlockScreen embedded), then the CLOUD leg.
               await win.webContents.executeJavaScript(
-                `localStorage.setItem('dropsync.mode.last','${memTarget}')`
+                "localStorage.setItem('dropsync.mode.last','local')"
               );
               win.webContents.reload();
-              await new Promise((r) => setTimeout(r, 5000)); // [c2] #2 emitted by remounted porch
+              await new Promise((r) => setTimeout(r, 5000)); // [c2] emitted by remounted porch
+              // C2c FIX 4 — collision/geometry proof at ONE SMALLER window size too (the
+              // default-size [c2c] auto-ran renderer-side when the form embedded).
+              const savedBounds = win.getBounds();
+              win.setSize(1150, 760);
+              await new Promise((r) => setTimeout(r, 500));
+              const smallProbe = await win.webContents.executeJavaScript(
+                'window.__c2cPillProbe ? window.__c2cPillProbe() : Promise.resolve({ missing: true })'
+              );
+              console.log('[c2c-small]', JSON.stringify(smallProbe));
+              // TEMP C2c debug
+              const dbg2 = await win.webContents.executeJavaScript(
+                "JSON.stringify({n:document.querySelectorAll('[data-testid=\"porch-pill-float\"]').length,attached:[...document.querySelectorAll('[data-testid=\"porch-pill-float\"]')].map(e=>e.isConnected),porchKids:[...(document.querySelector('[data-testid=\"porch\"]')?.children ?? [])].map(c=>c.getAttribute('data-testid')||c.tagName),chromeInDom:!!document.querySelector('[data-testid=\"porch-knob\"]')})"
+              );
+              console.log('[c2c-dbg]', dbg2);
+              win.setSize(savedBounds.width, savedBounds.height);
+              await new Promise((r) => setTimeout(r, 400));
+              await win.webContents.executeJavaScript(
+                "localStorage.setItem('dropsync.mode.last','cloud')"
+              );
+              win.webContents.reload();
+              await new Promise((r) => setTimeout(r, 5000)); // [c2] emitted by remounted porch
               await win.webContents.executeJavaScript(
                 "window.dispatchEvent(new CustomEvent('dropsync:c2-dev-enter',{detail:{mode:'cloud'}}))"
               );
@@ -3447,6 +3485,13 @@ function createWindow(): void {
               // C2 steady state: after all the churn the unauth home must STILL be dressed.
               await new Promise((r) => setTimeout(r, 5000));
               console.log('[c2b-steady]', JSON.stringify(cloudCtl!.dressedProbe()));
+              // Real-restart proof helper: leave a specific memory value behind for the NEXT
+              // boot to read (DROPSYNC_CLOUD_DEV_MEM=local ⇒ next launch must open on Local).
+              if (process.env.DROPSYNC_CLOUD_DEV_MEM === 'local') {
+                await win.webContents.executeJavaScript(
+                  "localStorage.setItem('dropsync.mode.last','local')"
+                );
+              }
             } catch (error) {
               console.error('[c1] failed:', error instanceof Error ? error.message : String(error));
             }
@@ -3675,7 +3720,9 @@ function registerIpc(): void {
       return { mode: appMode, ...st, isolation, authSeen };
     });
     handle('mode:c2Evidence', (_e, evidence: unknown) => {
-      console.log('[c2]', JSON.stringify(evidence));
+      const tagged = evidence as { c2cTag?: string };
+      const line = tagged && tagged.c2cTag === 'pillfloat' ? '[c2c]' : '[c2]';
+      console.log(line, JSON.stringify(evidence));
     });
   }
   handle('vault:changePassword', (_e, oldPassword: string, newPassword: string) => manager.changePassword(oldPassword, newPassword));

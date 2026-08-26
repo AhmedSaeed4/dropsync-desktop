@@ -41,6 +41,9 @@ function writeLastMode(mode: DesktopMode): void {
 interface PorchProps {
   /** Enters the chosen mode (App-level: porch → local branch or C1 cloud view). */
   onEnter: (mode: DesktopMode) => void;
+  /** C2b — callback-ref for the Local-panel slot: AppBody portals the REAL entry component
+   * (FirstRunSetup / UnlockScreen) here; the porch is just the frame around it. */
+  localSlotRef: (el: HTMLDivElement | null) => void;
 }
 
 
@@ -57,7 +60,7 @@ const PILL_BTN =
 
 function Pill({ sel, onPick }: { sel: DesktopMode; onPick: (m: DesktopMode) => void }) {
   return (
-    <div className="inline-flex relative rounded-full bg-[#1a1a1a] p-1">
+    <div data-testid="porch-pill" className="inline-flex relative rounded-full bg-[#1a1a1a] p-1">
       <span
         data-testid="porch-knob"
         aria-hidden
@@ -81,8 +84,6 @@ function Pill({ sel, onPick }: { sel: DesktopMode; onPick: (m: DesktopMode) => v
 
 
 
-const CARD =
-  'w-[340px] max-w-full rounded-2xl border border-[#1a1a1a]/10 bg-white/70 p-7 text-center';
 const HEADING = 'text-lg font-light tracking-tight text-[#1a1a1a] mb-1';
 const NOTE = 'text-xs text-[#1a1a1a]/45 mt-4 leading-relaxed';
 const PRIMARY_BTN =
@@ -90,9 +91,10 @@ const PRIMARY_BTN =
 const MUTED_LINK =
   'bg-none border-none p-0 text-xs text-[#1a1a1a]/50 underline underline-offset-[3px] cursor-pointer hover:text-[#1a1a1a] transition-colors';
 
-/** Cloud panel content (§2). Remembered session ⇒ "Continue as <email>" + muted switch link;
- * otherwise the neutral card. BOTH one-tap into the C1 cloud view — the SITE's own UI handles
- * credentials/account switching there (planner ruling; prototype State B is indicative only). */
+/** C2b FIX 3 — borderless: centered text + button + link directly on the background (prototype:
+ * "No cards"). Remembered session ⇒ "Continue as <email>" + muted switch link; otherwise the
+ * neutral card. BOTH one-tap into the C1 cloud view — the SITE's own UI handles credentials/
+ * account switching there (planner ruling; prototype State B is indicative only). */
 function CloudCard({
   probe,
   onEnter,
@@ -101,7 +103,7 @@ function CloudCard({
   onEnter: () => void;
 }) {
   return (
-    <div className={CARD} data-testid="porch-cloud-card">
+    <div className="w-[420px] max-w-full px-6 text-center" data-testid="porch-cloud-card">
       {probe.state === 'signedIn' && probe.email ? (
         <>
           <p className={HEADING}>Welcome back</p>
@@ -138,23 +140,6 @@ function CloudCard({
   );
 }
 
-/** Local panel card — indicative only; the REAL entry flows (FirstRunSetup / UnlockScreen,
- * M7 offer included) render unchanged right after choosing Local. */
-function LocalCard({ onEnter }: { onEnter: () => void }) {
-  return (
-    <div className={CARD} data-testid="porch-local-card">
-      <p className={HEADING}>Your encrypted vault</p>
-      <p className="text-sm text-[#1a1a1a]/60 mt-2">
-        Everything local, sealed with your password.
-      </p>
-      <button type="button" onClick={onEnter} className={PRIMARY_BTN}>
-        Open Local
-      </button>
-      <p className={NOTE}>Local locks whenever you leave it or step away.</p>
-    </div>
-  );
-}
-
 
 
 
@@ -176,8 +161,15 @@ function buildEvidence(args: {
   const panelTransition = args.panelEl ? getComputedStyle(args.panelEl).transition : null;
   const storedAbsent = storedValue === null;
   const storedValid = storedValue === 'cloud' || storedValue === 'local';
+  // C2b FIX 4 — is the REAL entry component embedded in the Local panel (no placeholder card)?
+  const porchRoot = document.querySelector('[data-testid="porch"]');
+  const porchText = porchRoot?.textContent ?? '';
+  const unlockEmbedded = !!porchRoot?.querySelector('input[placeholder="Vault password"]');
+  const firstrunEmbedded =
+    !unlockEmbedded && (porchRoot?.querySelectorAll('input[type="password"]').length ?? 0) >= 2;
+  const embeddedKind = unlockEmbedded ? 'unlock' : firstrunEmbedded ? 'firstrun' : 'none';
   return {
-    f_c2_porchRenders: !!document.querySelector('[data-testid="porch"]'),
+    f_c2_porchRenders: !!porchRoot,
     storedValue,
     pillInitial: args.pillInitial,
     pillNow: args.sel,
@@ -194,12 +186,19 @@ function buildEvidence(args: {
     f_c2_slideTransition:
       !!knobTransition?.includes('cubic-bezier(0.34, 1.56, 0.64, 1)') &&
       !!panelTransition?.includes('cubic-bezier(0.22, 0.61, 0.36, 1)'),
+    embeddedKind,
+    placeholderCardGone: !porchText.includes('Open Local') && !porchText.includes('Your encrypted vault'),
+    f_c2_localEmbedded:
+      !!porchRoot &&
+      args.sel === 'local' &&
+      embeddedKind === 'unlock' &&
+      !porchText.includes('Open Local'),
   };
 }
 
 
 
-export function Porch({ onEnter }: PorchProps) {
+export function Porch({ onEnter, localSlotRef }: PorchProps) {
   const pillInitial = useRef(readLastMode()).current;
   const [sel, setSel] = useState<DesktopMode>(pillInitial);
   const selRef = useRef(sel);
@@ -209,6 +208,8 @@ export function Porch({ onEnter }: PorchProps) {
   }));
   const busyRef = useRef(false);
   const panelRefs = useRef<Partial<Record<DesktopMode, HTMLDivElement | null>>>({});
+  // C2c — floating chrome can be dropped/restored by the DEV geometry probe.
+  const [chromeUp, setChromeUp] = useState(true);
   const [probe, setProbe] = useState<{ state: 'probing' | 'signedIn' | 'none'; email: string | null }>({
     state: 'probing',
     email: null,
@@ -269,26 +270,9 @@ export function Porch({ onEnter }: PorchProps) {
   }, []);
 
   // DEV battery (?c2dev tag written by main under DROPSYNC_CLOUD_DEV=1): emit evidence on
-  // mount AND again when the email probe resolves. StrictMode double-invokes effects, so
-  // identical consecutive signatures are suppressed. Channel is env-gated main-side; rejects
-  // elsewhere are swallowed.
-  const lastEmitSig = useRef('');
-  useEffect(() => {
-    if (!new URLSearchParams(window.location.search).has('c2dev')) return;
-    const ev = buildEvidence({
-      pillInitial,
-      sel: selRef.current,
-      probe,
-      knobEl: document.querySelector('[data-testid="porch-knob"]'),
-      panelEl:
-        panelRefs.current[pillInitial] ??
-        document.querySelector('[data-testid^="porch-panel-"]'),
-    });
-    const sig = JSON.stringify([ev.pillInitial, ev.pillNow, probe.state, probe.email]);
-    if (sig === lastEmitSig.current) return;
-    lastEmitSig.current = sig;
-    window.dropsync.mode.devC2?.(ev).catch(() => {});
-  }, [pillInitial, probe]);
+  // mount AND whenever the Local-panel slot mutates (the portaled real form can land seconds
+  // later — slow first status round-trip). StrictMode double-invokes are deduped by signature;
+  // channel is env-gated main-side, rejects swallowed.
 
   // Headless entry for the battery — ENTERS the mode directly (bypasses pick(): when the pill
   // already sits on the requested mode, pick() would correctly no-op, but the battery wants
@@ -305,28 +289,161 @@ export function Porch({ onEnter }: PorchProps) {
     return () => window.removeEventListener(C2_DEV_ENTER, h);
   }, [onEnter]);
 
+  // C2c FIX 3/4 — floating-pill geometry probe (dev-gated). Proves the embedded screen's
+  // bounding boxes are IDENTICAL with the floating chrome mounted vs unmounted (the core
+  // owner guarantee: zero geometry change), that the float wrapper has no background of its
+  // own and hangs directly off the porch root (no band element), and that the pill zone does
+  // not collide with any interactive element of the embedded form.
+  const floatBusyRef = useRef(false);
+  const runPillFloatProbe = useCallback(async (): Promise<Record<string, unknown>> => {
+    if (floatBusyRef.current) return { f_c2_pillFloat: false, reason: 'busy' };
+    floatBusyRef.current = true;
+    try {
+      const rectOf = (el: Element): Record<string, number> => {
+        const r = el.getBoundingClientRect();
+        const q = (n: number): number => Math.round(n * 10) / 10;
+        return { x: q(r.x), y: q(r.y), w: q(r.width), h: q(r.height) };
+      };
+      const grab = (): { form: Record<string, number>; controls: Record<string, number>[] } | null => {
+        const slotChild = document.querySelector('[data-testid="porch-local-slot"]')?.firstElementChild;
+        if (!slotChild) return null;
+        const controls = [...slotChild.querySelectorAll('input,button')].slice(0, 4).map(rectOf);
+        return { form: rectOf(slotChild), controls };
+      };
+      const doubleRaf = (): Promise<void> =>
+        new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+      const porchRoot = document.querySelector('[data-testid="porch"]');
+      const wrapper = document.querySelector('[data-testid="porch-pill-float"]');
+      if (!wrapper) return { f_c2_pillFloat: false, reason: 'no-float-wrapper' };
+      // Wait out web-font loading: late font swaps shift text metrics and would fake a
+      // geometry change that the pill never caused.
+      try {
+        await document.fonts.ready;
+      } catch { /* older engine — proceed */ }
+      await doubleRaf();
+      const before = grab();
+      if (!before) return { f_c2_pillFloat: false, reason: 'no-embedded-form' };
+      const pillEl = wrapper.querySelector('[data-testid="porch-pill"]') ?? wrapper;
+      const pillRect = rectOf(pillEl);
+      const interactive = [
+        ...(document.querySelector('[data-testid="porch-local-slot"]')?.querySelectorAll('button,input,a') ?? []),
+      ].map(rectOf);
+      const overlaps = interactive.filter(
+        (r) => r.x < pillRect.x + pillRect.w && r.x + r.w > pillRect.x && r.y < pillRect.y + pillRect.h && r.y + r.h > pillRect.y
+      );
+      setChromeUp(false);
+      await doubleRaf();
+      await new Promise((r) => setTimeout(r, 60));
+      const during = grab();
+      setChromeUp(true);
+      await doubleRaf();
+      await new Promise((r) => setTimeout(r, 60));
+      const after = grab();
+      // NOTE: hiding the chrome UNMOUNTS the original wrapper node — re-query the live one
+      // for style/parent checks (a stale reference would read as detached: bg '' / no parent).
+      const liveWrapper = document.querySelector('[data-testid="porch-pill-float"]');
+      if (!liveWrapper) return { f_c2_pillFloat: false, reason: 'wrapper-gone-after-restore' };
+      const bg = getComputedStyle(liveWrapper).backgroundColor;
+      const parentIsPorch = liveWrapper.parentElement === porchRoot;
+      const geometryEqual =
+        JSON.stringify(before) === JSON.stringify(during) &&
+        JSON.stringify(before) === JSON.stringify(after);
+      return {
+        f_c2_pillFloat: geometryEqual && (bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') && parentIsPorch,
+        geometryEqual,
+        wrapperBgTransparent: bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent',
+        wrapperBgRaw: bg,
+        wrapperParentIsPorch: parentIsPorch,
+        wrapperDebug: {
+          tag: liveWrapper.tagName,
+          parentTag: liveWrapper.parentElement?.tagName ?? null,
+          parentTestId: liveWrapper.parentElement?.getAttribute('data-testid') ?? null,
+        },
+        pillZoneOverlapInteractive: overlaps.length > 0,
+        overlapCount: overlaps.length,
+        formRectWithPill: before.form,
+        firstControlRectWithPill: before.controls[0] ?? null,
+      };
+    } finally {
+      floatBusyRef.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!new URLSearchParams(window.location.search).has('c2dev')) return;
+    (window as unknown as { __c2cPillProbe?: () => Promise<Record<string, unknown>> }).__c2cPillProbe =
+      runPillFloatProbe;
+    return () => {
+      delete (window as unknown as { __c2cPillProbe?: unknown }).__c2cPillProbe;
+    };
+  }, [runPillFloatProbe]);
+
+  // DEV battery (?c2dev tag written by main under DROPSYNC_CLOUD_DEV=1): emit evidence on
+  // mount AND whenever the Local-panel slot mutates (the portaled real form can land seconds
+  // later — slow first status round-trip). StrictMode double-invokes are deduped by signature;
+  // channel is env-gated main-side, rejects swallowed. Once the real form is embedded, the
+  // C2c floating-pill geometry proof auto-runs at the current window size.
+  const lastEmitSig = useRef('');
+  useEffect(() => {
+    if (!new URLSearchParams(window.location.search).has('c2dev')) return;
+    const collect = (): Record<string, unknown> =>
+      buildEvidence({
+        pillInitial,
+        sel: selRef.current,
+        probe,
+        knobEl: document.querySelector('[data-testid="porch-knob"]'),
+        panelEl:
+          panelRefs.current[pillInitial] ??
+          document.querySelector('[data-testid^="porch-panel-"]'),
+      });
+    const emit = (): void => {
+      const ev = collect();
+      const sig = JSON.stringify([ev.pillNow, ev.embeddedKind, ev.cardKind, probe.email]);
+      if (sig === lastEmitSig.current) return;
+      lastEmitSig.current = sig;
+      window.dropsync.mode.devC2?.(ev).catch(() => {});
+    };
+    emit();
+    const floatDoneRef = { done: false };
+    const slotEl = document.querySelector('[data-testid="porch-local-slot"]');
+    const mo = new MutationObserver(() => {
+      emit();
+      if (!floatDoneRef.done && selRef.current === 'local' && document.querySelector('[data-testid="porch-local-slot"] input')) {
+        floatDoneRef.done = true;
+        void runPillFloatProbe().then((res) => {
+          window.dropsync.mode.devC2?.({ c2cTag: 'pillfloat', ...res }).catch(() => {});
+        });
+      }
+    });
+    if (slotEl) mo.observe(slotEl, { childList: true, subtree: true });
+    return () => mo.disconnect();
+  }, [pillInitial, probe, runPillFloatProbe]);
+
   return (
     <div
       data-testid="porch"
-      className="fixed inset-0 bg-[#FAF7F2] flex flex-col items-center overflow-hidden"
+      className="fixed inset-0 bg-[#FAF7F2] overflow-hidden"
       style={{ fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif" }}
     >
-      <div className="flex-1 w-full flex flex-col items-center justify-center pt-6">
-        <p className="text-xs tracking-[0.35em] text-[#1a1a1a]/50 mb-9" style={{ fontVariantCaps: 'small-caps' }}>
-          DROPSYNC · DESKTOP
-        </p>
-        <Pill sel={sel} onPick={pick} />
-        <div className="relative w-full flex-1 min-h-[320px]">
-          {(['cloud', 'local'] as const).map((m) => (
+      {/* C2c FIX 1/2 — the glide layer IS the full window: embedded FirstRunSetup/UnlockScreen
+       * render at their natural, untouched size (identical pixels to standalone); the pill
+       * FLOATS above them and panels slide BENEATH it. No bands, no spacers, no squeezing. */}
+      <div className="absolute inset-0">
+        {(['cloud', 'local'] as const).map((m) => {
+          const isLocal = m === 'local';
+          return (
             <div
               key={m}
               ref={(el) => {
                 panelRefs.current[m] = el;
               }}
               data-testid={`porch-panel-${m}`}
-              className="absolute left-0 top-1/2 w-full flex justify-center"
+              className={`absolute inset-0 ${isLocal ? '' : 'flex justify-center'}`}
               style={{
-                transform: `translate(${TX[pos[m]]}px, calc(-50% - 96px))`,
+                transform: isLocal
+                  ? `translate(${TX[pos[m]]}px, 0)`
+                  : `translate(${TX[pos[m]]}px, calc(-50% - 110px))`,
+                top: isLocal ? 0 : '50%',
                 opacity: pos[m] === 'active' ? 1 : 0,
                 pointerEvents: pos[m] === 'active' ? 'auto' : 'none',
                 transition: 'opacity 0.28s ease, transform 0.45s cubic-bezier(0.22, 0.61, 0.36, 1)',
@@ -336,14 +453,43 @@ export function Porch({ onEnter }: PorchProps) {
               {m === 'cloud' ? (
                 <CloudCard probe={probe} onEnter={() => onEnter('cloud')} />
               ) : (
-                <LocalCard onEnter={() => onEnter('local')} />
+                /* FIX 1 (C2b): the REAL entry component portals in here at FULL window size. */
+                <div ref={localSlotRef} data-testid="porch-local-slot" className="h-full w-full" />
               )}
             </div>
-          ))}
-        </div>
+          );
+        })}
       </div>
-      <div className="absolute bottom-8 left-8 text-xs text-[#1a1a1a]/45">{clock}</div>
-      <div className="absolute bottom-8 right-8 text-xs text-[#1a1a1a]/45">EDITION 2.0</div>
+
+      {/* C2c FIX 2 — FLOATING chrome: transparent overlay (no band/strip), pointer-events only
+       * on its own controls; FIX 2 (C2b) still applies — branding yields to the real Local
+       * form, so the wordmark shows only with the Cloud panel. */}
+      <div
+        data-testid="porch-wordmark"
+        className={`pointer-events-none absolute inset-x-0 top-[18px] z-[60] flex justify-center transition-opacity duration-200 ${
+          sel === 'cloud' ? 'opacity-100' : 'opacity-0'
+        }`}
+      >
+        <p className="text-xs tracking-[0.35em] text-[#1a1a1a]/50" style={{ fontVariantCaps: 'small-caps' }}>
+          DROPSYNC · DESKTOP
+        </p>
+      </div>
+      {chromeUp && (
+        <div
+          data-testid="porch-pill-float"
+          className="pointer-events-none absolute left-1/2 top-[52px] z-[60]"
+          style={{ transform: 'translateX(-50%)' }}
+        >
+          <div className="pointer-events-auto">
+            <Pill sel={sel} onPick={pick} />
+          </div>
+        </div>
+      )}
+
+      <div className={`absolute bottom-8 left-8 text-xs text-[#1a1a1a]/45 ${sel === 'cloud' ? '' : 'invisible'}`}>{clock}</div>
+      <div className={`absolute bottom-8 right-8 text-xs text-[#1a1a1a]/45 ${sel === 'cloud' ? '' : 'invisible'}`}>
+        EDITION 2.0
+      </div>
     </div>
   );
 }

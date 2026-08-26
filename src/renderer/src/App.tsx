@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { VaultStoreProvider, useVaultStore } from './store/vault';
 import type { Drop } from './lib/types';
 import { FirstRunSetup } from './components/FirstRunSetup';
@@ -21,6 +22,12 @@ import { Toast } from './components/shared/Toast';
 import { ModeBadge, type DesktopMode } from './components/ModeBadge';
 import { Porch } from './components/Porch';
 import { requestModeSwitch } from './lib/modeSwitchGuard';
+
+/** C2b — the porch's Local-panel slot. When the porch frame is up, AppBody portals the REAL
+ * entry component (FirstRunSetup / UnlockScreen, internals untouched) into the slot so the
+ * pill sits directly above the actual form; null ⇒ render direct (mid-session/auto-lock C1
+ * paths). The ref object is stable; slot DOM changes flow through shell state re-renders. */
+const PorchSlotContext = createContext<{ current: HTMLDivElement | null }>({ current: null });
 import type { CreateExpirationOptionDTO, DropDTO, UpdateMetaPatchDTO } from '../../preload/apiTypes';
 
 export default function App() {
@@ -46,6 +53,19 @@ function CloudModeShell() {
   const { status, refreshAll } = useVaultStore();
   const [screen, setScreen] = useState<'porch' | 'local' | 'cloud'>('porch');
   const pendingSettingsRef = useRef(false);
+  // C2b — Local-panel portal slot (see PorchSlotContext).
+  const slotRef = useRef<HTMLDivElement | null>(null);
+  const [, setSlotEl] = useState<HTMLDivElement | null>(null);
+  const attachSlot = useCallback((el: HTMLDivElement | null) => {
+    slotRef.current = el;
+    setSlotEl(el); // re-render so AppBody portals into the freshly attached node
+  }, []);
+
+  // C2b FIX 1: unlocking from the EMBEDDED UnlockScreen goes straight into the main app —
+  // the porch unmounts (badge remains) in the same commit; no flash, no double-render.
+  useEffect(() => {
+    if (screen === 'porch' && status === 'unlocked') setScreen('local');
+  }, [screen, status]);
 
   // "Desktop settings" from Cloud: auto-open the existing SettingsModal once Local is back
   // AND the vault is unlocked again (returning always requires the password first).
@@ -99,10 +119,15 @@ function CloudModeShell() {
 
   if (screen === 'porch') {
     return (
-      <div className="contents" data-shell="porch">
-        <Porch onEnter={(m) => void applyMode(m)} />
-        {badge}
-      </div>
+      <PorchSlotContext.Provider value={slotRef}>
+        <div className="contents" data-shell="porch">
+          {/* Body first so the porch frame paints over its transient spinner; once locked-state
+           * entry renders, it PORTALS into the porch's Local panel (single screen, FIX 1). */}
+          <AppBody />
+          <Porch onEnter={(m) => void applyMode(m)} localSlotRef={attachSlot} />
+          {badge}
+        </div>
+      </PorchSlotContext.Provider>
     );
   }
 
@@ -126,6 +151,7 @@ function CloudModeShell() {
 
 function AppBody() {
   const store = useVaultStore();
+  const porchSlot = useContext(PorchSlotContext);
   const {
     status, folder, checking, theme, spaces, currentSpaceId, currentSpaceName,
     categories, drops, loading, settings,
@@ -571,7 +597,10 @@ function AppBody() {
   }
 
   if (status !== 'unlocked') {
-    return status === 'none' ? (
+    // C2b: when the porch frame is up, the REAL entry component renders INSIDE the porch's
+    // Local panel (portal slot) — same screen as the pill, no placeholder card, no extra
+    // navigation step. Without the porch (mid-session return / auto-lock) → direct, as C1.
+    const entryUi = status === 'none' ? (
       <FirstRunSetup
         theme={theme}
         folder={folder}
@@ -596,6 +625,8 @@ function AppBody() {
         onUnlock={handleUnlock}
       />
     );
+    const slot = porchSlot.current;
+    return slot ? createPortal(entryUi, slot) : entryUi;
   }
 
   return (
