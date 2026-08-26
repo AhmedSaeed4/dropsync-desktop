@@ -3454,6 +3454,7 @@ function createWindow(): void {
                 win.webContents.send('pill:flipRequested', 'local');
                 await sleep(1200);
               }
+              const META_TEXT = 'META-SAVE-FULL-TEXT-LINE-1\nMETA-SAVE-FULL-TEXT-LINE-2'; // hotfix-2 fixture body
               const seedId = await win.webContents.executeJavaScript(
                 `(async () => {
                    try {
@@ -3461,23 +3462,27 @@ function createWindow(): void {
                      await d.vault.prepareFolder('/tmp/ds-c2f-vault').catch(() => {});
                      try { await d.vault.create('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch {}
                      await d.vault.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
-                     const rec = await d.drop.createText({ spaceId: 'personal', name: 'GuardFixture', content: 'original text', categories: [], expirationOption: '24h', locked: false, reminderAt: null });
-                     return String(rec.id);
+                     // Two fixtures, ONE reload: GuardFixture (hotfix-1 guard matrix) +
+                     // MetaSaveFixture (hotfix-2 meta-save preview key) with KNOWN body text.
+                     const g = await d.drop.createText({ spaceId: 'personal', name: 'GuardFixture', content: 'original text', categories: [], expirationOption: '24h', locked: false, reminderAt: null });
+                     const m = await d.drop.createText({ spaceId: 'personal', name: 'MetaSaveFixture', content: ${JSON.stringify(META_TEXT)}, categories: [], expirationOption: '24h', locked: false, reminderAt: null });
+                     return JSON.stringify({ g: String(g.id), m: String(m.id) });
                    } catch (e) { return 'FATAL:' + String(e); }
                  })()`
               ) as string;
               if (seedId.startsWith('FATAL')) throw new Error('guard fixture seeding failed: ' + seedId);
+              const seeds = JSON.parse(seedId) as { g: string; m: string };
               win.webContents.reload();
               await sleep(4500); // renderer remount: boot-into-last-mode (local) + store fetch
               let opened = false;
               for (let i = 0; i < 10 && !opened; i++) {
                 opened = await win.webContents.executeJavaScript(
-                  `window.__c2fEditTest ? window.__c2fEditTest.open(${JSON.stringify(seedId)}) : false`
+                  `window.__c2fEditTest ? window.__c2fEditTest.open(${JSON.stringify(seeds.g)}) : false`
                 ) as boolean;
                 if (!opened) await sleep(500);
               }
               await sleep(800); // modal mount + edit-payload hydration
-              if (!opened) throw new Error('guard fixture: edit modal never opened (seedId=' + seedId + ') — AppBody mounted? e2eHooks tag present?');
+              if (!opened) throw new Error('guard fixture: edit modal never opened (seeds.g=' + seeds.g + ') — AppBody mounted? e2eHooks tag present?');
               const baseState = await readState(); // PRE-typing baseline (fixture opens the list
               // item directly, so the editor may seed empty — assertions are relative to THIS).
               const typedOk = await win.webContents.executeJavaScript(
@@ -3516,15 +3521,24 @@ function createWindow(): void {
               const discardMode = await readMode();
               const discardFlips = discardMode === 'cloud' && appMode === 'cloud';
 
-              win.webContents.send('pill:flipRequested', 'local'); // come back — editor must be GONE
-              await sleep(1800);
+              // Come back — editor must be GONE. Cloud SEALED the vault on entry (applyMode
+              // :3949 manager.lock()), so re-unlock through the bridge and reload first: these
+              // final legs must assert against the REAL Local UI, not the locked early-return
+              // screen (which would make them pass vacuously — no UI, nothing to be open).
+              win.webContents.send('pill:flipRequested', 'local');
+              await sleep(1500);
+              await win.webContents.executeJavaScript(
+                `(async () => { const d = window.dropsync; await d.vault.prepareFolder('/tmp/ds-c2f-vault').catch(() => {}); await d.vault.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw').catch(() => {}); return true; })()`
+              );
+              win.webContents.reload();
+              await sleep(4500); // boot-into-last-mode ('local', written by the relay flip) + store
               const backDom = await readState();
               const editorClosedOnReturn = backDom.open === false;
 
               // Clean leg: reopen (discard threw the typing away), do NOT type, flip ⇒ instant,
               // NO confirm — the guard must not nag the clean case.
               const reopened = await win.webContents.executeJavaScript(
-                `window.__c2fEditTest ? window.__c2fEditTest.open(${JSON.stringify(seedId)}) : false`
+                `window.__c2fEditTest ? window.__c2fEditTest.open(${JSON.stringify(seeds.g)}) : false`
               ) as boolean;
               await sleep(700);
               const markClean = await seqLen();
@@ -3538,7 +3552,112 @@ function createWindow(): void {
                 f_c2f_flipGuardFull: dirtyIntercept && cancelKeeps && discardFlips && editorClosedOnReturn && cleanInstant,
                 f_c2f_flipGuard: cleanInstant, // folded: the old relay key IS the clean-path assertion
                 matrix: { dirtyIntercept, cancelKeeps, discardFlips, editorClosedOnReturn, cleanInstant },
-                raw: { seedId, opened, typedOk, baseState, dirtyState, typedAdded, duringDirty, cancelState, confirmAgain, discardMode, backDom, cleanState },
+                raw: { seedId: seeds.g, opened, typedOk, baseState, dirtyState, typedAdded, duringDirty, cancelState, confirmAgain, discardMode, backDom, cleanState },
+              }));
+
+              // (1c) f_c2f_metaSavePreviewKeepsText — THE robot test for hotfix-2. A metadata-only
+              // save of a text drop used to leave the preview cache primed with an EMPTY body
+              // (App.tsx primeSavedPreviewPayload primed '' when the meta DTO carried no payload)
+              // ⇒ the reopened preview rendered blank on an unconditional cache hit. Drives the
+              // REAL preview→Edit→save→reopen path and asserts the FULL original text is on screen
+              // (DOM) AND in the re-primed cache (dev hook). Regression leg (a): content-edit save
+              // still renders the new text.
+              // The clean leg above ended in Cloud ⇒ vault sealed ⇒ restore a REAL Local UI
+              // through the bridge before driving any preview (locked early-return renders none).
+              win.webContents.send('pill:flipRequested', 'local');
+              await sleep(1500);
+              await win.webContents.executeJavaScript(
+                `(async () => { const d = window.dropsync; await d.vault.prepareFolder('/tmp/ds-c2f-vault').catch(() => {}); await d.vault.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw').catch(() => {}); return true; })()`
+              );
+              win.webContents.reload();
+              await sleep(4500); // boot-into-last-mode ('local') + store fetch with BOTH fixtures
+              const openPreview = await win.webContents.executeJavaScript(
+                `window.__c2fEditTest ? window.__c2fEditTest.openPreview(${JSON.stringify(seeds.m)}) : false`
+              ) as boolean;
+              await sleep(1200); // preview mount + cold payload fetch banks into the cache
+              const preSave = await win.webContents.executeJavaScript(
+                'JSON.stringify(window.__c2fEditTest ? window.__c2fEditTest.previewState() : null)'
+              ).then((s) => JSON.parse(s as string) as { preText: string | null; editBtnVisible: boolean });
+              // Click the REAL Edit button in the preview → openEditModal's preview-originated
+              // branch (editOriginRef set) → this is the ONLY path that rebuilds the preview.
+              let clickedEdit = false;
+              for (let i = 0; i < 8 && !clickedEdit; i++) {
+                clickedEdit = await clickButton('Edit');
+                if (!clickedEdit) await sleep(400);
+              }
+              await sleep(900); // openEditModal hydrates the payload BEFORE mounting the editor
+              let openedMeta = false;
+              for (let i = 0; i < 8 && !openedMeta; i++) {
+                openedMeta = await win.webContents.executeJavaScript(
+                  'window.__c2fEditTest ? window.__c2fEditTest.state().open : false'
+                ) as boolean;
+                if (!openedMeta) await sleep(400);
+              }
+              // Rename via a NATIVE input event (React onChange) — no state poking.
+              const NEW_NAME = 'MetaSaveFixture RENAMED';
+              const renamed = await win.webContents.executeJavaScript(
+                `(() => { const inp = document.querySelector('input[placeholder="Text snippet"]');
+                  if (!inp) return false;
+                  const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                  set.call(inp, ${JSON.stringify(NEW_NAME)});
+                  inp.dispatchEvent(new Event('input', { bubbles: true }));
+                  return true; })()`
+              ) as boolean;
+              await sleep(300); // React flush
+              await clickButton('Save changes');
+              // Save → invalidate → PRIME(fixed fetch) → reopen; poll for the reopened preview body.
+              let postMeta: { preText: string | null } = { preText: null };
+              for (let i = 0; i < 12; i++) {
+                await sleep(500);
+                const st = await win.webContents.executeJavaScript(
+                  'window.__c2fEditTest ? JSON.stringify({ ed: document.querySelector("div[contenteditable][role=\\"textbox\\"]") ? true : false, pv: window.__c2fEditTest.previewState() }) : "null"'
+                ).then((s) => JSON.parse(s as string) as { ed: boolean; pv: { preText: string | null } } | null);
+                if (!st) continue;
+                if (!st.ed && st.pv.preText !== null) { postMeta = st.pv; break; }
+              }
+              const cachedAfterMeta = await win.webContents.executeJavaScript(
+                `JSON.stringify(window.__previewCacheGet ? window.__previewCacheGet(${JSON.stringify(seeds.m)}) : null)`
+              ).then((s) => JSON.parse(s as string) as { text: string } | null);
+              const metaSaveKeepsFullText = preSave.preText === META_TEXT && postMeta.preText === META_TEXT;
+              const cachePrimedWithFullText = !!cachedAfterMeta && cachedAfterMeta.text === META_TEXT;
+
+              // Regression leg (a): CONTENT-edit save still renders the new text.
+              await clickButton('Edit');
+              await sleep(900);
+              let reopenedForContent = false;
+              for (let i = 0; i < 8 && !reopenedForContent; i++) {
+                reopenedForContent = await win.webContents.executeJavaScript(
+                  'window.__c2fEditTest ? window.__c2fEditTest.state().open : false'
+                ) as boolean;
+                if (!reopenedForContent) await sleep(400);
+              }
+              const contentTyped = await win.webContents.executeJavaScript(
+                `(() => { const ed = document.querySelector('div[contenteditable][role="textbox"]');
+                  if (!ed) return false; ed.focus();
+                  document.execCommand('selectAll', false, null);
+                  document.execCommand('insertText', false, 'CONTENT-EDITED-BODY'); return true; })()`
+              ) as boolean;
+              await sleep(400);
+              await clickButton('Save changes');
+              let postContent: { preText: string | null } = { preText: null };
+              for (let i = 0; i < 12; i++) {
+                await sleep(500);
+                const st = await win.webContents.executeJavaScript(
+                  'window.__c2fEditTest ? JSON.stringify({ ed: document.querySelector("div[contenteditable][role=\\"textbox\\"]") ? true : false, pv: window.__c2fEditTest.previewState() }) : "null"'
+                ).then((s) => JSON.parse(s as string) as { ed: boolean; pv: { preText: string | null } } | null);
+                if (!st) continue;
+                if (!st.ed && st.pv.preText !== null) { postContent = st.pv; break; }
+              }
+              const cachedAfterContent = await win.webContents.executeJavaScript(
+                `JSON.stringify(window.__previewCacheGet ? window.__previewCacheGet(${JSON.stringify(seeds.m)}) : null)`
+              ).then((s) => JSON.parse(s as string) as { text: string } | null);
+              const contentEditStillRenders = contentTyped && postContent.preText === 'CONTENT-EDITED-BODY'
+                && !!cachedAfterContent && cachedAfterContent.text === 'CONTENT-EDITED-BODY';
+
+              console.log('[c2f-metasave]', JSON.stringify({
+                f_c2f_metaSavePreviewKeepsText: openPreview && renamed && metaSaveKeepsFullText && cachePrimedWithFullText && contentEditStillRenders,
+                matrix: { metaSaveKeepsFullText, cachePrimedWithFullText, contentEditStillRenders },
+                raw: { seedsM: seeds.m, openPreview, preSave, clickedEdit, openedMeta, renamed, postMeta, cachedAfterMeta, reopenedForContent, contentTyped, postContent, cachedAfterContent },
               }));
               // (2) Enter Cloud through the REAL user path — the pill flip relay. The site view
               // is created lazily on first Cloud entry, so bounds legs must run with it alive.

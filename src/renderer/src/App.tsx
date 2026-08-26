@@ -338,6 +338,17 @@ function AppBody() {
    * preview modal's own fetch matrix exactly, so the reopened modal cache-hits with ZERO
    * loading frame and zero IPC fetches. Per-slot failures resolve null — the modal then pays
    * its normal cold fetch for just that slot (graceful, never blocking).
+   *
+   * C2f-hotfix-2 — METADATA-ONLY save of a plain text drop: handleEditDrop just ran
+   * invalidatePreviewPayload() (the cached copy is stale by definition), and the updateMeta
+   * DTO carries no encrypted payload — so `editedContent` is undefined here. Priming an empty
+   * string in that case made the reopened preview render a BLANK body on an unconditional
+   * cache hit (EditorialPreviewModal :81-87 never falls back on a hit). Instead, fetch the
+   * stored text (mirroring openEditModal's guard) so the cache is primed complete. The caller
+   * AWAITS this before reopenSavedPreview, so the fetch fires-before-reopen — the instant-
+   * render bar (FIX 18) holds with zero loading frame and zero skeleton flash. Drawings are
+   * excluded (no text payload; their body rides imageUrl below); FILE drops keep their own
+   * existing branch and never take this one.
    */
   const primeSavedPreviewPayload = useCallback(async (saved: Drop, editedContent: string | undefined) => {
     let text = '';
@@ -345,7 +356,15 @@ function AppBody() {
     let imageUrl: string | null = null;
     try {
       if (saved.type === 'text') {
-        text = editedContent ?? '';
+        if (editedContent !== undefined) {
+          // Content save: prime with EXACTLY what was saved (regression bar — must stay byte-equal).
+          text = editedContent;
+        } else if (!saved.isDrawing) {
+          text = await fetchTextPayload(saved.id).catch((err) => {
+            console.error('[preview-prime] meta-only save could not re-fetch text — reopened preview will be blank:', err);
+            return ''; // old behavior as fallback — degraded render, never a hang
+          });
+        }
       } else if (isTextFileDrop(saved)) {
         text = await fetchTextPayload(saved.id).catch(() => '');
       }
@@ -568,12 +587,20 @@ function AppBody() {
   // — and read guard-relevant truth back from the DOM. Dirtying itself is NOT done here: the
   // battery types through the real editor surface (execCommand → native input event), so no
   // React state is ever poked for the action under test.
+  //
+  // C2f-hotfix-2 additions: openPreview() re-points the REAL preview modal at a seeded drop
+  // (same setPreviewDrop the card click makes) and previewState() reads the rendered body back
+  // from the DOM (<pre> textContent — absent entirely when the body is blank, which is exactly
+  // the meta-only-save symptom). The battery still clicks the REAL 'Edit' button itself so the
+  // save→prime→reopen path runs through openEditModal's preview-originated branch.
   useEffect(() => {
     if (!(import.meta.env.DEV && window.location.search.includes('e2eHooks'))) return;
     const w = window as unknown as {
       __c2fEditTest?: {
         open(dropId: string): boolean;
+        openPreview(dropId: string): boolean;
         state(): { open: boolean; saveDisabled: boolean | null; typedChars: number; discardConfirmVisible: boolean };
+        previewState(): { preText: string | null; editBtnVisible: boolean };
       };
     };
     w.__c2fEditTest = {
@@ -581,6 +608,12 @@ function AppBody() {
         const source = drops.find((d) => d.id === dropId);
         if (!source) return false;
         setEditDrop(source);
+        return true;
+      },
+      openPreview(dropId: string): boolean {
+        const source = drops.find((d) => d.id === dropId);
+        if (!source) return false;
+        setPreviewDrop(source);
         return true;
       },
       state() {
@@ -597,6 +630,12 @@ function AppBody() {
           typedChars: editor ? (editor.textContent || '').replace(/\u200B/g, '').length : -1,
           discardConfirmVisible,
         };
+      },
+      previewState() {
+        const pre = document.querySelector('pre');
+        const editBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+          .find((b) => b.textContent?.trim() === 'Edit');
+        return { preText: pre ? pre.textContent : null, editBtnVisible: !!editBtn };
       },
     };
   }, [drops, editDrop]);
