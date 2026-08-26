@@ -10,12 +10,12 @@
 import { app, BrowserWindow, ipcMain, dialog, Notification, protocol, shell, net } from 'electron';
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';import { createWriteStream } from 'node:fs';
+import { fileURLToPath } from 'node:url';import { createWriteStream, readFileSync, rmSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
 import { VaultManager } from './vault/vault.ts';
-import { initCloud, attachCloudResizeTracking, PILL_MARGIN, PILL_W, PILL_H, type CloudController } from './cloud';
+import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, type CloudController } from './cloud';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -71,6 +71,7 @@ let cloudCtl: CloudController | null = null;
 let appMode: 'cloud' | 'local' = 'local'; // relaunch always starts Local in C1 (remember-last-mode = C2)
 /** Assigned by registerIpc — shared by mode:set and the DEV probe's switch storm. */
 let applyCloudMode: (next: 'cloud' | 'local') => Promise<'cloud' | 'local'> = async () => appMode;
+let pillFlipRelayCount = 0; // C2g-hotfix-1 §5 — receipts of REAL pill:flip ipc (incremented in the relay)
 /** DEV-only: the C1/C2 battery reloads the renderer (memory test) — this guard keeps its
  * did-finish-load handler from re-triggering the whole sequence on every reload. */
 let cloudDevBatteryStarted = false;
@@ -3669,8 +3670,293 @@ function createWindow(): void {
                 await sleep(1000);
                 readyMs = cloudCtl.probeState().readyMs ?? null;
               }
+              // (2b) f_c2g_* — THE PUNCH-HOLE PILL battery (C2g FIX 5). Runs BEFORE the c2f
+              // bounds/storm legs and restores Style A at the end, so those carried keys keep
+              // asserting against the known full-width footprint. All layer actions ride the
+              // REAL DOM listeners via pillDrive/pillEval (env-gated); bounds truth is main-side.
+              {
+                const g = cloudCtl; // narrowed alias — TS can't keep null-checks inside closures
+                const centeredOk = (r: Electron.Rectangle, w: number, cw: number): boolean =>
+                  Math.abs(r.x - Math.round((cw - w) / 2)) <= 1 && r.y === PILL_TOP
+                  && r.width === w && r.height === PILL_H;
+                const pillState = (): Promise<{ style: string; bloomed: boolean }> =>
+                  g.pillEval('JSON.stringify(window.__c2gPill || null)').then((s) => JSON.parse(s as string) as { style: string; bloomed: boolean } | null)
+                    .then((p) => p ?? { style: 'missing', bloomed: false });
+                const pollStyle = async (want: string): Promise<boolean> => {
+                  for (let i = 0; i < 8; i++) {
+                    if ((await pillState()).style === want) return true;
+                    await sleep(400);
+                  }
+                  return false;
+                };
+                const waitBounded = async (w: number): Promise<boolean> => {
+                  for (let i = 0; i < 12; i++) { // ≤6s: watchdog + deferred re-apply budget
+                    await sleep(500);
+                    const p = await g.pillProbe();
+                    if (centeredOk(p.bounds, w, win.getContentBounds().width)) return true;
+                  }
+                  return false;
+                };
+
+                // First-boot default proof + normalize: cleared store ⇒ relaunch boots A.
+                const styleFile = join(app.getPath('userData'), 'pill-style.json');
+                const fileStyle = (): string | null => {
+                  try {
+                    return (JSON.parse(readFileSync(styleFile, 'utf8')) as { style?: string }).style ?? null;
+                  } catch { return null; }
+                };
+                rmSync(styleFile, { force: true });
+                await g.reloadPillLayer();
+                await sleep(900);
+                const bootedA = await pollStyle('A');
+
+                // f_c2g_geometry — Style A: centered-x ±1px, y=10, 112 × 28; site {0,0,w,h}.
+                // C2g-hotfix-3 folds §5's A-side LAYOUT asserts here: the visibility toggler must
+                // carry `inline-flex` (it said `block` and killed the flex row), and Local's rect
+                // top must be 2±0.5 — it measured 27.5 (wrapped BELOW the 28px window) when broken.
+                const geoLegs: Array<{ tag: string; ok: boolean; disp?: string; localTop?: number }> = [];
+                const readALayout = async (): Promise<{ d: string; t: number }> =>
+                  g.pillEval(`(function(){ var a = document.getElementById('pillA');
+                      var r = document.getElementById('btn-local-a').getBoundingClientRect();
+                      return JSON.stringify({ d: getComputedStyle(a).display, t: +r.top.toFixed(1) }); })()`)
+                    .then((s) => JSON.parse(s as string) as { d: string; t: number });
+                const geoLeg = async (tag: string, w: number, h: number, fullscreen: boolean): Promise<void> => {
+                  if (fullscreen) win.setFullScreen(true);
+                  else win.setSize(w, h);
+                  await sleep(1600); // watchdog + deferred re-apply budget
+                  const b = win.getContentBounds();
+                  const site = await g.siteProbe();
+                  const pill = await g.pillProbe();
+                  // C2g spec: "correct w/h for the CURRENT style" — B at rest is 28 wide.
+                  const wantW = pill.style === 'B' && !pill.blooming ? PILL_B_REST_W : PILL_W;
+                  let disp: string | undefined;
+                  let localTop: number | undefined;
+                  let layoutOk = true; // non-A boots skip the A-layout check (they have their own)
+                  if (pill.style === 'A') {
+                    const al = await readALayout();
+                    disp = al.d;
+                    localTop = al.t;
+                    // NOTE (hotfix-3): #pillA is position:absolute, so its COMPUTED display is
+                    // BLOCKIFIED — specified `inline-flex` resolves to `flex` ('block' leaked
+                    // through when the broken cascade won). Accept the pair as row-proof.
+                    layoutOk = (al.d === 'inline-flex' || al.d === 'flex') && Math.abs(al.t - 2) <= 0.5;
+                  }
+                  geoLegs.push({
+                    tag,
+                    ok: site.visible
+                      && site.bounds.x === 0 && site.bounds.y === 0
+                      && site.bounds.width === b.width && site.bounds.height === b.height
+                      && centeredOk(pill.bounds, wantW, b.width)
+                      && layoutOk,
+                    disp,
+                    localTop,
+                  });
+                };
+                await geoLeg('geo-1600x1000', 1600, 1000, false);
+                await geoLeg('geo-1150x760', 1150, 760, false);
+                await geoLeg('geo-fullscreen', 0, 0, true);
+                win.setFullScreen(false);
+
+                // f_c2g_stylesToggle — REAL right-click toggles A⇄B; disk store updates; choice
+                // survives a pill-layer relaunch (disk → query param → first frame).
+                await g.pillDrive('contextmenu'); // A → B
+                await sleep(400);
+                const stB = await pillState();
+                const fileAfterB = fileStyle() === 'B';
+                const probeStyleB = (await g.pillProbe()).style === 'B';
+                const restB = await g.pillProbe(); // B at rest = tight 28 × 28, centered
+                await g.reloadPillLayer(); // "relaunch": persisted B must survive
+                await sleep(900);
+                const survivedB = await pollStyle('B');
+                await g.pillDrive('contextmenu'); // B → A
+                await sleep(400);
+                const stA = await pillState();
+                const fileAfterA = fileStyle() === 'A';
+                await g.reloadPillLayer();
+                await sleep(900);
+                const survivedA = await pollStyle('A');
+
+                // f_c2g_bloomBounds — Style B: rest 28 × 28 centered → hover-bloom 112 × 28
+                // centered → collapse back; rapid hover storms settle with no stuck size.
+                await g.pillDrive('contextmenu'); // → B again for the bloom legs
+                await sleep(400);
+                const restOk = centeredOk(restB.bounds, PILL_B_REST_W, win.getContentBounds().width);
+                await g.pillDrive('mouseenter');
+                const bloomOk = await waitBounded(PILL_W);
+                const bloomFlag = (await pillState()).bloomed;
+                // C2g-hotfix-3 §5 B-side asserts, read with the bloom settled: inner knob must be
+                // ≈54 × 24 (measured 0×0 before the shared .mode-pill sizing), words 10.5px with
+                // 7.5px/14px padding (were UA 16px / 1px 6px).
+                await sleep(400);
+                const bStyle = await g.pillEval(`(function(){
+                    var ks = getComputedStyle(document.querySelector('#pillB .inner .knob'));
+                    var bs = getComputedStyle(document.querySelector('#pillB .inner button'));
+                    return JSON.stringify({ kw: parseFloat(ks.width), kh: parseFloat(ks.height),
+                      fs: bs.fontSize, pad: bs.paddingLeft + ' ' + bs.paddingTop }); })()`)
+                  .then((s) => JSON.parse(s as string) as { kw: number; kh: number; fs: string; pad: string });
+                const bStyled = Math.abs(bStyle.kw - 54) <= 1 && Math.abs(bStyle.kh - 24) <= 1
+                  && bStyle.fs === '10.5px' && bStyle.pad === '14px 7.5px';
+                for (const ev of ['mouseleave', 'mouseenter', 'mouseleave', 'mouseenter'] as const) {
+                  await g.pillDrive(ev);
+                  await sleep(120); // storm — faster than the .55s transition on purpose
+                }
+                const stormOk = await waitBounded(PILL_W) && (await pillState()).bloomed;
+                await g.pillDrive('mouseleave');
+                const collapseOk = await waitBounded(PILL_B_REST_W) && !(await pillState()).bloomed;
+
+                // f_c2g_colors — COLOR RULE in BOTH styles × BOTH modes: word under the knob is
+                // ALWAYS ink #1a1a1a; the other ALWAYS rgba(255,255,255,.55). Knob side rides the
+                // REAL channel (setPillMode — what actual mode flips use).
+                const INK = 'rgb(26, 26, 26)';
+                const FAINT = 'rgba(255, 255, 255, 0.55)';
+                const readColors = async (sel: string): Promise<{ act: string; inact: string }> =>
+                  g.pillEval(`(function(){ var bs = document.querySelector('${sel}').querySelectorAll('button');
+                      return JSON.stringify({ act: getComputedStyle(bs[0]).color, inact: getComputedStyle(bs[1]).color }); })()`)
+                    .then((s) => JSON.parse(s as string) as { act: string; inact: string });
+                const pairOk = (c: { act: string; inact: string }, mode: 'cloud' | 'local'): boolean =>
+                  mode === 'cloud' ? c.act === INK && c.inact === FAINT : c.inact === INK && c.act === FAINT;
+                const colorsOk: Record<string, boolean> = {};
+                for (const mode of ['cloud', 'local'] as const) {
+                  g.setPillMode(mode);
+                  await sleep(800); // knob transition + color .3s ease settled
+                  colorsOk[`a${mode}`] = pairOk(await readColors('#pillA'), mode);
+                  colorsOk[`b${mode}`] = pairOk(await readColors('#pillB .inner'), mode);
+                }
+
+                console.log('[c2g]', JSON.stringify({
+                  f_c2g_geometry: bootedA && geoLegs.every((l) => l.ok),
+                  f_c2g_stylesToggle: bootedA && stB.style === 'B' && fileAfterB && probeStyleB
+                    && restB.bounds.width === PILL_B_REST_W && survivedB
+                    && stA.style === 'A' && fileAfterA && survivedA,
+                  f_c2g_bloomBounds: restOk && bloomOk && bloomFlag && stormOk && collapseOk && bStyled,
+                  f_c2g_colors: colorsOk.acloud && colorsOk.alocal && colorsOk.bcloud && colorsOk.blocal,
+                  raw: { geoLegs, boot: { bootedA }, toggle: { stB, fileAfterB, probeStyleB, survivedB, stA, fileAfterA, survivedA },
+                    bloom: { restOk, restW: restB.bounds.width, bloomOk, bloomFlag, stormOk, collapseOk, bStyle }, colorsOk },
+                }));
+                await g.pillDrive('contextmenu'); // bloom legs left us in B — restore A for c2f legs
+                await sleep(300);
+              }
+
+              // (2b2) f_c2g_realClickFlips — THE PRIME DIRECTIVE robot (C2g-hotfix-1 FIX 4):
+              // REAL element.click() on the pill layer's actual elements → true listener → true
+              // `pill:flip` ipc → true relay → guarded switchMode → applyMode. NO
+              // `pill:flipRequested` shortcuts anywhere. Asserts MAIN-side appMode flipped AND
+              // the layer's rendered side (knob/dot truth via __c2gPill.mode) matches.
+              {
+                const g = cloudCtl;
+                const flipReceiptsBefore = pillFlipRelayCount;
+                const waitMode = async (want: string): Promise<boolean> => {
+                  for (let i = 0; i < 12; i++) { // ≤6s: ipc → relay → guarded switch → echo
+                    if (appMode === want) return true;
+                    await sleep(500);
+                  }
+                  return appMode === want;
+                };
+                const layerTruth = async (): Promise<{ style: string; bloomed: boolean; mode: string }> =>
+                  g.pillEval('JSON.stringify(window.__c2gPill || null)').then((s) => JSON.parse(s as string) as { style: string; bloomed: boolean; mode: string } | null)
+                    .then((p) => p ?? { style: 'missing', bloomed: false, mode: 'missing' });
+                // C2g-hotfix-3 §4 — MANDATORY hit-test gate. Before EVERY synthetic click, prove a
+                // REAL pointer at the target's center would land on it (or a descendant). A blind
+                // el.click() skips hit-testing entirely — exactly how Local shipped invisible
+                // AND unclickable while this robot passed 15/15. Any mismatch fails the key.
+                const hitTest = async (sel: string): Promise<{ ok: boolean; cx: number; cy: number; hit: string }> =>
+                  g.pillEval(`(function(){ var el = document.querySelector('${sel}');
+                      if (!el) return JSON.stringify({ ok:false, cx:-1, cy:-1, hit:'MISSING-TARGET' });
+                      var r = el.getBoundingClientRect();
+                      var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                      var h = document.elementFromPoint(cx, cy);
+                      return JSON.stringify({ ok: !!h && (h === el || el.contains(h)),
+                        cx:+cx.toFixed(1), cy:+cy.toFixed(1),
+                        hit: h ? (h.id || String(h.className).slice(0,32) || h.tagName) : 'OUTSIDE-VIEWPORT' }); })()`)
+                    .then((s) => JSON.parse(s as string) as { ok: boolean; cx: number; cy: number; hit: string });
+                const hitLog: Array<{ sel: string; cx: number; cy: number; hit: string; ok: boolean }> = [];
+                const realClick = async (sel: string): Promise<boolean> => {
+                  const ht = await hitTest(sel);
+                  hitLog.push({ sel, cx: ht.cx, cy: ht.cy, hit: ht.hit, ok: ht.ok });
+                  if (!ht.ok) return false; // gated — never fire a click a human could not make
+                  return g.pillEval(`(function(){ var el = document.querySelector('${sel}'); if (!el) return false; el.click(); return true; })()`) as Promise<boolean>;
+                };
+                const drive = (ev: 'mouseenter' | 'mouseleave' | 'contextmenu'): Promise<void> => g.pillDrive(ev);
+
+                // Leg 1 — Style A word click flips. Battery left us in Cloud + Style A.
+                let startA = (await layerTruth()).style === 'A';
+                if (!startA) {
+                  await drive('contextmenu');
+                  await sleep(300);
+                  startA = (await layerTruth()).style === 'A';
+                }
+                // §4's own coordinates, captured FIRST (Style A is up): GREEN must show
+                // elementFromPoint(80,14) = btn-local-a and Local's center hitting itself inside
+                // the viewport. RED (toggler reverted to block): point lands on the bare #pillA
+                // trough and Local's wrapped center falls OUTSIDE-VIEWPORT.
+                const redProof = await g.pillEval(`(function(){
+                    function tg(el){ if(!el) return 'OUTSIDE-VIEWPORT'; return el.id || String(el.className).slice(0,40) || el.tagName; }
+                    var la = document.getElementById('btn-local-a');
+                    if (!la) return JSON.stringify({ point80_14:'MISSING', center:[-1,-1], centerHits:'MISSING' });
+                    var r = la.getBoundingClientRect();
+                    return JSON.stringify({ point80_14: tg(document.elementFromPoint(80, 14)),
+                      center:[+(r.left+r.width/2).toFixed(1), +(r.top+r.height/2).toFixed(1)],
+                      centerHits: tg(document.elementFromPoint(r.left+r.width/2, r.top+r.height/2)) }); })()`)
+                  .then((s) => JSON.parse(s as string) as { point80_14: string; center: [number, number]; centerHits: string });
+                const greenProofOk = redProof.point80_14 === 'btn-local-a' && redProof.centerHits === 'btn-local-a'
+                  && redProof.center[1] >= 0 && redProof.center[1] < 28;
+                await realClick('#btn-local-a');
+                const aWordFlip = await waitMode('local') && (await layerTruth()).mode === 'local';
+
+                // Leg 2 — Style B AT-REST circle click flips (FIX 1: the whole circle is the button).
+                await drive('contextmenu'); // → B
+                await sleep(400);
+                await realClick('#pillB'); // at rest, mode 'local' → flips to the OTHER side
+                const circleFlip = await waitMode('cloud') && (await layerTruth()).mode === 'cloud';
+
+                // Leg 3 — Style B BLOOMED word click flips, clicked MID-TRANSITION (edge case:
+                // honored, no double-flip). Hover then click within the .55s bloom window.
+                await drive('mouseenter');
+                await sleep(150);
+                await realClick('#btn-local-b');
+                const bloomedWordFlip = await waitMode('local') && (await layerTruth()).mode === 'local';
+
+                // Leg 4 — same-mode click is a SAFE no-op (FIX 2: always-send; main dedupes).
+                await realClick('#btn-local-b');
+                await sleep(1200);
+                const sameModeNoop = appMode === 'local' && (await layerTruth()).mode === 'local';
+                await drive('mouseleave');
+                await sleep(800);
+
+                // Leg 5 — rapid ×10 storm: EVERY click honored or safely deduped; final mode =
+                // last click's word; no stuck knob. Back to Style A first (real right-click).
+                await drive('contextmenu'); // → A
+                await sleep(400);
+                for (let i = 0; i < 10; i++) {
+                  await realClick(i % 2 === 0 ? '#btn-cloud-a' : '#btn-local-a');
+                  await sleep(350);
+                }
+                const stormFinal = 'local'; // i=0..9 → last click (i=9) is Local
+                const stormOk = await waitMode(stormFinal) && (await layerTruth()).mode === stormFinal;
+                // End where the c2f legs need us: one more REAL click → Cloud.
+                await realClick('#btn-cloud-a');
+                const backToCloud = await waitMode('cloud');
+
+                // §5 suspects — bridge presence, layer console cleanliness, relay receipts.
+                const bridgeType = await g.pillEval('typeof window.dropsyncPill');
+                const consoleTail = g.pillConsoleTail();
+                const consoleErrors = consoleTail.filter((l) => l.includes('ERROR') || l.includes('Uncaught') || l.includes('bridge missing'));
+                const styleStillToggles = (await (async () => { await drive('contextmenu'); await sleep(300); const b = (await layerTruth()).style === 'B'; await drive('contextmenu'); await sleep(300); return b && (await layerTruth()).style === 'A'; })());
+
+                const everyHitOk = hitLog.length > 0 && hitLog.every((h) => h.ok);
+                console.log('[c2g2]', JSON.stringify({
+                  f_c2g_realClickFlips: startA && greenProofOk && everyHitOk && aWordFlip && circleFlip && bloomedWordFlip
+                    && sameModeNoop && stormOk && backToCloud && styleStillToggles
+                    && bridgeType === 'object' && consoleErrors.length === 0
+                    && pillFlipRelayCount - flipReceiptsBefore >= 15, // 15 real clicks, 15 receipts
+                  matrix: { aWordFlip, circleFlip, bloomedWordFlip, sameModeNoop, stormOk, backToCloud, styleStillToggles, greenProofOk, everyHitOk },
+                  redProof,
+                  suspects: { bridgeType, consoleErrors, flipReceipts: pillFlipRelayCount - flipReceiptsBefore },
+                  raw: { hitLog },
+                }));
+              }
               // (3) f_c2f_boundsFull — resize to two sizes + fullscreen; the site view must equal
-              // {0,0,w,h} within ~2s AND the pill must stay glued to its corner. This leg ABSORBS
+              // {0,0,w,h} within ~2s AND the pill must stay glued top-center. This leg ABSORBS
               // the owed f_c2d_boundsFollow debt at the NEW geometry (full window, no notch).
               const origBounds = win.getBounds();
               const ctl = cloudCtl; // narrowed alias — TS can't keep the null-check inside nested arrows
@@ -3685,7 +3971,9 @@ function createWindow(): void {
                 const siteOk = site.visible
                   && site.bounds.x === 0 && site.bounds.y === 0
                   && site.bounds.width === b.width && site.bounds.height === b.height;
-                const pillOk = pill.bounds.x === PILL_MARGIN && pill.bounds.y === PILL_MARGIN
+                // C2g contract: pill top-CENTER, y=10, 112 × 28 (±1px on the centered x).
+                const pillOk = Math.abs(pill.bounds.x - Math.round((b.width - PILL_W) / 2)) <= 1
+                  && pill.bounds.y === PILL_TOP
                   && pill.bounds.width === PILL_W && pill.bounds.height === PILL_H;
                 boundsLegs.push({ tag, siteOk, pillOk, site: site.bounds, pill: pill.bounds });
               };
@@ -3717,7 +4005,9 @@ function createWindow(): void {
               console.log('[c2f-pill]', JSON.stringify({
                 f_c2f_pillPersistent: childViews === 2 && stormPill.visible && stormPill.loaded
                   && cloudCtl.pillIsTopChild()
-                  && stormPill.bounds.x === PILL_MARGIN && stormPill.bounds.y === PILL_MARGIN
+                  && Math.abs(stormPill.bounds.x - Math.round((win.getContentBounds().width - PILL_W) / 2)) <= 1
+                  && stormPill.bounds.y === PILL_TOP
+                  && stormPill.bounds.width === PILL_W && stormPill.bounds.height === PILL_H
                   && stormPill.bodyBackgroundColor === 'rgba(0, 0, 0, 0)',
                 toggles: modes.length,
                 finalMode: appMode,
@@ -3982,9 +4272,27 @@ function registerIpc(): void {
   ipcMain.on('pill:flip', (_e, next: 'cloud' | 'local') => {
     if (next !== 'cloud' && next !== 'local') return;
     if (!mainWindow || mainWindow.isDestroyed()) return;
+    pillFlipRelayCount += 1; // C2g-hotfix-1 §5 — relay-receipt evidence for the real-click robot
     console.log('[pill] flip requested →', next);
     mainWindow.webContents.send('pill:flipRequested', next);
     cloudCtl?.blurPill();
+  });
+  // C2g FIX 3 — Style B hover coupling: the layer reports enter/leave, main resizes the native
+  // view (re-centered) in the same tick its CSS bloom starts. Strictly validated.
+  ipcMain.on('pill:bloom', (_e, on: unknown) => {
+    if (typeof on !== 'boolean') return;
+    cloudCtl?.setPillBloom(on);
+  });
+  // C2g FIX 4 — right-click style toggle: main persists to disk + re-asserts bounds.
+  ipcMain.on('pill:setStyle', (_e, style: unknown) => {
+    if (style !== 'A' && style !== 'B') return;
+    cloudCtl?.setPillStyle(style);
+  });
+  // C2g-hotfix-1 FIX 3 — the layer asks on load; reply IMMEDIATELY with the true mode and the
+  // true style. Kills the queued-mode race permanently (queue stays as belt-and-braces).
+  ipcMain.on('pill:ready', () => {
+    if (!cloudCtl) return;
+    cloudCtl.resyncPill(appMode);
   });
   // DEV-ONLY probes (I6): never registered without DROPSYNC_CLOUD_DEV=1.
   if (process.env.DROPSYNC_CLOUD_DEV === '1') {

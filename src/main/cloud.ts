@@ -24,12 +24,13 @@
  *   re-added LAST whenever the site view is (re-)added — see show()/ensurePill().
  * - The pill NEVER hides and NEVER fades: it survives mode switches, Local mode, everything.
  * - C2d's self-heal pattern is KEPT and generalized: ONE watchdog re-asserts BOTH the site view
- *   bounds (full window, when shown) AND the pill overlay bounds (corner, always), with the
- *   0/100/400 ms deferred re-apply on geometry events.
+ *   bounds (full window, when shown) AND the pill overlay bounds (C2g: top-center, style/bloom-
+ *   aware width, always), with the 0/100/400 ms deferred re-apply on geometry events.
  */
 
-import { BrowserWindow, session, shell, WebContentsView } from 'electron';
+import { BrowserWindow, app, session, shell, WebContentsView } from 'electron';
 import { join } from 'node:path';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export const CLOUD_URL = 'https://drag-drop-app.vercel.app';
@@ -48,13 +49,44 @@ const AUTH_POPUP_ALLOWLIST = new Set([
   'login.microsoftonline.com',
 ]);
 
-/** C2f FIX 1 — floating pill geometry (owner-locked: top-left, ~0.8× of the C2 porch pill).
- * Top-LEFT because top-right collides with BOTH apps' controls (site settings/avatar AND the
- * local header's Search/Settings gear); top-left covers only logos — nothing clickable that
- * matters. Position is these two numbers — trivially movable on owner request. */
-export const PILL_W = 176;
-export const PILL_H = 40;
-export const PILL_MARGIN = 14;
+/** C2g FIX 1 — floating pill geometry (owner-locked, ported VERBATIM from
+ * pill-variants-explainer.html §1: "Variant A — punch-hole", 112 × 28 at TOP-CENTER,
+ * 10px from the top). `PILL_B_REST_W` is Style B's at-rest footprint (the 28 × 28 dot-pair);
+ * when Style B is hovered/bloomed the footprint is the full 112 × 28 (§1 ZERO-MISS CLICK RULE:
+ * view bounds always EQUAL the visible pill). The old C2f values (176/40/14 top-left) are gone. */
+export const PILL_W = 112;
+export const PILL_H = 28;
+export const PILL_TOP = 10;
+export const PILL_B_REST_W = 28;
+
+/** C2g — the two owner-approved pill styles. A = "punch-hole" (default on first boot),
+ * B = "micro bloom" (28 × 28 dots → blooms to the full pill on hover). Right-click toggles;
+ * the choice persists across restarts (FIX 4). */
+export type PillStyle = 'A' | 'B';
+
+const PILL_STYLE_FILE = (): string => join(app.getPath('userData'), 'pill-style.json');
+
+/** C2g FIX 4 — persisted pill style. Deliberately a main-side JSON file in userData, NOT
+ * pill-layer localStorage: the layer runs sandboxed under attachPillLockdown and its file://
+ * origin storage is not a contract we rely on; main-side disk state is readable synchronously
+ * BEFORE the layer loads, so the boot renders the persisted style from the FIRST frame with no
+ * style flash. Missing/corrupt file ⇒ default 'A' (first-boot contract). */
+export function loadPillStyle(): PillStyle {
+  try {
+    const parsed = JSON.parse(readFileSync(PILL_STYLE_FILE(), 'utf8')) as { style?: string };
+    return parsed.style === 'B' ? 'B' : 'A';
+  } catch {
+    return 'A';
+  }
+}
+
+function savePillStyle(style: PillStyle): void {
+  try {
+    writeFileSync(PILL_STYLE_FILE(), JSON.stringify({ style }), 'utf8');
+  } catch (err) {
+    console.error('[pill] style persist failed:', err);
+  }
+}
 
 export type PillMode = 'cloud' | 'local';
 
@@ -63,11 +95,25 @@ export interface CloudController {
   hide(): void;
   isVisible(): boolean;
   /** C2d self-heal, generalized (FIX 1): re-assert the site view bounds (true full window
-   * {0,0,w,h}) AND the pill overlay bounds (top-left corner) — idempotent, no focus steal. */
+   * {0,0,w,h}) AND the pill overlay bounds (C2g: top-center) — idempotent, no focus steal. */
   syncBounds(): void;
   /** C2f FIX 2 — tell the pill layer which mode the app is actually in (knob slides only on
    * this). Queued until the pill layer finishes loading; safe to call at any time. */
   setPillMode(mode: PillMode): void;
+  /** C2g FIX 3 — Style B bloom coupling (ZERO-MISS CLICK RULE): the pill layer reports
+   * hover-enter/leave; main resizes the overlay view to the bloomed (112 × 28) or rest
+   * (28 × 28) footprint RE-CENTERED, in the same tick the CSS transition starts. Idempotent;
+   * bloom requests while Style A is active are ignored. */
+  setPillBloom(bloomed: boolean): void;
+  /** C2g FIX 4 — right-click style toggle lands here: flip state, PERSIST to disk, re-assert
+   * bounds for the new style's current footprint. */
+  setPillStyle(style: PillStyle): void;
+  /** C2g-hotfix-1 FIX 3 — reply to the layer's `pill:ready`: push the TRUE mode (same
+   * `pill:setMode` channel; the boot queue stays as belt-and-braces) AND the true style. */
+  resyncPill(mode: PillMode): void;
+  /** C2g-hotfix-1 §5 — tail of the pill layer's own console (ring buffer, last 50 lines) so the
+   * battery can prove no runtime errors during load/clicks. */
+  pillConsoleTail(): string[];
   /** C2f FIX 1 — focus hygiene: give keyboard focus back after a pill click handled a flip. */
   blurPill(): void;
   /** Probe data for DROPSYNC_CLOUD_DEV: did-finish-load latency for the site origin, if loaded. */
@@ -102,14 +148,29 @@ export interface CloudController {
     windowsAfter: number;
   }>;
   /** C2f FIX 5 — pill-layer evidence for f_c2f_pillPersistent: corner bounds, visibility,
-   * load state, and the pill page's own computed transparency (background-color alpha). */
+   * load state, and the pill page's own computed transparency (background-color alpha).
+   * C2g: `expected` is now style/bloom-aware (centered), and `style`/`blooming` report the
+   * main-side truth for the f_c2g_* keys. */
   pillProbe(): Promise<{
     bounds: Electron.Rectangle;
     expected: Electron.Rectangle;
     visible: boolean;
     loaded: boolean;
     bodyBackgroundColor: string;
+    style: PillStyle;
+    blooming: boolean;
   }>;
+  /** C2g FIX 5 — drive the REAL pill layer's DOM listeners headlessly (battery only, env-gated):
+   * dispatches synthetic mouseenter/mouseleave/contextmenu through the layer so the bloom and
+   * style-toggle paths run exactly as a user's would. Throws when DROPSYNC_CLOUD_DEV ≠ 1. */
+  pillDrive(event: 'mouseenter' | 'mouseleave' | 'contextmenu'): Promise<void>;
+  /** C2g FIX 4/5 — evaluate JS inside the PILL layer (battery-only, env-gated): read computed
+   * colors / the __c2gPill fixture. Throws when DROPSYNC_CLOUD_DEV ≠ 1. */
+  pillEval<T = unknown>(expr: string): Promise<T>;
+  /** C2g FIX 4 — relaunch JUST the pill layer from disk state (persistence proof without an
+   * app restart): re-navigates to pillPageUrl(loadPillStyle()) so the boot path — file → query
+   * param → first frame — runs end-to-end. Battery-only, env-gated. */
+  reloadPillLayer(): Promise<void>;
   /** C2f FIX 5 — site-view evidence for f_c2f_boundsFull: current bounds + visibility. */
   siteProbe(): Promise<{ bounds: Electron.Rectangle; visible: boolean }>;
   /** C2f FIX 5 — z-order truth: the pill must be the LAST contentView child (paints on top). */
@@ -214,11 +275,14 @@ function attachPillLockdown(wc: Electron.WebContents): void {
 }
 
 /** C2f — where the pill page lives: the dev server in dev (electron-vite serves the renderer
- * over http; there is no out/ tree), the built multi-page output in production. */
-function pillPageUrl(): string {
+ * over http; there is no out/ tree), the built multi-page output in production.
+ * C2g FIX 4 — the PERSISTED style rides the query string so the page renders it from the very
+ * first frame (no style flash). `&e2e=1` arms the __c2gPill fixture, only under DROPSYNC_CLOUD_DEV. */
+function pillPageUrl(style: PillStyle): string {
   const devRoot = process.env.ELECTRON_RENDERER_URL;
-  if (devRoot) return `${devRoot}/pill/pill.html`;
-  return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/pill/pill.html');
+  const suffix = `?style=${style}${process.env.DROPSYNC_CLOUD_DEV === '1' ? '&e2e=1' : ''}`;
+  if (devRoot) return `${devRoot}/pill/pill.html${suffix}`;
+  return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/pill/pill.html') + suffix;
 }
 
 export function initCloud(mainWindow: BrowserWindow): CloudController {
@@ -231,15 +295,35 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
   let pillView: WebContentsView | null = null;
   let pillLoaded = false;
   let pillModeQueued: PillMode | null = null; // setPillMode before the pill page finished loading
+  // C2g — style + bloom state live in MAIN (single source of truth): bounds math, persistence
+  // and the battery probes all read these; the pill layer mirrors them via IPC.
+  let pillStyle: PillStyle = loadPillStyle();
+  let pillBlooming = false;
+  const pillConsole: string[] = []; // C2g-hotfix-1 §5 — layer console ring buffer
+
+  /** Shared load-finished path for boot AND battery-driven layer relaunches (C2g FIX 4). */
+  const onPillLoadFinished = (): void => {
+    pillLoaded = true;
+    console.log('[pill] layer loaded');
+    // Boot: main sent the initial mode before the page was ready — deliver it now.
+    if (pillModeQueued) {
+      const m = pillModeQueued;
+      pillModeQueued = null;
+      pillView?.webContents.send('pill:setMode', m);
+    }
+  };
 
   /** C2d self-heal, generalized (FIX 1): the site view is TRUE FULL WINDOW {0,0,w,h}; the pill
-   * is glued to its top-left corner. Pure functions of the window — no hidden state. */
+   * is glued TOP-CENTER (C2g), style/bloom-aware in width. Pure functions of the window. */
   const siteBounds = (): Electron.Rectangle => {
     const b = mainWindow.getContentBounds();
     return { x: 0, y: 0, width: b.width, height: b.height };
   };
+  const pillWidth = (): number => (pillStyle === 'A' || pillBlooming ? PILL_W : PILL_B_REST_W);
   const pillBounds = (): Electron.Rectangle => {
-    return { x: PILL_MARGIN, y: PILL_MARGIN, width: PILL_W, height: PILL_H };
+    const b = mainWindow.getContentBounds();
+    const w = pillWidth();
+    return { x: Math.round((b.width - w) / 2), y: PILL_TOP, width: w, height: PILL_H };
   };
 
   /** Idempotent bounds assertion: writes (and logs) ONLY on real drift, so the resize handlers,
@@ -285,17 +369,16 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
     // Transparency is the whole trick — spike-proven under WSLg (STEP 0.5, 2026-08-26).
     pillView.setBackgroundColor('#00000000');
     attachPillLockdown(pillView.webContents);
-    pillView.webContents.once('did-finish-load', () => {
-      pillLoaded = true;
-      console.log('[pill] layer loaded');
-      // Boot: main sent the initial mode before the page was ready — deliver it now.
-      if (pillModeQueued) {
-        const m = pillModeQueued;
-        pillModeQueued = null;
-        pillView?.webContents.send('pill:setMode', m);
-      }
+    // C2g-hotfix-1 §5 — capture the layer's own console (ring buffer) so the battery can prove
+    // a clean load/click session instead of asserting silence by assumption.
+    pillView.webContents.on('console-message', (_e, _level, message) => {
+      pillConsole.push(`${new Date().toISOString()} ${message}`);
+      if (pillConsole.length > 50) pillConsole.shift();
     });
-    void pillView.webContents.loadURL(pillPageUrl());
+    pillView.webContents.once('did-finish-load', () => {
+      onPillLoadFinished();
+    });
+    void pillView.webContents.loadURL(pillPageUrl(pillStyle));
     pillView.setBounds(pillBounds());
     mainWindow.contentView.addChildView(pillView); // first (and only) child at boot
     return pillView;
@@ -308,6 +391,36 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
       return;
     }
     pillView?.webContents.send('pill:setMode', mode);
+  };
+
+  // C2g FIX 3 — bloom coupling. Idempotent + validated: Style A never blooms, and a request for
+  // the state we're already in is a no-op (rapid hover storms collapse to nothing). The bounds
+  // re-assert runs in the SAME tick the layer starts its CSS transition (the layer adds its
+  // class before sending this IPC), so bloom/collapse looks seamless.
+  const setPillBloom = (bloomed: boolean): void => {
+    if (!pillView || pillStyle !== 'B') return; // A has no bloom; nothing to resize
+    if (pillBlooming === bloomed) return;
+    pillBlooming = bloomed;
+    syncBounds();
+  };
+
+  // C2g FIX 4 — right-click toggle: flip, PERSIST, re-assert bounds for the new footprint.
+  const setPillStyle = (style: PillStyle): void => {
+    if (style !== 'A' && style !== 'B') return;
+    if (pillStyle === style) return;
+    pillStyle = style;
+    if (style === 'A') pillBlooming = false; // A's footprint is always the full pill
+    savePillStyle(style);
+    console.log('[pill] style persisted:', style);
+    syncBounds();
+  };
+
+  // C2g-hotfix-1 FIX 3 — the `pill:ready` reply: TRUE mode now (the queue below already covers
+  // the not-yet-loaded case — belt-and-braces kept), TRUE style unconditionally (the layer's
+  // applyStyle is idempotent; a same-style push is a no-op there).
+  const resyncPill = (mode: PillMode): void => {
+    setPillMode(mode);
+    if (pillView && pillLoaded) pillView.webContents.send('pill:styleChanged', pillStyle);
   };
 
   const blurPill = (): void => {
@@ -374,6 +487,10 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
     isVisible: () => shown,
     syncBounds,
     setPillMode,
+    setPillBloom,
+    setPillStyle,
+    resyncPill,
+    pillConsoleTail: () => [...pillConsole],
     blurPill,
     probeState: () => ({ readyMs, url: view ? CLOUD_URL : null }),
     probeIsolation: async () => {
@@ -442,7 +559,7 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
     },
     pillProbe: async () => {
       const expected = pillBounds();
-      if (!pillView) return { bounds: { x: 0, y: 0, width: 0, height: 0 }, expected, visible: false, loaded: false, bodyBackgroundColor: 'no-view' };
+      if (!pillView) return { bounds: { x: 0, y: 0, width: 0, height: 0 }, expected, visible: false, loaded: false, bodyBackgroundColor: 'no-view', style: pillStyle, blooming: pillBlooming };
       const bodyBackgroundColor = (await pillView.webContents.executeJavaScript(
         'getComputedStyle(document.body).backgroundColor'
       )) as string;
@@ -452,7 +569,39 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
         visible: mainWindow.contentView.children.includes(pillView),
         loaded: pillLoaded,
         bodyBackgroundColor,
+        style: pillStyle,
+        blooming: pillBlooming,
       };
+    },
+    // C2g FIX 5 — battery-only layer access (I6: env-gated like every other probe).
+    pillDrive: async (event) => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('pillDrive is DROPSYNC_CLOUD_DEV-only');
+      if (!pillView) throw new Error('pill layer missing');
+      // Dispatch through the REAL DOM listeners in the REAL layer (no state is poked).
+      await pillView.webContents.executeJavaScript(
+        `(function(){ var r = document.getElementById('root'); if (!r) return false;
+           r.dispatchEvent(new Event(${JSON.stringify(event)})); return true; })()`
+      );
+    },
+    pillEval: async <T>(expr: string): Promise<T> => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('pillEval is DROPSYNC_CLOUD_DEV-only');
+      if (!pillView) throw new Error('pill layer missing');
+      return (await pillView.webContents.executeJavaScript(expr)) as T;
+    },
+    reloadPillLayer: async () => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('reloadPillLayer is DROPSYNC_CLOUD_DEV-only');
+      if (!pillView) throw new Error('pill layer missing');
+      // Full re-navigation (NOT .reload()): the query string must be rebuilt from DISK so this
+      // proves the real boot path — file → loadPillStyle → URL param → first frame.
+      // C2g-hotfix-1: MAIN's memory re-syncs from disk too — otherwise the pill:ready handshake
+      // would push a stale in-memory style over the layer's disk-derived boot (the exact
+      // divergence the cleared-store leg exercises).
+      pillStyle = loadPillStyle();
+      pillBlooming = false; // a fresh layer always boots at rest
+      syncBounds();
+      pillLoaded = false;
+      await pillView.webContents.loadURL(pillPageUrl(loadPillStyle()));
+      onPillLoadFinished();
     },
     siteProbe: async () => {
       if (!view) return { bounds: { x: 0, y: 0, width: 0, height: 0 }, visible: false };
@@ -472,8 +621,8 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
 }
 
 // Registered by index.ts once per window: keeps BOTH layers glued across geometry changes —
-// the site view at true full window AND the pill at its top-left corner (C2d pattern kept,
-// generalized per C2f FIX 1; WSLg may deliver the final size late, hence the deferred re-apply).
+// the site view at true full window AND the pill top-center (C2d pattern kept, generalized per
+// C2f FIX 1 + C2g FIX 1; WSLg may deliver the final size late, hence the deferred re-apply).
 export function attachCloudResizeTracking(
   mainWindow: BrowserWindow,
   controller: CloudController,
@@ -488,6 +637,6 @@ export function attachCloudResizeTracking(
   mainWindow.on('unmaximize', handler);
   mainWindow.on('enter-full-screen', handler);
   mainWindow.on('leave-full-screen', handler);
-  mainWindow.on('move', handler); // the pill is corner-anchored in WINDOW coords — moves are free,
-  // but the deferred re-assert costs nothing and proves the glue under any WM weirdness.
+  mainWindow.on('move', handler); // the pill is center-anchored in WINDOW coords — moves are
+  // free, but the deferred re-assert costs nothing and proves the glue under any WM weirdness.
 }
