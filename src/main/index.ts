@@ -10,12 +10,12 @@
 import { app, BrowserWindow, ipcMain, dialog, Notification, protocol, shell, net } from 'electron';
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';import { createWriteStream, mkdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
 import { VaultManager } from './vault/vault.ts';
-import { initCloud, attachCloudResizeTracking, probeCloudSessionEmail, type CloudController } from './cloud';
+import { initCloud, attachCloudResizeTracking, PILL_MARGIN, PILL_W, PILL_H, type CloudController } from './cloud';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -91,16 +91,21 @@ function createWindow(): void {
     },
   });
   mainWindow.once('ready-to-show', () => mainWindow?.show());
-  // C1: cloud view lifecycle + notch-safe bounds tracking (resize/maximize/full-screen).
+  // C1: cloud view lifecycle + C2f generalized bounds tracking (resize/maximize/full-screen/move).
   cloudCtl = initCloud(mainWindow);
   attachCloudResizeTracking(mainWindow, cloudCtl);
+  // C2f FIX 2 — the pill must show the app's ACTUAL boot mode (relaunch starts Local; the
+  // renderer's boot-into-last-mode may immediately flip it via mode:set). Queued until the
+  // pill layer finishes loading; delivered automatically.
+  cloudCtl.setPillMode(appMode);
   // Polish sweep #1: the window title is ALWAYS "DropSync" — renderer document.title changes
   // (dev overlays, hash routes) are ignored.
   mainWindow.on('page-title-updated', (event) => event.preventDefault());
   // Dev-only boot probe: proves the contextBridge landed and React mounted.
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.webContents.on('console-message', (_event, _level, message) => {
-      if (process.env.DROPSYNC_E2E_S2 === '1' || process.env.DROPSYNC_SIT3_DOMCHECKS === '1') console.log('[renderer-console]', message);
+      if (process.env.DROPSYNC_E2E_S2 === '1' || process.env.DROPSYNC_SIT3_DOMCHECKS === '1'
+        || process.env.DROPSYNC_CLOUD_DEV === '1') console.log('[renderer-console]', message);
     });
     mainWindow.webContents.on('did-finish-load', () => {
       void mainWindow?.webContents
@@ -3388,11 +3393,13 @@ function createWindow(): void {
             .catch((error) => console.error('[s4] failed:', error instanceof Error ? error.message : String(error)));
         }, 4000);
       }
-      // DROPSYNC_CLOUD_DEV=1 → C1/C2 cloud battery. C2: launch is PORCH-FIRST, so the battery
-      // (1) lets the porch paint + emit [c2] passively, (2) sets dropsync.mode.last='cloud' and
-      // RELOADS — porch remounts and must report pillInitial 'cloud' (memory-remember), then
-      // (3) drives the REAL renderer path into Cloud via the porch's dev event, which runs the
-      // same choose() code a user tap would. All f_c1_* evidence below is unchanged.
+      // DROPSYNC_CLOUD_DEV=1 → C1/C1b/C2f cloud battery. C2f: launch goes STRAIGHT into the last
+      // used mode (no porch), so the battery (1) captures the boot state + pill layer evidence,
+      // (2) proves full-window bounds + corner-glued pill across resize/fullscreen, (3) drives
+      // the pill flip relay through the guarded switch path, then (4) re-runs the kept [c1]/
+      // [c1b] evidence. The porch-era [c2]/[c2b]/[c2c] assertions (memory-remember via porch
+      // remount, dressed-login dance, pill-float DOM probe) are OBSOLETE — removed with this
+      // rewrite (C2f FIX 5: never silently keep a green that tests nothing).
       if (process.env.DROPSYNC_CLOUD_DEV === '1' && !cloudDevBatteryStarted) {
         cloudDevBatteryStarted = true;
         setTimeout(() => {
@@ -3400,91 +3407,232 @@ function createWindow(): void {
             try {
               const win = mainWindow;
               if (!win || !cloudCtl) throw new Error('window/controller gone');
-              // C2b FIX 4 precondition: guarantee a vault exists and is LOCKED so the porch
-              // embeds the real UnlockScreen (not FirstRunSetup) when the pill sits on Local.
-              // The manager boots folder-less in dev profiles, so force the sequence:
-              // ensure dir → prepare → create-if-missing → unlock (loads folder) → lock (seals).
-              mkdirSync('/tmp/ds-c2b-vault', { recursive: true });
-              const vState = await win.webContents.executeJavaScript(
+              const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+              // Page-side readers shared by every leg below (defined FIRST — no TDZ traps).
+              const readState = (): Promise<{ open: boolean; saveDisabled: boolean | null; typedChars: number; discardConfirmVisible: boolean }> =>
+                win.webContents.executeJavaScript('JSON.stringify(window.__c2fEditTest ? window.__c2fEditTest.state() : null)').then((s) => {
+                  const parsed = JSON.parse(s as string) as { open: boolean; saveDisabled: boolean | null; typedChars: number; discardConfirmVisible: boolean } | null;
+                  if (!parsed) throw new Error('guard fixture: __c2fEditTest not registered (AppBody not mounted?)');
+                  return parsed;
+                });
+              const readMode = (): Promise<string> =>
+                win.webContents.executeJavaScript('window.dropsync.mode.get()').then((m) => String(m));
+              const readModeSafe = (): Promise<string> =>
+                win.webContents.executeJavaScript('window.dropsync ? window.dropsync.mode.get() : "no-bridge"').then((m) => String(m));
+              const seqLen = (): Promise<number> =>
+                win.webContents.executeJavaScript('window.__DC_METRICS ? window.__DC_METRICS.seq.length : 0').then((n) => Number(n));
+              const seqHasConfirmOpenSince = (mark: number): Promise<boolean> =>
+                win.webContents.executeJavaScript(
+                  `(window.__DC_METRICS ? window.__DC_METRICS.seq.slice(${mark}).some((e) => e.ev === 'mode-guard-confirm-open') : false)`
+                ).then((v) => v === true);
+              // (1) Boot evidence: straight-into-last-mode + the pill layer present/transparent.
+              await sleep(2500); // pill layer load + boot-into-last-mode settle
+              const bootPill = await cloudCtl.pillProbe();
+              console.log('[c2f-boot]', JSON.stringify({
+                mode: appMode,
+                f_c2f_pillPersistent_boot: bootPill.loaded && bootPill.visible
+                  && bootPill.bounds.x === bootPill.expected.x && bootPill.bounds.y === bootPill.expected.y,
+                pillRaw: bootPill,
+              }));
+              // (1b) f_c2f_flipGuardFull — THE robot test for the unsaved-work guard
+              // (C2f-hotfix-1). The old relay leg could only prove the CLEAN path; this one
+              // drives a REAL dirty editor through the REAL relay path:
+              //   pill:flip ipc ≡ win.webContents.send('pill:flipRequested', next)
+              // Editors exist only inside an unlocked vault, so: ensure vault → unlock → seed a
+              // text drop through the REAL bridge → reload (renderer mounts Local/unlocked with
+              // the seeded drop) → open the edit modal via the __c2fEditTest dev fixture → type
+              // THROUGH THE DOM (execCommand insertText → native input event → mention editor
+              // onChange). React state is never poked for any action under test.
+              // Return to Local through the REAL path (renderer screen must follow — the reload
+              // below boots into dropsync.mode.last, and ONLY a renderer-driven switch writes it).
+              if (appMode !== 'local') {
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1800);
+              }
+              if ((await readModeSafe()) !== 'local') { // desync insurance: force both sides local
+                await applyCloudMode('local');
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1200);
+              }
+              const seedId = await win.webContents.executeJavaScript(
                 `(async () => {
-                   const d = window.dropsync;
-                   await d.vault.prepareFolder('/tmp/ds-c2b-vault').catch(() => {});
-                   try { await d.vault.create('/tmp/ds-c2b-vault', 'c2b-vault-pw'); } catch {}
-                   await d.vault.unlock('/tmp/ds-c2b-vault', 'c2b-vault-pw');
-                   await d.vault.lock();
-                   return JSON.stringify(await d.vault.status());
+                   try {
+                     const d = window.dropsync;
+                     await d.vault.prepareFolder('/tmp/ds-c2f-vault').catch(() => {});
+                     try { await d.vault.create('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch {}
+                     await d.vault.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
+                     const rec = await d.drop.createText({ spaceId: 'personal', name: 'GuardFixture', content: 'original text', categories: [], expirationOption: '24h', locked: false, reminderAt: null });
+                     return String(rec.id);
+                   } catch (e) { return 'FATAL:' + String(e); }
                  })()`
-              );
-              console.log('[c2-pre]', JSON.stringify({ vaultState: vState }));
-              // Memory rule, LOCAL leg first (also the f_c2_localEmbedded window: pill on Local
-              // with the locked vault ⇒ UnlockScreen embedded), then the CLOUD leg.
-              await win.webContents.executeJavaScript(
-                "localStorage.setItem('dropsync.mode.last','local')"
-              );
+              ) as string;
+              if (seedId.startsWith('FATAL')) throw new Error('guard fixture seeding failed: ' + seedId);
               win.webContents.reload();
-              await new Promise((r) => setTimeout(r, 5000)); // [c2] emitted by remounted porch
-              // C2c FIX 4 — collision/geometry proof at ONE SMALLER window size too (the
-              // default-size [c2c] auto-ran renderer-side when the form embedded).
-              const savedBounds = win.getBounds();
-              win.setSize(1150, 760);
-              await new Promise((r) => setTimeout(r, 500));
-              const smallProbe = await win.webContents.executeJavaScript(
-                'window.__c2cPillProbe ? window.__c2cPillProbe() : Promise.resolve({ missing: true })'
-              );
-              console.log('[c2c-small]', JSON.stringify(smallProbe));
-              // TEMP C2c debug
-              const dbg2 = await win.webContents.executeJavaScript(
-                "JSON.stringify({n:document.querySelectorAll('[data-testid=\"porch-pill-float\"]').length,attached:[...document.querySelectorAll('[data-testid=\"porch-pill-float\"]')].map(e=>e.isConnected),porchKids:[...(document.querySelector('[data-testid=\"porch\"]')?.children ?? [])].map(c=>c.getAttribute('data-testid')||c.tagName),chromeInDom:!!document.querySelector('[data-testid=\"porch-knob\"]')})"
-              );
-              console.log('[c2c-dbg]', dbg2);
-              win.setSize(savedBounds.width, savedBounds.height);
-              await new Promise((r) => setTimeout(r, 400));
-              await win.webContents.executeJavaScript(
-                "localStorage.setItem('dropsync.mode.last','cloud')"
-              );
-              win.webContents.reload();
-              await new Promise((r) => setTimeout(r, 5000)); // [c2] emitted by remounted porch
-              await win.webContents.executeJavaScript(
-                "window.dispatchEvent(new CustomEvent('dropsync:c2-dev-enter',{detail:{mode:'cloud'}}))"
-              );
+              await sleep(4500); // renderer remount: boot-into-last-mode (local) + store fetch
+              let opened = false;
+              for (let i = 0; i < 10 && !opened; i++) {
+                opened = await win.webContents.executeJavaScript(
+                  `window.__c2fEditTest ? window.__c2fEditTest.open(${JSON.stringify(seedId)}) : false`
+                ) as boolean;
+                if (!opened) await sleep(500);
+              }
+              await sleep(800); // modal mount + edit-payload hydration
+              if (!opened) throw new Error('guard fixture: edit modal never opened (seedId=' + seedId + ') — AppBody mounted? e2eHooks tag present?');
+              const baseState = await readState(); // PRE-typing baseline (fixture opens the list
+              // item directly, so the editor may seed empty — assertions are relative to THIS).
+              const typedOk = await win.webContents.executeJavaScript(
+                `(() => { const ed = document.querySelector('div[contenteditable][role="textbox"]');
+                  if (!ed) return false; ed.focus();
+                  document.execCommand('insertText', false, 'HOTFIX-DIRTY-TEXT'); return true; })()`
+              ) as boolean;
+              await sleep(400); // React flush after the native input event
+              const clickButton = (label: string): Promise<boolean> =>
+                win.webContents.executeJavaScript(
+                  `[...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === ${JSON.stringify(label)}) ? ( [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === ${JSON.stringify(label)}).click(), true ) : false`
+                ).then((v) => v === true);
+
+              const dirtyState = await readState();
+              const typedAdded = dirtyState.typedChars - baseState.typedChars; // == 17 when the
+              // native input event really drove the editor (the React-observable delta)
+              const mark1 = await seqLen();
+              win.webContents.send('pill:flipRequested', 'cloud'); // dirty flip
+              await sleep(900);
+              const duringDirty = { mode: await readMode(), dom: await readState(), sawConfirmEvent: await seqHasConfirmOpenSince(mark1) };
+              const dirtyIntercept = typedOk && typedAdded === 17 /* len('HOTFIX-DIRTY-TEXT') */
+                && appMode === 'local' && duringDirty.mode === 'local'
+                && duringDirty.dom.discardConfirmVisible && duringDirty.sawConfirmEvent;
+
+              await clickButton('Keep editing'); // Cancel leg
+              await sleep(400);
+              const cancelState = { mode: await readMode(), dom: await readState() };
+              const cancelKeeps = cancelState.mode === 'local' && cancelState.dom.open
+                && cancelState.dom.typedChars === dirtyState.typedChars; // typed text intact
+
+              win.webContents.send('pill:flipRequested', 'cloud'); // re-flip while still dirty
+              await sleep(700);
+              const confirmAgain = await readState();
+              await clickButton('Discard'); // Discard leg — fires the stashed continuation
+              await sleep(2000);
+              const discardMode = await readMode();
+              const discardFlips = discardMode === 'cloud' && appMode === 'cloud';
+
+              win.webContents.send('pill:flipRequested', 'local'); // come back — editor must be GONE
+              await sleep(1800);
+              const backDom = await readState();
+              const editorClosedOnReturn = backDom.open === false;
+
+              // Clean leg: reopen (discard threw the typing away), do NOT type, flip ⇒ instant,
+              // NO confirm — the guard must not nag the clean case.
+              const reopened = await win.webContents.executeJavaScript(
+                `window.__c2fEditTest ? window.__c2fEditTest.open(${JSON.stringify(seedId)}) : false`
+              ) as boolean;
+              await sleep(700);
+              const markClean = await seqLen();
+              win.webContents.send('pill:flipRequested', 'cloud');
+              await sleep(1400);
+              const cleanState = { mode: await readMode(), dom: await readState(), sawConfirmEvent: await seqHasConfirmOpenSince(markClean) };
+              const cleanInstant = reopened && cleanState.mode === 'cloud' && !cleanState.dom.discardConfirmVisible
+                && !cleanState.sawConfirmEvent;
+
+              console.log('[c2f-flipguard]', JSON.stringify({
+                f_c2f_flipGuardFull: dirtyIntercept && cancelKeeps && discardFlips && editorClosedOnReturn && cleanInstant,
+                f_c2f_flipGuard: cleanInstant, // folded: the old relay key IS the clean-path assertion
+                matrix: { dirtyIntercept, cancelKeeps, discardFlips, editorClosedOnReturn, cleanInstant },
+                raw: { seedId, opened, typedOk, baseState, dirtyState, typedAdded, duringDirty, cancelState, confirmAgain, discardMode, backDom, cleanState },
+              }));
+              // (2) Enter Cloud through the REAL user path — the pill flip relay. The site view
+              // is created lazily on first Cloud entry, so bounds legs must run with it alive.
+              // (Driving the raw mode:set bridge would leave the renderer's screen state out of
+              // sync — the relay IS the real path: pill → main → guarded switchMode → mode:set.)
+              win.webContents.send('pill:flipRequested', 'cloud');
               let readyMs: number | null = null;
-              for (let i = 0; i < 60 && readyMs === null; i++) {
-                await new Promise((r) => setTimeout(r, 1000));
+              for (let i = 0; i < 30 && readyMs === null; i++) {
+                await sleep(1000);
                 readyMs = cloudCtl.probeState().readyMs ?? null;
               }
+              // (3) f_c2f_boundsFull — resize to two sizes + fullscreen; the site view must equal
+              // {0,0,w,h} within ~2s AND the pill must stay glued to its corner. This leg ABSORBS
+              // the owed f_c2d_boundsFollow debt at the NEW geometry (full window, no notch).
+              const origBounds = win.getBounds();
+              const ctl = cloudCtl; // narrowed alias — TS can't keep the null-check inside nested arrows
+              const boundsLegs: Array<{ tag: string; siteOk: boolean; pillOk: boolean; site: Electron.Rectangle; pill: Electron.Rectangle }> = [];
+              const assertLeg = async (tag: string, w: number, h: number, fullscreen: boolean): Promise<void> => {
+                if (fullscreen) win.setFullScreen(true);
+                else win.setSize(w, h);
+                await sleep(1600); // well within the ~1s watchdog + deferred re-apply budget
+                const b = win.getContentBounds();
+                const site = await ctl.siteProbe();
+                const pill = await ctl.pillProbe();
+                const siteOk = site.visible
+                  && site.bounds.x === 0 && site.bounds.y === 0
+                  && site.bounds.width === b.width && site.bounds.height === b.height;
+                const pillOk = pill.bounds.x === PILL_MARGIN && pill.bounds.y === PILL_MARGIN
+                  && pill.bounds.width === PILL_W && pill.bounds.height === PILL_H;
+                boundsLegs.push({ tag, siteOk, pillOk, site: site.bounds, pill: pill.bounds });
+              };
+              await assertLeg('size-1600x1000', 1600, 1000, false);
+              await assertLeg('size-1150x760', 1150, 760, false);
+              await assertLeg('fullscreen', 0, 0, true);
+              win.setFullScreen(false);
+              win.setSize(origBounds.width, origBounds.height);
+              await sleep(600);
+              console.log('[c2f-bounds]', JSON.stringify({
+                f_c2f_boundsFull: boundsLegs.every((l) => l.siteOk && l.pillOk),
+                f_c2d_boundsFollow_absorbed: boundsLegs.every((l) => l.siteOk && l.pillOk),
+                legs: boundsLegs,
+              }));
+
+              // (4) f_c2f_pillPersistent — rapid flip storm (×10) with NO settling: exactly one
+              // site view + one pill view reused, pill z-order ALWAYS on top (last child),
+              // corner bounds intact. The storm drives MAIN-side applyCloudMode directly (view
+              // reuse under churn); the renderer is re-synced through mode:set right after,
+              // because ALL real user paths flow through the renderer (the desync the storm
+              // leaves behind is a battery-only artifact and must not leak into the flip leg).
+              const modes: string[] = [];
+              for (let i = 0; i < 10; i++) {
+                modes.push(await applyCloudMode(i % 2 === 0 ? 'local' : 'cloud'));
+              }
+              const childViews = win.contentView.children.length;
+              const stormPill = await cloudCtl.pillProbe();
+              const stormSite = await cloudCtl.siteProbe();
+              console.log('[c2f-pill]', JSON.stringify({
+                f_c2f_pillPersistent: childViews === 2 && stormPill.visible && stormPill.loaded
+                  && cloudCtl.pillIsTopChild()
+                  && stormPill.bounds.x === PILL_MARGIN && stormPill.bounds.y === PILL_MARGIN
+                  && stormPill.bodyBackgroundColor === 'rgba(0, 0, 0, 0)',
+                toggles: modes.length,
+                finalMode: appMode,
+                childViews,
+                pillIsTopChild: cloudCtl.pillIsTopChild(),
+                pillRaw: stormPill,
+                siteVisible: stormSite.visible,
+              }));
+              // Re-sync renderer ⇄ main through the REAL path after the storm (the storm above
+              // is main-side by design; this relay flip restores the renderer's screen state).
+              win.webContents.send('pill:flipRequested', 'cloud');
+              await sleep(1500);
+              // (The old f_c2f_flipGuard relay leg was folded into f_c2f_flipGuardFull — its
+              // clean-path assertion is emitted from the guard matrix as f_c2f_flipGuard.)
+              // Kept [c1]/[c1b] evidence, re-run after all the churn (adapted honestly: badgeDom
+              // is GONE — the bottom strip no longer exists; the pill probe replaces it).
+              await sleep(1500);
               const iso = await cloudCtl.probeIsolation();
               const auth = await cloudCtl.probeAuthSeen();
               const proof = await cloudCtl.probePersistProof();
-              // C2 dressed login: applied on unauth home → removed off-route → reapplied on return.
-              const dressed = await cloudCtl.probeDressedSequence();
-              console.log('[c2b]', JSON.stringify(dressed));
-              // Rapid double-switch storm: Cloud→Local→Cloud ×3 with no settling time —
-              // exactly one WebContentsView, reused, never orphaned (§6).
-              const modes: string[] = [];
-              for (let i = 0; i < 3; i++) {
-                modes.push(await applyCloudMode('local'));
-                modes.push(await applyCloudMode('cloud'));
-              }
-              const childViews = win.contentView.children.length;
-              const badgeDom = await win.webContents.executeJavaScript(
-                '(() => { const b = document.querySelector(\'button[aria-label^="Mode:"]\'); return b ? (b.textContent || "").trim() : null; })()'
-              );
               console.log('[c1]', JSON.stringify({
-                f_c1_cloudReady: readyMs !== null,
-                readyMs,
-                f_c1_isolationGuard: iso.dropsyncType === 'undefined',
-                dropsyncType: iso.dropsyncType,
+                f_c1_cloudReady: cloudCtl.probeState().readyMs !== null,
+                readyMs: cloudCtl.probeState().readyMs,
+                f_c1_isolationGuard: iso.dropsyncType === 'undefined'
+                  && iso.pillDropsyncType === 'undefined' && iso.pillBridgeType === 'object',
+                isolationRaw: iso,
                 f_c1_authSeen: auth.firebaseAuthKeys > 0 || auth.accountChip,
                 authSeenRaw: auth,
                 persistProof: proof,
-                f_c1_switchStorm: { toggles: modes.length, finalMode: appMode, childViews, badgeDom },
+                f_c1_switchStorm: { toggles: modes.length, finalMode: appMode, childViews },
               }));
               // C1b FIX D — synthetic auth-handler popup through OUR allowlist, end-to-end.
               const c1b = await cloudCtl!.probeSyntheticAuthPopup();
               console.log('[c1b]', JSON.stringify(c1b));
-              // C2 steady state: after all the churn the unauth home must STILL be dressed.
-              await new Promise((r) => setTimeout(r, 5000));
-              console.log('[c2b-steady]', JSON.stringify(cloudCtl!.dressedProbe()));
               // Real-restart proof helper: leave a specific memory value behind for the NEXT
               // boot to read (DROPSYNC_CLOUD_DEV_MEM=local ⇒ next launch must open on Local).
               if (process.env.DROPSYNC_CLOUD_DEV_MEM === 'local') {
@@ -3504,12 +3652,11 @@ function createWindow(): void {
   if (process.env.ELECTRON_RENDERER_URL) {
     // Sitting-2 battery AND the Sitting-3 round-trip need the dev-only __EXCAL hook — tag the
     // URL so main.tsx enables it. FIX 14's cache-size probe rides the same flag for DOM checks.
-    // C2: the porch battery evidence emitter is tagged with `c2dev` under DROPSYNC_CLOUD_DEV.
+    // C2f-hotfix-1: the cloud battery needs the same tag for its guard fixture (__c2fEditTest
+    // + __DC_METRICS), and its renderer-console lines are forwarded for failure visibility.
     const wantsHooks = process.env.DROPSYNC_E2E_S2 === '1' || process.env.DROPSYNC_E2E_SIT3 === '1'
-      || process.env.DROPSYNC_SIT3_DOMCHECKS === '1';
-    const devUrl = `${process.env.ELECTRON_RENDERER_URL}${wantsHooks ? '?e2eHooks' : ''}${
-      process.env.DROPSYNC_CLOUD_DEV === '1' ? (wantsHooks ? '&' : '?') + 'c2dev' : ''
-    }`;
+      || process.env.DROPSYNC_SIT3_DOMCHECKS === '1' || process.env.DROPSYNC_CLOUD_DEV === '1';
+    const devUrl = `${process.env.ELECTRON_RENDERER_URL}${wantsHooks ? '?e2eHooks' : ''}`;
     void mainWindow.loadURL(devUrl);
   } else {
     void mainWindow.loadFile(join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/index.html'));
@@ -3703,13 +3850,23 @@ function registerIpc(): void {
       appMode = 'local';
       cloudCtl?.hide();
     }
+    // C2f FIX 2 — the knob slides ONLY when the mode ACTUALLY applied (never on request).
+    cloudCtl?.setPillMode(appMode);
     return appMode;
   };
   applyCloudMode = applyMode;
   handle('mode:get', () => appMode);
   handle('mode:set', (_e, next: 'cloud' | 'local') => applyCloudMode(next));
-  // C2 porch — read-only hidden-view email discovery. USER-FACING feature: registered always.
-  handle('mode:probeEmail', () => probeCloudSessionEmail());
+  // C2f FIX 2 — the pill's ONE outbound channel: forward the flip request to the MAIN window
+  // renderer, which runs the EXISTING guarded switchMode (unsaved-work discard-confirm
+  // included). The pill never switches anything by itself. Then give keyboard focus back.
+  ipcMain.on('pill:flip', (_e, next: 'cloud' | 'local') => {
+    if (next !== 'cloud' && next !== 'local') return;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    console.log('[pill] flip requested →', next);
+    mainWindow.webContents.send('pill:flipRequested', next);
+    cloudCtl?.blurPill();
+  });
   // DEV-ONLY probes (I6): never registered without DROPSYNC_CLOUD_DEV=1.
   if (process.env.DROPSYNC_CLOUD_DEV === '1') {
     handle('mode:devProbe', async () => {

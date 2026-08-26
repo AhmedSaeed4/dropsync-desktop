@@ -1,5 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { VaultStoreProvider, useVaultStore } from './store/vault';
 import type { Drop } from './lib/types';
 import { FirstRunSetup } from './components/FirstRunSetup';
@@ -19,15 +18,27 @@ import { dropDtoToDrop } from './lib/types';
 import { isTextFileDrop, drawingMediaKind } from './lib/dropsHelpers';
 import { invalidatePreviewPayload, clearPreviewPayloadCache, putCachedPreviewPayload } from './lib/previewPayloadCache';
 import { Toast } from './components/shared/Toast';
-import { ModeBadge, type DesktopMode } from './components/ModeBadge';
-import { Porch } from './components/Porch';
 import { requestModeSwitch } from './lib/modeSwitchGuard';
 
-/** C2b — the porch's Local-panel slot. When the porch frame is up, AppBody portals the REAL
- * entry component (FirstRunSetup / UnlockScreen, internals untouched) into the slot so the
- * pill sits directly above the actual form; null ⇒ render direct (mid-session/auto-lock C1
- * paths). The ref object is stable; slot DOM changes flow through shell state re-renders. */
-const PorchSlotContext = createContext<{ current: HTMLDivElement | null }>({ current: null });
+/** C2f — desktop mode. (The old bottom-strip badge is gone with the porch.) */
+type DesktopMode = 'cloud' | 'local';
+
+/** Memory rule (§2, KEPT EXACTLY from C2): localStorage `dropsync.mode.last`; first-ever launch
+ * (absent/corrupt) ⇒ LOCAL. Read BEFORE first paint so boot goes straight into the last mode. */
+const MEMORY_KEY = 'dropsync.mode.last';
+function readLastMode(): DesktopMode {
+  try {
+    const v = localStorage.getItem(MEMORY_KEY);
+    return v === 'cloud' ? 'cloud' : 'local'; // corrupt/absent ⇒ Local default (§5)
+  } catch {
+    return 'local';
+  }
+}
+function writeLastMode(mode: DesktopMode): void {
+  try {
+    localStorage.setItem(MEMORY_KEY, mode);
+  } catch { /* storage unavailable — memory simply won't persist */ }
+}
 import type { CreateExpirationOptionDTO, DropDTO, UpdateMetaPatchDTO } from '../../preload/apiTypes';
 
 export default function App() {
@@ -39,49 +50,34 @@ export default function App() {
 }
 
 /**
- * C2 — launch is PORCH-FIRST: the porch shows before ANY mode entry (pill memory via
- * localStorage `dropsync.mode.last`, first-ever ⇒ Local). Choosing a mode glides to it:
- * Local re-parents the EXISTING entry branches (FirstRunSetup / UnlockScreen, M7 offer
- * included — internals unchanged, AppBody untouched); Cloud runs the C1 path (mode:set seals
- * the vault when unlocked, then the embedded view). Mid-session switching stays with the
- * badge + the new SettingsModal line and now routes through the unsaved-work guard
- * (lib/modeSwitchGuard) so editors confirm "Discard changes?" before any switch proceeds.
- * Auto-lock still lands on UnlockScreen — never back on the porch. Badge visible in ALL
- * states incl. the porch; cloud view shows through the reserved bottom band as in C1.
+ * C2f — launch goes STRAIGHT into the last used mode (memory rule above; no porch, no cards,
+ * no strip). The mode switcher is the floating pill — its OWN tiny native layer above the site
+ * view (src/renderer/pill/), never DOM here. A pill click arrives as `pill:flipRequested` and
+ * rides the EXISTING guarded switchMode (unsaved-work discard-confirm included). Cloud = the
+ * REAL website full-window, raw; Local = this app exactly as committed. There is NO desktop
+ * settings door while IN cloud (accepted trade-off: flip to Local for that).
  */
 function CloudModeShell() {
-  const { status, refreshAll } = useVaultStore();
-  const [screen, setScreen] = useState<'porch' | 'local' | 'cloud'>('porch');
-  const pendingSettingsRef = useRef(false);
-  // C2b — Local-panel portal slot (see PorchSlotContext).
-  const slotRef = useRef<HTMLDivElement | null>(null);
-  const [, setSlotEl] = useState<HTMLDivElement | null>(null);
-  const attachSlot = useCallback((el: HTMLDivElement | null) => {
-    slotRef.current = el;
-    setSlotEl(el); // re-render so AppBody portals into the freshly attached node
+  const { refreshAll } = useVaultStore();
+  // Boot: read the memory rule BEFORE first paint and render that mode directly.
+  const [screen, setScreen] = useState<DesktopMode>(() => readLastMode());
+
+  // Boot-into-last-mode: when the remembered mode is Cloud, main must raise the site view.
+  // (Local needs nothing — the local flow below is exactly as committed.) The pill's knob is
+  // set main-side (setPillMode on boot + after every applied mode change).
+  useEffect(() => {
+    if (screen === 'cloud') void window.dropsync.mode.set('cloud');
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- boot-only: run once on mount
   }, []);
 
-  // C2b FIX 1: unlocking from the EMBEDDED UnlockScreen goes straight into the main app —
-  // the porch unmounts (badge remains) in the same commit; no flash, no double-render.
-  useEffect(() => {
-    if (screen === 'porch' && status === 'unlocked') setScreen('local');
-  }, [screen, status]);
-
-  // "Desktop settings" from Cloud: auto-open the existing SettingsModal once Local is back
-  // AND the vault is unlocked again (returning always requires the password first).
-  useEffect(() => {
-    if (screen === 'local' && status === 'unlocked' && pendingSettingsRef.current) {
-      pendingSettingsRef.current = false;
-      window.dispatchEvent(new CustomEvent('dropsync:open-settings'));
-    }
-  }, [screen, status]);
-
-  /** Actual transition: main seals/raises/hides; renderer flips + resyncs on Local return. */
+  /** Actual transition: main seals/raises/hides (and sets the pill knob); renderer flips +
+   * resyncs on Local return. Writes the memory rule (C2 §2 — choice is written on switch). */
   const applyMode = useCallback(
     async (next: DesktopMode): Promise<void> => {
       if (next === screen) return;
       await window.dropsync.mode.set(next);
       setScreen(next);
+      writeLastMode(next);
       if (next === 'local') await refreshAll(); // instant entry-branch resync (status may have flipped)
     },
     [screen, refreshAll]
@@ -96,6 +92,13 @@ function CloudModeShell() {
     [applyMode]
   );
 
+  // C2f FIX 2/3 — the floating pill's flip requests land here and ride the SAME guarded
+  // switchMode a keyboard/user path would. (The pill itself never switches anything.)
+  useEffect(() => {
+    const off = window.dropsync.onPillFlipRequested((next) => switchMode(next));
+    return () => { off(); };
+  }, [switchMode]);
+
   // SettingsModal "Switch to Cloud" line rides the event bus (same style as open-settings).
   useEffect(() => {
     const h = (): void => switchMode('cloud');
@@ -104,39 +107,13 @@ function CloudModeShell() {
   }, [switchMode]);
 
   // Single root element (display:contents) keeps the boot probe's `rootChildren: 1` contract
-  // intact while hosting porch/local/cloud screens plus the fixed-position badge.
-  const badge = (
-    <ModeBadge
-      mode={screen === 'cloud' ? 'cloud' : 'local'}
-      onSwitch={() => switchMode(screen === 'cloud' ? 'local' : 'cloud')}
-      onOpenSettings={() => {
-        pendingSettingsRef.current = screen === 'cloud';
-        if (screen === 'cloud') switchMode('local'); // planner ruling: Local first; modal opens after unlock
-        else window.dispatchEvent(new CustomEvent('dropsync:open-settings'));
-      }}
-    />
-  );
-
-  if (screen === 'porch') {
-    return (
-      <PorchSlotContext.Provider value={slotRef}>
-        <div className="contents" data-shell="porch">
-          {/* Body first so the porch frame paints over its transient spinner; once locked-state
-           * entry renders, it PORTALS into the porch's Local panel (single screen, FIX 1). */}
-          <AppBody />
-          <Porch onEnter={(m) => void applyMode(m)} localSlotRef={attachSlot} />
-          {badge}
-        </div>
-      </PorchSlotContext.Provider>
-    );
-  }
-
+  // intact. The floating pill is NOT in this DOM — it is a separate native layer (main/cloud.ts).
   if (screen === 'cloud') {
     return (
       <div className="contents" data-shell="cloud">
-        {/* Cloud view covers everything above the notch band; render a quiet filler beneath. */}
+        {/* The site view covers the ENTIRE window above this DOM; keep a quiet cream filler
+         * beneath for the first paint instants before the site's first frame lands. */}
         <div className="fixed inset-0 bg-[#FAF7F2]" />
-        {badge}
       </div>
     );
   }
@@ -144,14 +121,12 @@ function CloudModeShell() {
   return (
     <div className="contents" data-shell="local">
       <AppBody />
-      {badge}
     </div>
   );
 }
 
 function AppBody() {
   const store = useVaultStore();
-  const porchSlot = useContext(PorchSlotContext);
   const {
     status, folder, checking, theme, spaces, currentSpaceId, currentSpaceName,
     categories, drops, loading, settings,
@@ -588,6 +563,44 @@ function AppBody() {
     if (w.seq.length > 240) w.seq.shift();
   }, [editDrop]);
 
+  // C2f-hotfix-1 DEV fixture (?e2eHooks only): lets the cloud battery open the REAL edit modal
+  // for a seeded drop — the exact setEditDrop call the row's Edit action makes (App.tsx onEdit)
+  // — and read guard-relevant truth back from the DOM. Dirtying itself is NOT done here: the
+  // battery types through the real editor surface (execCommand → native input event), so no
+  // React state is ever poked for the action under test.
+  useEffect(() => {
+    if (!(import.meta.env.DEV && window.location.search.includes('e2eHooks'))) return;
+    const w = window as unknown as {
+      __c2fEditTest?: {
+        open(dropId: string): boolean;
+        state(): { open: boolean; saveDisabled: boolean | null; typedChars: number; discardConfirmVisible: boolean };
+      };
+    };
+    w.__c2fEditTest = {
+      open(dropId: string): boolean {
+        const source = drops.find((d) => d.id === dropId);
+        if (!source) return false;
+        setEditDrop(source);
+        return true;
+      },
+      state() {
+        const editor = document.querySelector<HTMLDivElement>('div[contenteditable][role="textbox"]');
+        // The edit-mode submit button is disabled ⇔ `isEditMode && !hasChanges` (modal :1180),
+        // so its disabled flag IS the hasChanges truth, read from the DOM like a user sees it.
+        const saveBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+          .find((b) => b.textContent?.trim() === 'Save changes');
+        const discardConfirmVisible = Array.from(document.querySelectorAll('p'))
+          .some((el) => el.textContent?.trim() === 'Discard changes?');
+        return {
+          open: !!editor,
+          saveDisabled: saveBtn ? saveBtn.disabled : null,
+          typedChars: editor ? (editor.textContent || '').replace(/\u200B/g, '').length : -1,
+          discardConfirmVisible,
+        };
+      },
+    };
+  }, [drops, editDrop]);
+
   if (checking) {
     return (
       <div className={`min-h-screen ${tc.bg} flex items-center justify-center`}>
@@ -597,10 +610,9 @@ function AppBody() {
   }
 
   if (status !== 'unlocked') {
-    // C2b: when the porch frame is up, the REAL entry component renders INSIDE the porch's
-    // Local panel (portal slot) — same screen as the pill, no placeholder card, no extra
-    // navigation step. Without the porch (mid-session return / auto-lock) → direct, as C1.
-    const entryUi = status === 'none' ? (
+    // C2f: Local renders DIRECT full-window exactly as these components always have (the C2b
+    // porch portal slot is gone; no component needed any porch-only props).
+    return status === 'none' ? (
       <FirstRunSetup
         theme={theme}
         folder={folder}
@@ -625,8 +637,6 @@ function AppBody() {
         onUnlock={handleUnlock}
       />
     );
-    const slot = porchSlot.current;
-    return slot ? createPortal(entryUi, slot) : entryUi;
   }
 
   return (

@@ -184,6 +184,16 @@ export function EditorialTextModal({
     if (w.seq.length > 240) w.seq.shift();
   }, [mode, extractingScene, editDrop]);
 
+  // C2f-hotfix-1 trace (same DEV/e2eHooks gating, zero prod impact): the mode-switch discard-
+  // confirm's visibility lifecycle. The cloud battery asserts on these events (plus plain DOM
+  // checks) instead of reaching into component state.
+  useEffect(() => {
+    if (!(import.meta.env.DEV && window.location.search.includes('e2eHooks'))) return;
+    const w = (window as unknown as { __DC_METRICS?: { seq: { t: number; ev: string }[] } }).__DC_METRICS;
+    w?.seq.push({ t: Date.now(), ev: showCloseDiscardConfirm ? 'mode-guard-confirm-open' : 'mode-guard-confirm-close' });
+    if (w && w.seq.length > 240) w.seq.shift();
+  }, [showCloseDiscardConfirm]);
+
   // Load existing image for edit mode — media:// URL through the bridge (no Firebase decrypt).
   useEffect(() => {
     if (!isEditMode || !editDrop || !editDrop.imageSize) return;

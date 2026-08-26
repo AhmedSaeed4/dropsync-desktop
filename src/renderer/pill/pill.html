@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>DropSync Pill</title>
+    <!-- C2f FIX 2 — the floating pill layer. Transparent body (spike-proven, STEP 0.5);
+         strict CSP: local scripts only, no remote anything, styles inline (knob transform is
+         set via CSSOM from pill.ts, which CSP does not govern). -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
+    />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent; /* the whole point — no rectangle behind the pill */
+        overflow: hidden;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+        user-select: none;
+      }
+      /* C2 pixel contract (the original porch pill), scaled ~0.8×: dark trough #1a1a1a, radius 999px,
+         4px padding; white knob width calc(50% - 4px), shadow 0 1px 3px rgba(0,0,0,.08),
+         ELASTIC easing cubic-bezier(0.34,1.56,0.64,1) over 0.6s; buttons 12px/500, inactive
+         rgba(255,255,255,.55) → active #1a1a1a, color .3s. Wording EXACTLY "Cloud"/"Local". */
+      #pill {
+        position: absolute;
+        inset: 0;
+        box-sizing: border-box;
+        display: flex;
+        align-items: stretch;
+        border-radius: 999px;
+        background: #1a1a1a;
+        padding: 4px;
+      }
+      #knob {
+        position: absolute;
+        top: 4px;
+        left: 4px;
+        height: calc(100% - 8px);
+        width: calc(50% - 4px);
+        background: #ffffff;
+        border-radius: 999px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+        will-change: transform;
+        transform: translateX(0); /* Cloud rest position */
+        transition: transform 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
+      }
+      button {
+        position: relative;
+        z-index: 1;
+        flex: 1 1 50%;
+        border: none;
+        background: transparent;
+        border-radius: 999px;
+        padding: 8px 0;
+        font-size: 12px;
+        font-weight: 500;
+        font-family: inherit;
+        letter-spacing: 0.01em;
+        cursor: pointer;
+        transition: color 0.3s;
+        color: rgba(255, 255, 255, 0.55);
+      }
+      button.active {
+        color: #1a1a1a;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="pill" data-testid="pill-layer">
+      <span id="knob" aria-hidden="true"></span>
+      <button id="btn-cloud" type="button">Cloud</button>
+      <button id="btn-local" type="button">Local</button>
+    </div>
+    <script type="module" src="./pill.ts"></script>
+  </body>
+</html>

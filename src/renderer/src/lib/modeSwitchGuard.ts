@@ -19,7 +19,11 @@ export interface ModeSwitchDetail {
 
 /** Returns true when the switch was INTERCEPTED by an editor's discard guard. */
 export function requestModeSwitch(proceed: () => void): boolean {
-  const ev = new CustomEvent<ModeSwitchDetail>(MODE_SWITCH_EVENT, { detail: { proceed } });
+  // `cancelable` is load-bearing (C2f-hotfix-1): without it preventDefault() is a spec-level
+  // no-op and dispatchEvent ALWAYS returns true, so `intercepted` was always false and every
+  // guarded switch proceeded instantly, discarding unsaved edits. MDN Event.preventDefault:
+  // "does nothing if the event is not cancelable".
+  const ev = new CustomEvent<ModeSwitchDetail>(MODE_SWITCH_EVENT, { cancelable: true, detail: { proceed } });
   const intercepted = !window.dispatchEvent(ev);
   if (!intercepted) proceed();
   return intercepted;

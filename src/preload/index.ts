@@ -61,9 +61,16 @@ const api: DropsyncBridge = {
   mode: {
     get: () => invoke<'cloud' | 'local'>('mode:get'),
     set: (next: 'cloud' | 'local') => invoke<'cloud' | 'local'>('mode:set', next),
-    probeEmail: () => invoke<{ signedIn: boolean; email: string | null }>('mode:probeEmail'),
     devProbe: () => invoke<unknown>('mode:devProbe'),
-    devC2: (evidence: unknown) => invoke<void>('mode:c2Evidence', evidence),
+  },
+  onPillFlipRequested: (listener: (next: 'cloud' | 'local') => void): (() => void) => {
+    const wrapped = (_e: Electron.IpcRendererEvent, next: 'cloud' | 'local'): void => {
+      if (next === 'cloud' || next === 'local') listener(next);
+    };
+    ipcRenderer.on('pill:flipRequested', wrapped);
+    return () => {
+      ipcRenderer.removeListener('pill:flipRequested', wrapped);
+    };
   },
   shell: {
     openExternal: (url: string) => invoke('shell:openExternal', url),

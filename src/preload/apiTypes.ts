@@ -198,18 +198,18 @@ export interface DropsyncBridge {
   youtube: {
     refreshTitles(spaceId: string): Promise<RefreshTitlesResultDTO>;
   };
-  /** C1 — desktop mode. Cloud = embedded real site; Local = the encrypted vault UI. */
+  /** C1 — desktop mode. Cloud = embedded real site; Local = the encrypted vault UI.
+   * (C2f: the porch-era probeEmail/devC2 members are gone with the porch.) */
   mode: {
     get(): Promise<'cloud' | 'local'>;
     /** 'cloud' seals the vault via the existing lock path; 'local' reveals the entry branch. */
     set(next: 'cloud' | 'local'): Promise<'cloud' | 'local'>;
-    /** C2 porch — read-only hidden-view session/email discovery (async, never blocks paint). */
-    probeEmail(): Promise<{ signedIn: boolean; email: string | null }>;
     /** DEV-ONLY (DROPSYNC_CLOUD_DEV=1) — f_c1_* evidence; unregistered otherwise. */
     devProbe?(): Promise<unknown>;
-    /** DEV-ONLY — porch battery evidence relay ([c2] console line); unregistered otherwise. */
-    devC2?(evidence: unknown): Promise<void>;
   };
+  /** C2f FIX 2/3 — the floating pill's flip relay. Main forwards the pill's ONE flip request
+   * here; the renderer runs the EXISTING guarded switchMode. Returns the unsubscribe. */
+  onPillFlipRequested(listener: (next: 'cloud' | 'local') => void): () => void;
   shell: {
     openExternal(url: string): Promise<boolean>;
   };
