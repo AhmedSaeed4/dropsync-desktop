@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>DropSync Reminder Card</title>
+    <!-- C2j — the reminder CARD layer: a THIRD trusted local view (pill sibling). ZERO remote
+         assets: no fonts, no images, no remote scripts — strict CSP below, styling hand-rolled
+         to the Editorial tokens (cream #FAF7F2 family, ink #1a1a1a, gold accent bar) so the app's
+         Tailwind build is NOT needed here. The page paints NOTHING while idle (no .show class)
+         so the collapsed 0×0 native footprint is invisible. prefers-reduced-motion ⇒ the 180 ms
+         scale/fade is disabled (instant appear/disappear). -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
+    />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent; /* the whole point — no rectangle behind the card */
+        overflow: hidden;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+        user-select: none;
+      }
+      #root { width: 100vw; height: 100vh; }
+      /* The card exactly fills the native CARD_W × CARD_H room (348 × 92 at top-right — the
+         native bounds own placement; the page just paints the card at 0,0). Editorial tokens:
+         cream surface, ink text, gold accent bar, rounded-xl, soft shadow. */
+      #card {
+        position: absolute; top: 0; left: 0; width: 348px; height: 92px; box-sizing: border-box;
+        display: flex; align-items: stretch;
+        background: #FAF7F2; color: #1a1a1a;
+        border-radius: 16px;
+        box-shadow: 0 10px 30px rgba(26, 26, 26, .18), 0 2px 8px rgba(26, 26, 26, .12);
+        cursor: pointer; overflow: hidden;
+        opacity: 0; transform: scale(.92) translateY(-6px);
+        transition: opacity .18s ease-out, transform .18s ease-out;
+      }
+      #card.show { opacity: 1; transform: scale(1) translateY(0); }
+      #bar { flex: 0 0 6px; width: 6px; background: #C9A227; } /* gold accent bar */
+      #txt { flex: 1; min-width: 0; padding: 16px 18px; display: flex; flex-direction: column; justify-content: center; gap: 4px; }
+      #title { font-size: 14px; font-weight: 600; letter-spacing: .01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #body { font-size: 12px; color: rgba(26, 26, 26, .62); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      @media (prefers-reduced-motion: reduce) { #card { transition: none; } }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div id="card" role="alert" aria-live="polite">
+        <div id="bar"></div>
+        <div id="txt">
+          <div id="title"></div>
+          <div id="body"></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="./card.ts"></script>
+  </body>
+</html>

@@ -61,6 +61,23 @@ export const PILL_H = 28;
 export const PILL_TOP = 10;
 export const PILL_B_REST_W = 28;
 
+/** C2j — the reminder CARD layer (LEG 2): a THIRD trusted local view, sibling of the pill.
+ * A due reminder must be IMPOSSIBLE to miss, so it floats over WHICHEVER world is on screen
+ * (native z-order: site < card < pill). Footprint discipline mirrors the pill's zero-miss rule:
+ * with NO card active the layer is COLLAPSED (0×0 at its anchor corner — paints nothing, eats
+ * no clicks); while a card shows, bounds are exactly CARD_W × CARD_H at the top-right anchor.
+ * The site view is never navigated/injected/CSSed (invariants I1/I6 untouched). */
+export const CARD_W = 348;
+export const CARD_H = 92;
+export const CARD_TOP = PILL_TOP + 42; // 52 — one comfortable row below the pill band
+export const CARD_RIGHT = 14;
+/** Product dwell constants — NOT animation timings: how long a card stays up, the polite gap
+ * between consecutive cards, and how many missed reminders may queue before overflow drops
+ * the OLDEST (whose count rides the next flushed card as a single "+N older" body prefix). */
+export const AUTO_DISMISS_MS = 5500;
+export const NEXT_GAP_MS = 400;
+export const MAX_MISSED = 20;
+
 /** C2g-hotfix-4 FIX 2 — Style-B BLOOM-TIME breathing room ONLY (explicit owner-approved
  * trade-off). While bloomed, the native room grows to 132 × 44 so TWO things never clip inside
  * the page: the contracted elastic overshoot (bezier peaks ≈ +8 px past 112 mid-bounce) and the
@@ -166,12 +183,16 @@ export interface CloudController {
   /** Probe data for DROPSYNC_CLOUD_DEV: did-finish-load latency for the site origin, if loaded. */
   probeState(): { readyMs: number | null; url: string | null };
   /** f_c1_isolationGuard — evaluate INSIDE the cloud contents (I1: no bridge may exist), now
-   * ALSO covering the pill layer (its bridge must be `dropsyncPill`, never `dropsync`). */
+   * ALSO covering the pill layer (its bridge must be `dropsyncPill`, never `dropsync`) and,
+   * C2j, the card layer (`dropsyncCard` exists ONLY on the card page — never site, never pill). */
   probeIsolation(): Promise<{
     dropsyncType: string;
     hasPreloadKey: true;
     pillDropsyncType: string;
     pillBridgeType: string;
+    pillCardBridgeType: string;
+    cardDropsyncType: string;
+    cardBridgeType: string;
   }>;
   /**
    * f_c1_authSeen — READ-ONLY signed-in marker inside the persist:cloud session. Marker chain
@@ -227,6 +248,39 @@ export interface CloudController {
   siteDriveWheel(x: number, y: number, deltaY: number): Promise<boolean>;
   /** C2f FIX 5 — z-order truth: the pill must be the LAST contentView child (paints on top). */
   pillIsTopChild(): boolean;
+  /** C2j — reminder overlay LEG 2: show a card over whichever world is on screen. ALWAYS-on
+   * delivery beside the native toast; the card queue displays ONE card at a time, serially. */
+  reminderShow(title: string, body: string): void;
+  /** C2j LEG 3 — missed queue: a reminder that fired while the app wasn't front-and-center.
+   * Caps at MAX_MISSED; overflow drops the OLDEST and its count rides the next drained card. */
+  enqueueMissed(title: string, body: string): void;
+  /** C2j LEG 3 — drain the missed queue OLDEST-FIRST into the overlay (OVERLAY ONLY — these
+   * were already natively shown once at fire time). Spacing comes from the serial card pump. */
+  drainMissed(): void;
+  /** C2j — a card click landed: dismiss the clicked card and focus/restore the window
+   * (mirrors the native toast's click behavior). */
+  reminderClick(id: string): void;
+  /** C2j — card-layer evidence for f_c2j_cardOverBothWorlds: load/visibility, live bounds vs
+   * expected (showing ⇒ card rect, idle ⇒ collapsed 0×0), queue state, delivered counter,
+   * missed-queue state, the painted page's own card-node truth, and z-order (pillIsTopChild). */
+  cardProbe(): Promise<{
+    loaded: boolean;
+    visible: boolean;
+    showing: boolean;
+    bounds: Electron.Rectangle;
+    expected: Electron.Rectangle;
+    queueLen: number;
+    nextQueueTitle: string | null;
+    currentTitle: string | null;
+    delivered: number;
+    missedLen: number;
+    missedDropped: number;
+    pageCardVisible: boolean | 'no-view';
+    pillIsTop: boolean;
+  }>;
+  /** C2j — battery-only hermetic purge of ALL card/missed state (env-gated like pillDrive):
+   * queues, timers, the live card. The missed-queue unit leg uses it to stay deterministic. */
+  cardTestReset(): Promise<void>;
 }
 
 /** https-only external handoff (I2). Returns true when handed off. */
@@ -337,6 +391,14 @@ function pillPageUrl(style: PillStyle): string {
   return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/pill/pill.html') + suffix;
 }
 
+/** C2j — where the CARD page lives (cloned from pillPageUrl): dev server in dev, built
+ * multi-page output in production. No query params — the card carries no persisted state. */
+function cardPageUrl(): string {
+  const devRoot = process.env.ELECTRON_RENDERER_URL;
+  if (devRoot) return `${devRoot}/card/card.html`;
+  return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/card/card.html');
+}
+
 export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: () => void }): CloudController {
   // C2h FIX 2/3 — main-provided activity feed: gestures sensed on the cloud view call this
   // (wired in index.ts to manager.touch()), so Cloud input feeds the SAME idle clock as Local.
@@ -423,6 +485,16 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
       if (cur.x !== expected.x || cur.y !== expected.y || cur.width !== expected.width || cur.height !== expected.height) {
         pillView.setBounds(expected);
         console.log('[pill] bounds set', JSON.stringify({ from: cur, to: expected }));
+      }
+    }
+    // C2j — the card layer joins the self-heal: card rect while a card shows, collapsed 0×0
+    // while idle (zero-footprint discipline). Idempotent; logs only on real drift.
+    if (cardView) {
+      const expected = cardShowing ? cardBounds() : cardCollapsedBounds();
+      const cur = cardView.getBounds();
+      if (cur.x !== expected.x || cur.y !== expected.y || cur.width !== expected.width || cur.height !== expected.height) {
+        cardView.setBounds(expected);
+        console.log('[card] bounds set', JSON.stringify({ from: cur, to: expected }));
       }
     }
   };
@@ -557,6 +629,157 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     } catch { /* window gone — nothing to hand focus back to */ }
   };
 
+  // ==== C2j — the reminder CARD layer (LEG 2) ===============================================
+  // Third trusted local view — the pill's boot recipe mirrored exactly: EAGER creation at init
+  // (never removed in normal operation), transparent background, sandboxed local page with the
+  // same lockdown, DIP bounds math from getContentBounds, idempotent watchdog discipline.
+  let cardView: WebContentsView | null = null;
+  let cardLoaded = false;
+  interface CardItem { id: string; title: string; body: string }
+  const cardQueue: CardItem[] = []; // display queue — ONE card visible at a time (serial pump)
+  let cardShowing = false;
+  let cardCurrentId: string | null = null;
+  let cardCurrentTitle: string | null = null; // probe evidence: which card is on screen now
+  let cardSeq = 0;
+  let cardDelivered = 0; // cards that BEGAN displaying (battery proof of full delivery)
+  let cardDismissTimer: ReturnType<typeof setTimeout> | null = null;
+  // The hide-transition hold: the page plays its ~180 ms fade/scale while the native footprint
+  // still holds, THEN collapses to 0×0 and waits NEXT_GAP_MS before the next card.
+  let cardCollapseTimer: ReturnType<typeof setTimeout> | null = null;
+  // LEG 3 — missed-reminder queue (oldest-first = enqueue order). Overflow drops the OLDEST;
+  // its running count rides the NEXT drained card as a single "+N older" body prefix.
+  const missedQueue: CardItem[] = [];
+  let missedDropped = 0;
+
+  /** Top-right anchor, DIP math like pillBounds(): x = contentW − CARD_W − CARD_RIGHT. */
+  const cardBounds = (): Electron.Rectangle => {
+    const b = mainWindow.getContentBounds();
+    return { x: Math.round(b.width - CARD_W - CARD_RIGHT), y: CARD_TOP, width: CARD_W, height: CARD_H };
+  };
+  /** Zero-footprint rest state: 0×0 at the same anchor corner (pill zero-miss discipline). */
+  const cardCollapsedBounds = (): Electron.Rectangle => {
+    const b = mainWindow.getContentBounds();
+    return { x: Math.round(b.width - CARD_W - CARD_RIGHT), y: CARD_TOP, width: 0, height: 0 };
+  };
+
+  const onCardLoadFinished = (): void => {
+    cardLoaded = true;
+    console.log('[card] layer loaded');
+    pumpCard(); // a fire that arrived before the page was ready displays now
+  };
+
+  const ensureCard = (): WebContentsView => {
+    if (cardView) return cardView;
+    cardView = new WebContentsView({
+      webPreferences: {
+        preload: join(fileURLToPath(new URL('.', import.meta.url)), '../preload/cardPreload.cjs'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+    cardView.setBackgroundColor('#00000000'); // WSLg-transparency-safe (pill precedent, STEP 0.5)
+    attachPillLockdown(cardView.webContents); // same trusted-layer lockdown: no nav, no popups
+    cardView.webContents.once('did-finish-load', () => onCardLoadFinished());
+    void cardView.webContents.loadURL(cardPageUrl());
+    cardView.setBounds(cardCollapsedBounds()); // COLLAPSED until a card actually shows
+    // Added BEFORE the pill at boot ⇒ the z-order law (site < card < pill) holds from frame one.
+    mainWindow.contentView.addChildView(cardView);
+    return cardView;
+  };
+
+  /** Z-ORDER LAW (C2j): site view < cardView < pillView ALWAYS. Callers re-stack the card above
+   * the site BEFORE the pill is re-raised (children paint in add-order — pill precedent). */
+  const raiseCard = (): void => {
+    if (!cardView || mainWindow.isDestroyed()) return;
+    mainWindow.contentView.removeChildView(cardView);
+    mainWindow.contentView.addChildView(cardView);
+  };
+
+  /** Z-order truth shared by the controller accessor and cardProbe: the pill must be the LAST
+   * contentView child (paints on top) — even mid-card-display. */
+  const isPillTopChild = (): boolean => {
+    if (!pillView) return false;
+    const kids = mainWindow.contentView.children;
+    return kids.length > 0 && kids[kids.length - 1] === pillView;
+  };
+
+  /** Dismissal — race-safe under rapid fire: only the CURRENT card's auto-timer or its own
+   * click may dismiss (stale calls no-op). Click = dismiss = advance, so a click storm can
+   * never block the queue. The page's hide transition plays inside a 200 ms hold, then the
+   * footprint collapses to 0×0 (idempotent syncBounds) and the pump waits NEXT_GAP_MS. */
+  const dismissCard = (id: string): void => {
+    if (!cardShowing || cardCurrentId !== id) return;
+    if (cardDismissTimer !== null) { clearTimeout(cardDismissTimer); cardDismissTimer = null; }
+    cardShowing = false;
+    cardCurrentId = null;
+    cardCurrentTitle = null;
+    cardView?.webContents.send('card:hide');
+    if (cardCollapseTimer !== null) clearTimeout(cardCollapseTimer);
+    cardCollapseTimer = setTimeout(() => {
+      syncBounds(); // snap to the collapsed 0×0 footprint
+      cardCollapseTimer = setTimeout(pumpCard, NEXT_GAP_MS); // polite gap to the next card
+    }, 200);
+  };
+
+  /** Serial display pump: ONE card at a time. If the page hasn't finished loading, the item
+   * stays queued and the pump retries from onCardLoadFinished. */
+  const pumpCard = (): void => {
+    if (cardShowing || cardQueue.length === 0) return;
+    if (!cardView) ensureCard();
+    if (!cardLoaded) return;
+    const item = cardQueue.shift()!;
+    cardCurrentId = item.id;
+    cardCurrentTitle = item.title;
+    cardShowing = true;
+    cardDelivered += 1;
+    cardView!.setBounds(cardBounds()); // footprint EXACTLY the card while it shows (zero-miss)
+    cardView!.webContents.send('card:show', { id: item.id, title: item.title, body: item.body });
+    cardDismissTimer = setTimeout(() => dismissCard(item.id), AUTO_DISMISS_MS);
+  };
+
+  /** LEG 2 — overlay delivery. Works over whichever world is on screen (the view floats above
+   * both); multi-card storms serialize through the pump with NEXT_GAP_MS between cards. */
+  const reminderShow = (title: string, body: string): void => {
+    cardQueue.push({ id: `card-${Date.now()}-${cardSeq++}`, title, body });
+    pumpCard();
+  };
+
+  // LEG 3 — cap/overflow: at MAX_MISSED the OLDEST is dropped and counted. Pure data structure;
+  // display happens only via drainMissed (overlay only, no native re-show).
+  const enqueueMissed = (title: string, body: string): void => {
+    if (missedQueue.length >= MAX_MISSED) { missedQueue.shift(); missedDropped += 1; }
+    missedQueue.push({ id: `missed-${Date.now()}-${cardSeq++}`, title, body });
+  };
+  /** LEG 3 — drain on window focus: oldest-first, OVERLAY ONLY (these were natively shown once
+   * at fire time), ≥NEXT_GAP_MS spacing guaranteed by the serial pump. The first flushed card
+   * carries the "+N older" prefix if overflow ever dropped anything. */
+  const drainMissed = (): void => {
+    let first = true;
+    while (missedQueue.length > 0) {
+      const m = missedQueue.shift()!;
+      if (first && missedDropped > 0) {
+        reminderShow(m.title, `+${missedDropped} older — ${m.body}`);
+        missedDropped = 0;
+      } else {
+        reminderShow(m.title, m.body);
+      }
+      first = false;
+    }
+  };
+
+  /** Card click: dismiss the clicked card (= advance) and focus/restore the window, mirroring
+   * LEG 1's native-toast click block. */
+  const reminderClick = (id: string): void => {
+    if (cardShowing && cardCurrentId === id) dismissCard(id);
+    try {
+      if (mainWindow.isDestroyed()) return;
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    } catch { /* window gone */ }
+  };
+
   const ensureView = (): WebContentsView => {
     if (view) return view;
     view = new WebContentsView({
@@ -596,6 +819,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     if (!shown) {
       mainWindow.contentView.addChildView(v);
       shown = true;
+      raiseCard(); // the site view was just stacked ON TOP of the card too — undo (C2j z-law)
       raisePill(); // the site view was just stacked ON TOP of the pill — undo that, always
     }
     syncBounds();
@@ -635,12 +859,18 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     blurPill,
     probeState: () => ({ readyMs, url: view ? CLOUD_URL : null }),
     probeIsolation: async () => {
-      if (!view || !pillView) return { dropsyncType: 'no-view', hasPreloadKey: true as const, pillDropsyncType: 'no-view', pillBridgeType: 'no-view' };
+      if (!view || !pillView || !cardView) {
+        return { dropsyncType: 'no-view', hasPreloadKey: true as const, pillDropsyncType: 'no-view', pillBridgeType: 'no-view', pillCardBridgeType: 'no-view', cardDropsyncType: 'no-view', cardBridgeType: 'no-view' };
+      }
       const dropsyncType = await view.webContents.executeJavaScript('typeof window.dropsync');
       // The pill layer must have ITS bridge and NEVER the main app's.
       const pillDropsyncType = await pillView.webContents.executeJavaScript('typeof window.dropsync');
       const pillBridgeType = await pillView.webContents.executeJavaScript('typeof window.dropsyncPill');
-      return { dropsyncType, hasPreloadKey: true as const, pillDropsyncType, pillBridgeType };
+      // C2j — the card bridge exists ONLY on the card page (never site, never pill).
+      const pillCardBridgeType = await pillView.webContents.executeJavaScript('typeof window.dropsyncCard');
+      const cardDropsyncType = await cardView.webContents.executeJavaScript('typeof window.dropsync');
+      const cardBridgeType = await cardView.webContents.executeJavaScript('typeof window.dropsyncCard');
+      return { dropsyncType, hasPreloadKey: true as const, pillDropsyncType, pillBridgeType, pillCardBridgeType, cardDropsyncType, cardBridgeType };
     },
     probeAuthSeen: async () => {
       if (!view) return { firebaseAuthKeys: -1, accountChip: false };
@@ -761,14 +991,56 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
       if (!view) return { bounds: { x: 0, y: 0, width: 0, height: 0 }, visible: false };
       return { bounds: view.getBounds(), visible: shown };
     },
-    pillIsTopChild: () => {
-      if (!pillView) return false;
-      const kids = mainWindow.contentView.children;
-      return kids.length > 0 && kids[kids.length - 1] === pillView;
+    pillIsTopChild: isPillTopChild,
+    reminderShow,
+    enqueueMissed,
+    drainMissed,
+    reminderClick,
+    cardProbe: async () => {
+      const expected = cardShowing ? cardBounds() : cardCollapsedBounds();
+      if (!cardView) {
+        return { loaded: false, visible: false, showing: cardShowing, bounds: { x: 0, y: 0, width: 0, height: 0 }, expected, queueLen: cardQueue.length, nextQueueTitle: cardQueue[0]?.title ?? null, currentTitle: cardCurrentTitle, delivered: cardDelivered, missedLen: missedQueue.length, missedDropped, pageCardVisible: 'no-view' as const, pillIsTop: isPillTopChild() };
+      }
+      const pageCardVisible = (await cardView.webContents.executeJavaScript(
+        `(function(){ var c = document.getElementById('card'); return !!c && c.classList.contains('show'); })()`
+      )) as boolean;
+      return {
+        loaded: cardLoaded,
+        visible: mainWindow.contentView.children.includes(cardView),
+        showing: cardShowing,
+        bounds: cardView.getBounds(),
+        expected,
+        queueLen: cardQueue.length,
+        nextQueueTitle: cardQueue[0]?.title ?? null,
+        currentTitle: cardCurrentTitle,
+        delivered: cardDelivered,
+        missedLen: missedQueue.length,
+        missedDropped,
+        pageCardVisible,
+        pillIsTop: isPillTopChild(),
+      };
+    },
+    cardTestReset: async () => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('cardTestReset is DROPSYNC_CLOUD_DEV-only');
+      if (cardDismissTimer !== null) { clearTimeout(cardDismissTimer); cardDismissTimer = null; }
+      if (cardCollapseTimer !== null) { clearTimeout(cardCollapseTimer); cardCollapseTimer = null; }
+      cardQueue.length = 0;
+      missedQueue.length = 0;
+      missedDropped = 0;
+      if (cardShowing) {
+        cardShowing = false;
+        cardCurrentId = null;
+        cardCurrentTitle = null;
+        cardView?.webContents.send('card:hide');
+      }
+      syncBounds(); // collapse the footprint immediately (no hide-hold in the hermetic reset)
     },
   };
 
   // Boot: the pill layer exists from the first frame; create it eagerly.
+  // C2j — the card layer too (EAGER, never removed), created BEFORE the pill so the z-order
+  // law (site < card < pill) holds from the very first frame.
+  ensureCard();
   ensurePill();
 
   return controller;

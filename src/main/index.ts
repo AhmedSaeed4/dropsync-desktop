@@ -68,6 +68,10 @@ app.setAppUserModelId('com.dropsync.desktop');
 let mainWindow: BrowserWindow | null = null;
 /** C1 — cloud-mode controller (created with the window; mode:* handlers below drive it). */
 let cloudCtl: CloudController | null = null;
+// C2j — module-level handle on the EXACT notifier function the vault engine uses (assigned at
+// the manager.setNotifier site) so the DEV battery can drive synthetic reminder fires through
+// the SAME seam (no second engine invented).
+let engineNotifier: ((title: string, body: string) => void) | null = null;
 let appMode: 'cloud' | 'local' = 'local'; // relaunch always starts Local in C1 (remember-last-mode = C2)
 /** Assigned by registerIpc — shared by mode:set and the DEV probe's switch storm. */
 let applyCloudMode: (next: 'cloud' | 'local') => Promise<'cloud' | 'local'> = async () => appMode;
@@ -98,6 +102,10 @@ function createWindow(): void {
   // Safe by closure: manager is the module-level singleton (:63) outliving any view swap.
   cloudCtl = initCloud(mainWindow, { onUserActivity: () => manager.touch() });
   attachCloudResizeTracking(mainWindow, cloudCtl);
+  // C2j LEG 3 — missed reminders greet the owner when the window becomes front-and-center
+  // again: drain oldest-first, OVERLAY only (native already shown once at fire time); the
+  // serial card pump provides the ≥NEXT_GAP_MS spacing between the greeting cards.
+  mainWindow.on('focus', () => { cloudCtl?.drainMissed(); });
   // C2f FIX 2 — the pill must show the app's ACTUAL boot mode (relaunch starts Local; the
   // renderer's boot-into-last-mode may immediately flip it via mode:set). Queued until the
   // pill layer finishes loading; delivered automatically.
@@ -4133,6 +4141,11 @@ function createWindow(): void {
               }
               const childViews = win.contentView.children.length;
               const stormPill = await cloudCtl.pillProbe();
+              // C2j — childViews is now 3: site + card + pill (the card layer is a PERMANENT
+              // third native view, added below the pill per the C2j z-law). The intent of this
+              // assert is unchanged — the flip storm must not leak/duplicate views (a leaked
+              // site would read 4+); the +1 is the card's accounted-for membership.
+              const expectedChildViews = 3;
               // C2g-hotfix-6 — each mode delivery now arms the Style A flip room (124 × 28,
               // contract-coupled hold), so the "rest footprint" part of this key must be read
               // AFTER the hold snaps back to exactly 112 × 28. Persistence facts (view reuse,
@@ -4149,7 +4162,7 @@ function createWindow(): void {
               }
               const stormSite = await cloudCtl.siteProbe();
               console.log('[c2f-pill]', JSON.stringify({
-                f_c2f_pillPersistent: childViews === 2 && stormPill.visible && stormPill.loaded
+                f_c2f_pillPersistent: childViews === expectedChildViews && stormPill.visible && stormPill.loaded
                   && cloudCtl.pillIsTopChild()
                   && Math.abs(settlePill.bounds.x - Math.round((win.getContentBounds().width - PILL_W) / 2)) <= 1
                   && settlePill.bounds.y === PILL_TOP
@@ -4178,7 +4191,10 @@ function createWindow(): void {
                 f_c1_cloudReady: cloudCtl.probeState().readyMs !== null,
                 readyMs: cloudCtl.probeState().readyMs,
                 f_c1_isolationGuard: iso.dropsyncType === 'undefined'
-                  && iso.pillDropsyncType === 'undefined' && iso.pillBridgeType === 'object',
+                  && iso.pillDropsyncType === 'undefined' && iso.pillBridgeType === 'object'
+                  // C2j — the card bridge exists ONLY on the card page (never site, never pill).
+                  && iso.pillCardBridgeType === 'undefined'
+                  && iso.cardDropsyncType === 'undefined' && iso.cardBridgeType === 'object',
                 isolationRaw: iso,
                 f_c1_authSeen: auth.firebaseAuthKeys > 0 || auth.accountChip,
                 authSeenRaw: auth,
@@ -4344,6 +4360,147 @@ function createWindow(): void {
                 try { await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch { /* already */ }
                 win.webContents.reload();
                 await sleep(4000);
+              }
+
+              // (5c) C2j — f_c2j_cardOverBothWorlds — placed per order: immediately AFTER the C2i
+              // key (its lock-behind leg + cleanup reload re-establish the sane unlocked Local
+              // stage — build on that clean point) and BEFORE the dead-last C2h idle stage. The
+              // card is a THIRD NATIVE VIEW: no C2i renderer/DOM assertions are touched. All
+              // synthetic fires go through the EXACT engine notifier seam (`engineNotifier`,
+              // assigned at the manager.setNotifier site — no second engine invented).
+              {
+                if (manager.status().state !== 'unlocked') { // defensive only (cleanup leaves it open)
+                  await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
+                  await sleep(400);
+                }
+                await cloudCtl!.cardTestReset(); // hermetic start: no stale queues/timers
+                const delivered0 = (await cloudCtl!.cardProbe()).delivered;
+                const winFocused = win.isFocused(); // diagnostic: LEG 3 only fires when UNfocused
+
+                // LEG A — single fire while LOCAL is shown.
+                engineNotifier?.('C2j reminder', 'warm local fire');
+                await sleep(600);
+                const probeLocal = await cloudCtl!.cardProbe();
+                // LEG B — the SAME card must stay glued over the CLOUD world (watchdog ≤1 s
+                // re-asserts bounds after the flip's resize/move churn; sleep 1500 covers it).
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(1500);
+                const probeCloud = await cloudCtl!.cardProbe();
+                // LEG C — home again; then auto-dismiss must collapse the footprint to 0×0.
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                const probeHome = await cloudCtl!.cardProbe();
+                await sleep(7500); // AUTO_DISMISS 5500 + hide-hold 200 + watchdog 1000 + slop
+                const probeDismissed = await cloudCtl!.cardProbe();
+
+                // LEG D — rapid fire ≤200 ms apart: serial display (ONE visible at a time), all
+                // three delivered across ~3×(AUTO_DISMISS)+gaps, no stuck layer afterwards.
+                await cloudCtl!.cardTestReset(); // isolate the storm from any stray queue state
+                const deliveredBeforeStorm = (await cloudCtl!.cardProbe()).delivered;
+                engineNotifier?.('C2j storm 1', 'rapid 1');
+                await sleep(120);
+                engineNotifier?.('C2j storm 2', 'rapid 2');
+                await sleep(120);
+                engineNotifier?.('C2j storm 3', 'rapid 3');
+                await sleep(600);
+                const stormMid = await cloudCtl!.cardProbe(); // 1 visible, 2 still queued
+                await sleep(18500); // 2 remaining × (5500 dismiss + 200 hold + 400 gap) + slop
+                const stormEnd = await cloudCtl!.cardProbe();
+
+                // LEG E (logic-level ONLY, per order — no UI assertions) — missed-queue data
+                // structure: cap 20, overflow drops the OLDEST (2 dropped), drain order
+                // oldest-first (the first display-queue title must be item 3). Reset purges.
+                await cloudCtl!.cardTestReset();
+                for (let i = 1; i <= 22; i++) cloudCtl!.enqueueMissed(`C2j missed ${i}`, `unit ${i}`);
+                const missedCapped = await cloudCtl!.cardProbe();
+                cloudCtl!.drainMissed();
+                const drainedProbe = await cloudCtl!.cardProbe();
+                await cloudCtl!.cardTestReset();
+                const purged = await cloudCtl!.cardProbe();
+
+                // LEG F — C2j-hotfix-1 — f_c2j_rearmFiresAgain: a RE-ARMED reminder must erase
+                // the stale fired stamp (dropOps.ts re-arm branch) so the engine announces it
+                // AGAIN. Temp drop via the REAL renderer bridge (seed idiom index.ts:529/:976);
+                // engine ticks every 30 s ⇒ a due-at-+1.5 s reminder lands on the next tick
+                // within ≤31.5 s, so 18 × 2 s polls cover each leg. RED-PROOF: comment the
+                // journalPatch.reminderFiredAt = null line in dropOps.ts ⇒ leg 2 stays flat.
+                await cloudCtl!.cardTestReset();
+                const rearm0 = (await cloudCtl!.cardProbe()).delivered;
+                const tempDrop = await win.webContents.executeJavaScript(
+                  `window.dropsync.drop.createText({ spaceId: 'personal', name: 'C2j Rearm', content: 'rearm proof', categories: [], expirationOption: '24h', locked: false, reminderAt: new Date(Date.now() + 1500).toISOString() })`
+                ) as { id: string } | null;
+                let fire1 = false;
+                for (let i = 0; i < 18 && !fire1; i++) {
+                  await sleep(2000);
+                  fire1 = (await cloudCtl!.cardProbe()).delivered > rearm0;
+                }
+                const afterFirst = (await cloudCtl!.cardProbe()).delivered;
+                await win.webContents.executeJavaScript(
+                  `window.dropsync.drop.updateMeta(${JSON.stringify(tempDrop?.id)}, { reminderAt: new Date(Date.now() + 1500).toISOString() })`
+                );
+                let fire2 = false;
+                for (let i = 0; i < 18 && !fire2; i++) {
+                  await sleep(2000);
+                  fire2 = (await cloudCtl!.cardProbe()).delivered > afterFirst;
+                }
+                const afterSecond = (await cloudCtl!.cardProbe()).delivered;
+                // Cleanup: temp drop gone + layer inert so later stages stay sane.
+                if (tempDrop?.id) {
+                  await win.webContents.executeJavaScript(
+                    `window.dropsync.drop.deleteDrop(${JSON.stringify(tempDrop.id)})`
+                  ).catch(() => {});
+                }
+                await cloudCtl!.cardTestReset();
+                const rearmPurged = await cloudCtl!.cardProbe();
+                const f_c2j_rearmFiresAgain = !!tempDrop && fire1 && fire2
+                  && afterSecond - rearm0 === 2
+                  && !rearmPurged.showing && rearmPurged.queueLen === 0;
+
+                const rectEq = (a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }): boolean =>
+                  a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+                const f_c2j_cardOverBothWorlds = probeLocal.showing && probeLocal.visible && probeLocal.loaded
+                  && probeLocal.pageCardVisible === true && probeLocal.pillIsTop
+                  && rectEq(probeLocal.bounds, probeLocal.expected)
+                  && probeCloud.showing && probeCloud.pillIsTop && rectEq(probeCloud.bounds, probeCloud.expected)
+                  && probeHome.showing
+                  && !probeDismissed.showing && probeDismissed.bounds.width === 0 && probeDismissed.bounds.height === 0
+                  && stormMid.showing && stormMid.queueLen === 2
+                  && !stormEnd.showing && stormEnd.queueLen === 0 && stormEnd.bounds.width === 0 && stormEnd.bounds.height === 0
+                  && stormEnd.delivered - deliveredBeforeStorm === 3
+                  && missedCapped.missedLen === 20 && missedCapped.missedDropped === 2
+                  && drainedProbe.missedLen === 0 && drainedProbe.currentTitle === 'C2j missed 3'
+                  && drainedProbe.queueLen === 19
+                  && !purged.showing && purged.queueLen === 0 && purged.missedLen === 0;
+                console.log('[c2j]', JSON.stringify({
+                  f_c2j_cardOverBothWorlds,
+                  f_c2j_rearmFiresAgain,
+                  rearmMatrix: {
+                    tempDropCreated: !!tempDrop, firstFire: fire1, rearmSecondFire: fire2,
+                    firstDelta: afterFirst - rearm0, secondDelta: afterSecond - afterFirst,
+                    purgedClean: !rearmPurged.showing && rearmPurged.queueLen === 0,
+                  },
+                  matrix: {
+                    localShown: probeLocal.showing && probeLocal.pageCardVisible === true,
+                    localBoundsExact: rectEq(probeLocal.bounds, probeLocal.expected),
+                    cloudStillShown: probeCloud.showing && probeCloud.pageCardVisible === true,
+                    cloudBoundsExact: rectEq(probeCloud.bounds, probeCloud.expected),
+                    pillTopLocal: probeLocal.pillIsTop, pillTopCloud: probeCloud.pillIsTop,
+                    autoDismissCollapsed: !probeDismissed.showing && probeDismissed.bounds.width === 0,
+                    stormSerialized: stormMid.showing && stormMid.queueLen === 2,
+                    stormAllDelivered: stormEnd.delivered - deliveredBeforeStorm === 3,
+                    stormCleanEnd: !stormEnd.showing && stormEnd.queueLen === 0 && stormEnd.bounds.width === 0,
+                    missedCap: missedCapped.missedLen === 20 && missedCapped.missedDropped === 2,
+                    missedDrainOrderOldestFirst: drainedProbe.currentTitle === 'C2j missed 3' && drainedProbe.queueLen === 19,
+                    purgedClean: !purged.showing && purged.queueLen === 0 && purged.missedLen === 0,
+                  },
+                  raw: {
+                    winFocused, delivered0, deliveredBeforeStorm,
+                    probeLocal, probeCloud, probeHome, probeDismissed, stormMid, stormEnd, missedCapped, drainedProbe, purged,
+                  },
+                }));
+                // No cleanup needed: LEG E + LEG F ended with cardTestReset (collapsed + empty
+                // queues, temp drop deleted) — the card layer is inert for the dead-last C2h
+                // idle stage that follows.
               }
 
               // (6) C2h FIX 6 — f_c2h_cloudActivityFeedsIdleLock — DEAD-LAST in this stage; its
@@ -4664,6 +4821,12 @@ function registerIpc(): void {
     if (!cloudCtl) return;
     cloudCtl.resyncPill(appMode);
   });
+  // C2j — the reminder card was clicked: dismiss it (advances the queue) + focus/restore the
+  // window, mirroring the native toast's click block (LEG 1).
+  ipcMain.on('card:click', (_e, id: unknown) => {
+    if (typeof id !== 'string' || id.length === 0) return;
+    cloudCtl?.reminderClick(id);
+  });
   // DEV-ONLY probes (I6): never registered without DROPSYNC_CLOUD_DEV=1.
   if (process.env.DROPSYNC_CLOUD_DEV === '1') {
     handle('mode:devProbe', async () => {
@@ -4893,26 +5056,42 @@ function registerIpc(): void {
   const notifyFallback = (title: string, body: string): void => {
     mainWindow?.webContents.send('vault:notifyFallback', { title, body });
   };
-  manager.setNotifier((title, body) => {
+  // Reminder loop → THREE delivery legs (C2j — owner LOCKED: never rely on one channel again).
+  // LEG 1 native: the legacy Windows toast path kept byte-identical (click focuses the window;
+  //   an unsupported platform falls back to the legacy in-app event; a throw warns + falls back).
+  // LEG 2 overlay: OUR reminder card over whichever world is on screen — ALWAYS (cloud.ts's
+  //   trusted third layer; WSLg can swallow toasts, it cannot swallow a native view we own).
+  // LEG 3 missed: when the app wasn't front-and-center at fire time, the reminder re-surfaces
+  //   oldest-first on the next window focus (overlay only).
+  // DORMANCY RULING (C2j §1): the legacy `vault:notifyFallback` renderer wiring stays UNWIRED
+  // by design from now on — it has had zero subscribers since baseline 90edc85 and the overlay
+  // replaces it. The emission here stays byte-identical; nothing renderer-side listens. DO-NOT-FIX.
+  const engineNotify = (title: string, body: string): void => {
     if (!Notification.isSupported()) {
       notifyFallback(title, body);
-      return;
+    } else {
+      try {
+        const toast = new Notification({ title, body });
+        toast.on('click', () => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.show();
+            mainWindow.focus();
+          }
+        });
+        toast.show();
+      } catch (error) {
+        console.warn('[notify] failed, using in-app fallback:', error);
+        notifyFallback(title, body);
+      }
     }
-    try {
-      const toast = new Notification({ title, body });
-      toast.on('click', () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          if (mainWindow.isMinimized()) mainWindow.restore();
-          mainWindow.show();
-          mainWindow.focus();
-        }
-      });
-      toast.show();
-    } catch (error) {
-      console.warn('[notify] failed, using in-app fallback:', error);
-      notifyFallback(title, body);
+    cloudCtl?.reminderShow(title, body); // LEG 2 — ALWAYS (C2j red-proof: comment me out)
+    if (!mainWindow || mainWindow.isMinimized() || !mainWindow.isFocused()) {
+      cloudCtl?.enqueueMissed(title, body); // LEG 3 — cannot be seen anywhere right now
     }
-  });
+  };
+  manager.setNotifier(engineNotify);
+  engineNotifier = engineNotify; // DEV battery tap-point: the exact function the engine calls
 
   // ---- DEV-ONLY test seeds (DROPSYNC_E2E_SIT3=1 or the DOM-checks harness). Registered
   // exclusively under harness env flags so production IPC surface stays untouched.
