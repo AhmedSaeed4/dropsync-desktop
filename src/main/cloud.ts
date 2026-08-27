@@ -52,12 +52,36 @@ const AUTH_POPUP_ALLOWLIST = new Set([
 /** C2g FIX 1 — floating pill geometry (owner-locked, ported VERBATIM from
  * pill-variants-explainer.html §1: "Variant A — punch-hole", 112 × 28 at TOP-CENTER,
  * 10px from the top). `PILL_B_REST_W` is Style B's at-rest footprint (the 28 × 28 dot-pair);
- * when Style B is hovered/bloomed the footprint is the full 112 × 28 (§1 ZERO-MISS CLICK RULE:
- * view bounds always EQUAL the visible pill). The old C2f values (176/40/14 top-left) are gone. */
+ * when Style B is hovered/bloomed the VISIBLE pill is the full 112 × 28 (§1 ZERO-MISS CLICK
+ * RULE: view bounds always EQUAL the visible pill) — while BLOOMED the native ROOM adds
+ * symmetric breathing room around it (`PILL_BLOOM_PAD_*`, hotfix-4 FIX 2), which changes no
+ * rest-state footprint. The old C2f values (176/40/14 top-left) are gone. */
 export const PILL_W = 112;
 export const PILL_H = 28;
 export const PILL_TOP = 10;
 export const PILL_B_REST_W = 28;
+
+/** C2g-hotfix-4 FIX 2 — Style-B BLOOM-TIME breathing room ONLY (explicit owner-approved
+ * trade-off). While bloomed, the native room grows to 132 × 44 so TWO things never clip inside
+ * the page: the contracted elastic overshoot (bezier peaks ≈ +8 px past 112 mid-bounce) and the
+ * ~7 px drop-shadow halo (which used to render as a hard-edged "box" against the room wall).
+ * AT REST the room stays EXACTLY the 28 × 28 footprint — the zero-miss rule at rest is sacred;
+ * Style A stays exactly 112 × 28 at all times. The skirt exists only WHILE BLOOMED, when the
+ * cursor is by definition on the pill, so it eats no site clicks in practice; hover-out now
+ * means clearing the 132 px room, so an open pill "holds" ~10 px longer around its edges
+ * (documented behavior, not a bug). */
+export const PILL_BLOOM_PAD_X = 10;
+export const PILL_BLOOM_PAD_Y = 8;
+
+/** C2g-hotfix-5 FIX 2 — how long the BLOOMED native room (132 × 44) HOLDS after a collapse
+ * request, so the CSS shrink (contract: width 0.55s elastic) can play OUTSIDE any clipping wall
+ * and the final 28 px snap lands on an exactly-28-wide, centered, invisible-change pill. This is
+ * a CONTRACT COUPLING, not an independent animation timing: it equals the contract's width
+ * duration (550 ms) plus one frame (~16 ms) — if the CONTRACT width duration ever changes, this
+ * constant MUST change with it. Known accepted micro-residual (documented, out of scope): at the
+ * snap instant the compositor may present ≤1 stale frame cropped to the new room's top-left — an
+ * ≤18×20 px sliver of the pill's left arc shifting ~10 px, at rest size, for ≤16 ms. */
+const PILL_COLLAPSE_ROOM_HOLD_MS = 570;
 
 /** C2g — the two owner-approved pill styles. A = "punch-hole" (default on first boot),
  * B = "micro bloom" (28 × 28 dots → blooms to the full pill on hover). Right-click toggles;
@@ -299,6 +323,8 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
   // and the battery probes all read these; the pill layer mirrors them via IPC.
   let pillStyle: PillStyle = loadPillStyle();
   let pillBlooming = false;
+  // C2g-hotfix-5 FIX 2 — armed while the collapse room must WAIT for the CSS shrink to finish.
+  let pillCollapseHold: ReturnType<typeof setTimeout> | null = null;
   const pillConsole: string[] = []; // C2g-hotfix-1 §5 — layer console ring buffer
 
   /** Shared load-finished path for boot AND battery-driven layer relaunches (C2g FIX 4). */
@@ -320,8 +346,21 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
     return { x: 0, y: 0, width: b.width, height: b.height };
   };
   const pillWidth = (): number => (pillStyle === 'A' || pillBlooming ? PILL_W : PILL_B_REST_W);
+  /** C2g-hotfix-4 FIX 2 — the native ROOM for the current style/bloom state. Style A: exactly
+   * the 112 × 28 pill. B at rest: exactly the 28 × 28 footprint (zero-miss rule untouched).
+   * B bloomed: pill + symmetric skirt (`PILL_BLOOM_PAD_*`) so the elastic overshoot and the
+   * shadow halo paint INSIDE the page instead of against a clipping wall. Room-center arithmetic
+   * that makes this safe for the center-anchored page (#pillB uses left/top 50% + translate):
+   * rest center y = 10+14 = 24; bloomed room center y = (10−8)+22 = 24 ✓; x is centered in both
+   * ✓ ⇒ the painted circle NEVER moves when the room swaps. syncBounds, the watchdog and every
+   * resize/fullscreen handler read bounds through here, so they all inherit the room. */
   const pillBounds = (): Electron.Rectangle => {
     const b = mainWindow.getContentBounds();
+    if (pillStyle === 'B' && (pillBlooming || pillCollapseHold !== null)) {
+      const w = PILL_W + PILL_BLOOM_PAD_X * 2; // 132
+      const h = PILL_H + PILL_BLOOM_PAD_Y * 2; // 44
+      return { x: Math.round((b.width - w) / 2), y: PILL_TOP - PILL_BLOOM_PAD_Y, width: w, height: h };
+    }
     const w = pillWidth();
     return { x: Math.round((b.width - w) / 2), y: PILL_TOP, width: w, height: PILL_H };
   };
@@ -399,9 +438,29 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
   // class before sending this IPC), so bloom/collapse looks seamless.
   const setPillBloom = (bloomed: boolean): void => {
     if (!pillView || pillStyle !== 'B') return; // A has no bloom; nothing to resize
-    if (pillBlooming === bloomed) return;
-    pillBlooming = bloomed;
-    syncBounds();
+    if (bloomed) {
+      // C2g-hotfix-5 — re-hover DURING a collapse hold: the room must never shrink under a
+      // returning cursor. Cancel the hold, then grow exactly like a fresh bloom.
+      if (pillCollapseHold !== null) { clearTimeout(pillCollapseHold); pillCollapseHold = null; }
+      if (!pillBlooming) {
+        pillBlooming = true;
+        syncBounds();
+      }
+      return;
+    }
+    // C2g-hotfix-5 FIX 2 — collapse request: the pill's LOGICAL state collapses immediately
+    // (dots return, knob state correct), but the ROOM HOLDS at 132 × 44 for
+    // PILL_COLLAPSE_ROOM_HOLD_MS while the CSS shrink plays outside every clipping wall; the
+    // delayed syncBounds() then snaps to the tight 28 × 28 rest room onto an already-28-wide,
+    // centered pill — an invisible change. Idempotence: a second bloom(false) while already
+    // collapsing on hold does not push the deadline out.
+    if (!pillBlooming && pillCollapseHold === null) return;
+    pillBlooming = false;
+    if (pillCollapseHold !== null) clearTimeout(pillCollapseHold);
+    pillCollapseHold = setTimeout(() => {
+      pillCollapseHold = null;
+      syncBounds();
+    }, PILL_COLLAPSE_ROOM_HOLD_MS);
   };
 
   // C2g FIX 4 — right-click toggle: flip, PERSIST, re-assert bounds for the new footprint.
@@ -410,6 +469,9 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
     if (pillStyle === style) return;
     pillStyle = style;
     if (style === 'A') pillBlooming = false; // A's footprint is always the full pill
+    // C2g-hotfix-5 — a right-click mid-collapse must leave NO stale room-hold timer behind
+    // (the new style's footprint is asserted right below).
+    if (pillCollapseHold !== null) { clearTimeout(pillCollapseHold); pillCollapseHold = null; }
     savePillStyle(style);
     console.log('[pill] style persisted:', style);
     syncBounds();
@@ -598,6 +660,8 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
       // divergence the cleared-store leg exercises).
       pillStyle = loadPillStyle();
       pillBlooming = false; // a fresh layer always boots at rest
+      // C2g-hotfix-5 — battery relaunch must boot with no stale collapse-hold timer.
+      if (pillCollapseHold !== null) { clearTimeout(pillCollapseHold); pillCollapseHold = null; }
       syncBounds();
       pillLoaded = false;
       await pillView.webContents.loadURL(pillPageUrl(loadPillStyle()));

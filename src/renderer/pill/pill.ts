@@ -69,6 +69,13 @@ let bloomed = false;
 let collapseTimer: number | null = null;
 const COLLAPSE_HYSTERESIS_MS = 90; // §1-permitted hysteresis — see module doc
 
+/** C2g-hotfix-5 FIX 1 — SAFETY ceiling for the entry reveal poll. This is a safety timeout,
+ * NOT an animation timing and NOT part of the ANIMATION CONTRACT: it only bounds how long the
+ * blank-paint swap gate may hold the paint if the native room never lands (broken-install path —
+ * bridge missing ⇒ no room swap; the loud bridge errors already fire). Normal reveals take
+ * ≈2–4 frames, far below this. */
+const PILL_REVEAL_TIMEOUT_MS = 250;
+
 function applyStyle(s: 'A' | 'B'): void {
   style = s;
   document.body.classList.toggle('style-a', s === 'A');
@@ -104,13 +111,51 @@ function forceCollapse(): void {
 }
 
 /* Bloom in/out — driven by the layer's own mouseenter/mouseleave (root == the native view
- * footprint), so "leave" fires only when the cursor truly exits the CURRENT footprint. */
+ * footprint), so "leave" fires only when the cursor truly exits the CURRENT footprint.
+ * C2g-hotfix-4 FIX 3 — the 90 ms collapse LAG must never close the pill UNDER the cursor: a
+ * fast graze (out ~1 px, back within 90 ms) used to leave `forceCollapse` armed behind the
+ * `bloomed` short-circuit, so it fired with the pointer inside and hover went stale until a
+ * full exit/re-enter. The timer clear now runs BEFORE any early-return; only the style gate
+ * precedes it. No timing values change.
+ *
+ * C2g-hotfix-5 FIX 1 — ENTRY CHOREOGRAPHY (blank-paint swap gate). Main resizes the native room
+ * 28 → 132 in one instant step the same tick we ask; Chromium can present 1–3 STALE frames of
+ * the old bitmap anchored at the NEW room's top-left before the first re-laid-out frame arrives
+ * — the owner saw "a few frames coming from the left." So: set logical state FIRST, blank the
+ * paint INSTANTLY and transition-free (inline `visibility:hidden` — NOT opacity; the dots/inner
+ * own their opacity transitions), THEN send `pill:bloom(true)` so the swap happens over a blank
+ * page, then REVEAL only when the page can see that the room landed (`innerWidth > 28`) — the
+ * CSS bloom then starts fresh from width 28 in its FINAL room. Reveal always re-checks
+ * `bloomed`: a graze that collapsed during the hidden window restores clean rest paint instead
+ * of resurrecting a dead bloom, and the safety timeout guarantees no stuck-hidden paint. */
 root?.addEventListener('mouseenter', () => {
-  if (style !== 'B' || bloomed) return;
-  if (collapseTimer !== null) { clearTimeout(collapseTimer); collapseTimer = null; } // hysteresis
-  bloomed = true;
-  document.getElementById('pillB')?.classList.add('bloomed'); /* CSS starts… */
-  requireBridge('bloom')?.bloom(true); /* …same tick main grows the view */
+  if (style !== 'B') return;
+  if (collapseTimer !== null) { clearTimeout(collapseTimer); collapseTimer = null; } // hysteresis (re-entry always cancels)
+  if (bloomed) return;
+  bloomed = true; // logical state FIRST — collapse/circle-click logic must stay correct while hidden
+  const pillEl = document.getElementById('pillB');
+  if (pillEl) {
+    pillEl.style.visibility = 'hidden'; /* instant, transition-free blank across the room swap */
+    pillEl.classList.remove('bloomed');
+  }
+  requireBridge('bloom')?.bloom(true); /* room swaps over blank paint */
+  if (!pillEl) return;
+  const startedAt = Date.now();
+  const reveal = (): void => {
+    if (!bloomed) { // collapsed while hidden (fast graze): restore clean REST paint, no bloom class
+      pillEl.style.visibility = '';
+      return;
+    }
+    if (window.innerWidth > 28 || Date.now() - startedAt >= PILL_REVEAL_TIMEOUT_MS) {
+      // Room landed (or safety timeout fired) — start the CSS bloom fresh from width 28 in
+      // the FINAL room, then unblank in the same tick.
+      pillEl.classList.add('bloomed'); /* CSS starts… */
+      pillEl.style.visibility = ''; /* …reveal exactly when the bloom starts */
+      return;
+    }
+    requestAnimationFrame(reveal);
+  };
+  requestAnimationFrame(reveal);
 });
 root?.addEventListener('mouseleave', () => {
   if (style !== 'B' || !bloomed || collapseTimer !== null) return;

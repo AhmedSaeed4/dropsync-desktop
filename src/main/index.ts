@@ -15,7 +15,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
 import { VaultManager } from './vault/vault.ts';
-import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, type CloudController } from './cloud';
+import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, type CloudController } from './cloud';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -3710,11 +3710,12 @@ function createWindow(): void {
                 await sleep(900);
                 const bootedA = await pollStyle('A');
 
-                // f_c2g_geometry — Style A: centered-x ±1px, y=10, 112 × 28; site {0,0,w,h}.
-                // C2g-hotfix-3 folds §5's A-side LAYOUT asserts here: the visibility toggler must
-                // carry `inline-flex` (it said `block` and killed the flex row), and Local's rect
-                // top must be 2±0.5 — it measured 27.5 (wrapped BELOW the 28px window) when broken.
-                const geoLegs: Array<{ tag: string; ok: boolean; disp?: string; localTop?: number }> = [];
+                // f_c2g_geometry — footprint truth PER STATE: A = 112 × 28 @y10; B rest = 28 × 28
+                // @y10 (zero-miss footprint sacred); B BLOOMED = the 132 × 44 ROOM @y2
+                // (hotfix-4 FIX 2). Plus hotfix-3's A-side LAYOUT asserts (row display — computed
+                // value blockifies to `flex` on the abspos element — and Local's rect top 2±0.5)
+                // whenever style A is up.
+                const geoLegs: Array<{ tag: string; ok: boolean; disp?: string; localTop?: number; room?: [number, number, number] }> = [];
                 const readALayout = async (): Promise<{ d: string; t: number }> =>
                   g.pillEval(`(function(){ var a = document.getElementById('pillA');
                       var r = document.getElementById('btn-local-a').getBoundingClientRect();
@@ -3727,12 +3728,14 @@ function createWindow(): void {
                   const b = win.getContentBounds();
                   const site = await g.siteProbe();
                   const pill = await g.pillProbe();
-                  // C2g spec: "correct w/h for the CURRENT style" — B at rest is 28 wide.
-                  const wantW = pill.style === 'B' && !pill.blooming ? PILL_B_REST_W : PILL_W;
+                  const wantH = pill.style === 'A' || !pill.blooming ? PILL_H : PILL_H + PILL_BLOOM_PAD_Y * 2;
+                  const wantY = pill.style === 'B' && pill.blooming ? PILL_TOP - PILL_BLOOM_PAD_Y : PILL_TOP;
                   let disp: string | undefined;
                   let localTop: number | undefined;
                   let layoutOk = true; // non-A boots skip the A-layout check (they have their own)
+                  let wantW: number;
                   if (pill.style === 'A') {
+                    wantW = PILL_W;
                     const al = await readALayout();
                     disp = al.d;
                     localTop = al.t;
@@ -3740,16 +3743,23 @@ function createWindow(): void {
                     // BLOCKIFIED — specified `inline-flex` resolves to `flex` ('block' leaked
                     // through when the broken cascade won). Accept the pair as row-proof.
                     layoutOk = (al.d === 'inline-flex' || al.d === 'flex') && Math.abs(al.t - 2) <= 0.5;
+                  } else if (pill.blooming) {
+                    wantW = PILL_W + PILL_BLOOM_PAD_X * 2; // hotfix-4: bloom-time ROOM
+                  } else {
+                    wantW = PILL_B_REST_W;
                   }
                   geoLegs.push({
                     tag,
                     ok: site.visible
                       && site.bounds.x === 0 && site.bounds.y === 0
                       && site.bounds.width === b.width && site.bounds.height === b.height
-                      && centeredOk(pill.bounds, wantW, b.width)
+                      && Math.abs(pill.bounds.x - Math.round((b.width - wantW) / 2)) <= 1
+                      && pill.bounds.y === wantY
+                      && pill.bounds.width === wantW && pill.bounds.height === wantH
                       && layoutOk,
                     disp,
                     localTop,
+                    room: [wantW, wantH, wantY],
                   });
                 };
                 await geoLeg('geo-1600x1000', 1600, 1000, false);
@@ -3776,13 +3786,64 @@ function createWindow(): void {
                 await sleep(900);
                 const survivedA = await pollStyle('A');
 
-                // f_c2g_bloomBounds — Style B: rest 28 × 28 centered → hover-bloom 112 × 28
-                // centered → collapse back; rapid hover storms settle with no stuck size.
+                // f_c2g_bloomBounds — Style B: rest room EXACTLY 28 × 28 centered (zero-miss
+                // rule sacred, hotfix-4 untouched) → bloomed ROOM 132 × 44 centered at
+                // y = PILL_TOP − 8 (hotfix-4 FIX 2) with the PAINTED #pillB exactly 112 × 28
+                // centered inside the padded page ⇒ collapse back to the tight rest footprint;
+                // rapid hover storms settle with no stuck size.
                 await g.pillDrive('contextmenu'); // → B again for the bloom legs
                 await sleep(400);
                 const restOk = centeredOk(restB.bounds, PILL_B_REST_W, win.getContentBounds().width);
+                // ZERO-MISS at rest, page-level too: #root fills the viewport and the painted
+                // circle IS the whole 28 × 28 page (flush 0..28) — nothing larger than the native
+                // room exists to eat clicks just outside the footprint (the main-side rest bounds
+                // asserted above are exact by construction; views receive no events outside their
+                // bounds).
+                const restPage = await g.pillEval(`(function(){
+                    var r = document.getElementById('root').getBoundingClientRect();
+                    var p = document.getElementById('pillB').getBoundingClientRect();
+                    return JSON.stringify({ rw: [+r.width.toFixed(1), +r.height.toFixed(1)],
+                      pl: [+p.left.toFixed(1), +p.top.toFixed(1), +p.width.toFixed(1), +p.height.toFixed(1)] }); })()`)
+                  .then((s) => JSON.parse(s as string) as { rw: [number, number]; pl: [number, number, number, number] });
+                const restFlush = Math.abs(restPage.rw[0] - PILL_B_REST_W) <= 0.5
+                  && Math.abs(restPage.rw[1] - PILL_H) <= 0.5
+                  && restPage.pl[0] === 0 && restPage.pl[1] === 0
+                  && restPage.pl[2] === PILL_B_REST_W && restPage.pl[3] === PILL_H;
+                const waitBloomRoom = async (): Promise<boolean> => {
+                  for (let i = 0; i < 12; i++) { // ≤6s: watchdog + deferred re-apply budget
+                    await sleep(500);
+                    const pb = (await g.pillProbe()).bounds;
+                    const cw = win.getContentBounds().width;
+                    if (Math.abs(pb.x - Math.round((cw - (PILL_W + PILL_BLOOM_PAD_X * 2)) / 2)) <= 1
+                      && pb.y === PILL_TOP - PILL_BLOOM_PAD_Y
+                      && pb.width === PILL_W + PILL_BLOOM_PAD_X * 2
+                      && pb.height === PILL_H + PILL_BLOOM_PAD_Y * 2) return true;
+                  }
+                  return false;
+                };
                 await g.pillDrive('mouseenter');
-                const bloomOk = await waitBounded(PILL_W);
+                // C2g-hotfix-5 FIX 3 — ENTRY CHOREOGRAPHY truth: by ≤500 ms the reveal must have
+                // happened — bloomed class present AND viewport == the 132 room AND #pillB
+                // VISIBLE again and centered-left ≈ 10 (the blank-paint gate released). The
+                // subsequent settle probes below therefore run strictly AFTER the reveal window,
+                // not during the hidden gap.
+                const entryReveal = await (async (): Promise<boolean> => {
+                  for (let i = 0; i < 10; i++) {
+                    await sleep(100);
+                    const s = await g.pillEval(`(function(){
+                        var p = document.getElementById('pillB');
+                        if (!p) return JSON.stringify({ v:'none', w:-1, c:false, l:-1 });
+                        var cs = getComputedStyle(p);
+                        return JSON.stringify({ v: cs.visibility, w: window.innerWidth,
+                          c: p.classList.contains('bloomed'),
+                          l: +p.getBoundingClientRect().left.toFixed(1) }); })()`)
+                      .then((x) => JSON.parse(x as string) as { v: string; w: number; c: boolean; l: number });
+                    if (s.v === 'visible' && s.c && s.w === PILL_W + PILL_BLOOM_PAD_X * 2
+                      && Math.abs(s.l - PILL_BLOOM_PAD_X) <= 1) return true;
+                  }
+                  return false;
+                })();
+                const bloomOk = await waitBloomRoom();
                 const bloomFlag = (await pillState()).bloomed;
                 // C2g-hotfix-3 §5 B-side asserts, read with the bloom settled: inner knob must be
                 // ≈54 × 24 (measured 0×0 before the shared .mode-pill sizing), words 10.5px with
@@ -3796,12 +3857,35 @@ function createWindow(): void {
                   .then((s) => JSON.parse(s as string) as { kw: number; kh: number; fs: string; pad: string });
                 const bStyled = Math.abs(bStyle.kw - 54) <= 1 && Math.abs(bStyle.kh - 24) <= 1
                   && bStyle.fs === '10.5px' && bStyle.pad === '14px 7.5px';
+                // HOTFIX-4 painted-pill truth inside the bloomed room: #pillB centered in its
+                // 132 × 44 page ⇒ x ≈ 10..122, y ≈ 8..36 — symmetric growth around the stable
+                // center (the instant room swap moves only transparent skirt margins, not paint).
+                const paint = await g.pillEval(`(function(){
+                    var p = document.getElementById('pillB').getBoundingClientRect();
+                    return JSON.stringify([+p.left.toFixed(1), +p.top.toFixed(1),
+                      +p.width.toFixed(1), +p.height.toFixed(1)]); })()`)
+                  .then((s) => JSON.parse(s as string) as [number, number, number, number]);
+                const paintCentered = Math.abs(paint[0] - PILL_BLOOM_PAD_X) <= 1
+                  && Math.abs(paint[1] - PILL_BLOOM_PAD_Y) <= 1
+                  && Math.abs(paint[2] - PILL_W) <= 0.5 && Math.abs(paint[3] - PILL_H) <= 0.5;
                 for (const ev of ['mouseleave', 'mouseenter', 'mouseleave', 'mouseenter'] as const) {
                   await g.pillDrive(ev);
                   await sleep(120); // storm — faster than the .55s transition on purpose
                 }
-                const stormOk = await waitBounded(PILL_W) && (await pillState()).bloomed;
+                const stormOk = await waitBloomRoom() && (await pillState()).bloomed;
                 await g.pillDrive('mouseleave');
+                // C2g-hotfix-5 FIX 2 truth — the COLLAPSE HOLD: after the request the room must
+                // STILL be the 132 × 44 bloom room at ~+250 ms (the 90 ms hysteresis has passed
+                // by then; only the 570 ms hold keeps it up — asserts hold-until-shrink), and it
+                // must be exactly the tight 28 × 28 rest footprint by ~+1.2 s. waitBounded polls
+                // ≤6 s, comfortably covering the real ~660 ms path (90 hysteresis + 570 hold).
+                await sleep(250);
+                const pbHold = (await g.pillProbe()).bounds;
+                const cwHold = win.getContentBounds().width;
+                const holdKept = Math.abs(pbHold.x - Math.round((cwHold - (PILL_W + PILL_BLOOM_PAD_X * 2)) / 2)) <= 1
+                  && pbHold.y === PILL_TOP - PILL_BLOOM_PAD_Y
+                  && pbHold.width === PILL_W + PILL_BLOOM_PAD_X * 2
+                  && pbHold.height === PILL_H + PILL_BLOOM_PAD_Y * 2;
                 const collapseOk = await waitBounded(PILL_B_REST_W) && !(await pillState()).bloomed;
 
                 // f_c2g_colors — COLOR RULE in BOTH styles × BOTH modes: word under the knob is
@@ -3828,10 +3912,11 @@ function createWindow(): void {
                   f_c2g_stylesToggle: bootedA && stB.style === 'B' && fileAfterB && probeStyleB
                     && restB.bounds.width === PILL_B_REST_W && survivedB
                     && stA.style === 'A' && fileAfterA && survivedA,
-                  f_c2g_bloomBounds: restOk && bloomOk && bloomFlag && stormOk && collapseOk && bStyled,
+                  f_c2g_bloomBounds: restOk && restFlush && entryReveal && bloomOk && bloomFlag
+                    && paintCentered && holdKept && stormOk && collapseOk && bStyled,
                   f_c2g_colors: colorsOk.acloud && colorsOk.alocal && colorsOk.bcloud && colorsOk.blocal,
                   raw: { geoLegs, boot: { bootedA }, toggle: { stB, fileAfterB, probeStyleB, survivedB, stA, fileAfterA, survivedA },
-                    bloom: { restOk, restW: restB.bounds.width, bloomOk, bloomFlag, stormOk, collapseOk, bStyle }, colorsOk },
+                    bloom: { restOk, restW: restB.bounds.width, restPage, restFlush, entryReveal, bloomOk, bloomFlag, paint, paintCentered, holdKept, stormOk, collapseOk, bStyle }, colorsOk },
                 }));
                 await g.pillDrive('contextmenu'); // bloom legs left us in B — restore A for c2f legs
                 await sleep(300);

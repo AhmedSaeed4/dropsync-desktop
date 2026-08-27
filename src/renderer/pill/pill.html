@@ -109,10 +109,23 @@
       /* ---- demo Variant B "micro bloom", VERBATIM (explainer :68-79). The bloom is JS-DRIVEN
          (class `bloomed`), not :hover — the layer must tell main to resize the native view in
          the same tick the CSS starts (§1 ZERO-MISS + FIX 3 same-tick rule). Timings are the
-         demo's exact values: width .55s elastic · dots .18s ease · inner reveal .25s ease .12s. */
+         demo's exact values: width .55s elastic · dots .18s ease · inner reveal .25s ease .12s.
+         C2g-hotfix-4 FIX 1 — CENTER-ANCHORED bloom, replicating the demo's `.pos-tc-b`
+         (left:50%; transform:translateX(-50%)) middle-out growth: the percentage translate is
+         STATIC and re-resolves against the animating width every frame, so the circle grows
+          symmetrically around a screen-stable center. The old `inset:0` nailed the circle to the
+         page's LEFT edge while main re-centers the native room in one instant step on hover —
+         the painted circle rode that edge and teleported sideways ("comes from the left").
+         Main supplies BLOOM-TIME breathing room around the 112 × 28 pill (cloud.ts
+         PILL_BLOOM_PAD_*: 132 × 44) so neither the elastic overshoot nor the shadow halo is
+         clipped by the room rectangle; at REST this page is exactly 28 × 28 and the centered
+         circle sits flush at 0..28 — pixel-identical to before. Nothing here animates except
+         width (and the dots/inner rules below). */
       #pillB {
         position: absolute;
-        inset: 0;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
         width: 28px;
         height: 28px;
         border-radius: 100px;
