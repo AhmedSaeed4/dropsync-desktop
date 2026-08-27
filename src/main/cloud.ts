@@ -249,14 +249,17 @@ export interface CloudController {
   /** C2f FIX 5 — z-order truth: the pill must be the LAST contentView child (paints on top). */
   pillIsTopChild(): boolean;
   /** C2j — reminder overlay LEG 2: show a card over whichever world is on screen. ALWAYS-on
-   * delivery beside the native toast; the card queue displays ONE card at a time, serially. */
-  reminderShow(title: string, body: string): void;
+   * delivery beside the native toast; the card queue displays ONE card at a time, serially.
+   * C2k — theme?: unknown is normalized against the whitelist ('light'|'dark'|'minimal',
+   * fallback 'light') and stamped on the item at push time. */
+  reminderShow(title: string, body: string, theme?: unknown): void;
   /** C2j LEG 3 — missed queue: a reminder that fired while the app wasn't front-and-center.
    * Caps at MAX_MISSED; overflow drops the OLDEST and its count rides the next drained card. */
   enqueueMissed(title: string, body: string): void;
   /** C2j LEG 3 — drain the missed queue OLDEST-FIRST into the overlay (OVERLAY ONLY — these
-   * were already natively shown once at fire time). Spacing comes from the serial card pump. */
-  drainMissed(): void;
+   * were already natively shown once at fire time). Spacing comes from the serial card pump.
+   * C2k — theme?: unknown dresses each drained card at FLUSH time (flush-moment theme). */
+  drainMissed(theme?: unknown): void;
   /** C2j — a card click landed: dismiss the clicked card and focus/restore the window
    * (mirrors the native toast's click behavior). */
   reminderClick(id: string): void;
@@ -276,6 +279,10 @@ export interface CloudController {
     missedLen: number;
     missedDropped: number;
     pageCardVisible: boolean | 'no-view';
+    /** C2k — the live data-card-theme attribute on the card page ('no-view' when no view). */
+    pageTheme: string;
+    /** C2k — painted computed truth off the live nodes: bar background, card radius/edge. */
+    painted: { barBg: string; cardRadius: string; cardBorderWidth: string } | null;
     pillIsTop: boolean;
   }>;
   /** C2j — battery-only hermetic purge of ALL card/missed state (env-gated like pillDrive):
@@ -635,7 +642,16 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
   // same lockdown, DIP bounds math from getContentBounds, idempotent watchdog discipline.
   let cardView: WebContentsView | null = null;
   let cardLoaded = false;
-  interface CardItem { id: string; title: string; body: string }
+  /** C2k — the card wears the app's CURRENT theme at DISPLAY time (owner pick Row B ink bar:
+   * dark⇒white bar, light/minimal⇒ink bar). Whitelist mirrors the vault settings validation
+   * (vaultTypes.ts VaultSettings.theme / setSettings) — unknown/missing ⇒ 'light'. */
+  type CardTheme = 'light' | 'dark' | 'minimal';
+  const normTheme = (v: unknown): CardTheme =>
+    v === 'dark' || v === 'light' || v === 'minimal' ? v : 'light';
+  // theme rides on every DISPLAYED card — stamped by reminderShow at push time; missed items
+  // stay theme-less BY DESIGN (they were natively shown once already) and are dressed when
+  // FLUSHED by drainMissed, hence optional here.
+  interface CardItem { id: string; title: string; body: string; theme?: CardTheme }
   const cardQueue: CardItem[] = []; // display queue — ONE card visible at a time (serial pump)
   let cardShowing = false;
   let cardCurrentId: string | null = null;
@@ -734,14 +750,16 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     cardShowing = true;
     cardDelivered += 1;
     cardView!.setBounds(cardBounds()); // footprint EXACTLY the card while it shows (zero-miss)
-    cardView!.webContents.send('card:show', { id: item.id, title: item.title, body: item.body });
+    cardView!.webContents.send('card:show', { id: item.id, title: item.title, body: item.body, theme: item.theme });
     cardDismissTimer = setTimeout(() => dismissCard(item.id), AUTO_DISMISS_MS);
   };
 
   /** LEG 2 — overlay delivery. Works over whichever world is on screen (the view floats above
-   * both); multi-card storms serialize through the pump with NEXT_GAP_MS between cards. */
-  const reminderShow = (title: string, body: string): void => {
-    cardQueue.push({ id: `card-${Date.now()}-${cardSeq++}`, title, body });
+   * both); multi-card storms serialize through the pump with NEXT_GAP_MS between cards.
+   * C2k — the item is stamped with the theme at PUSH time (display-time theme: the caller
+   * reads the app's current theme the moment the reminder fires). */
+  const reminderShow = (title: string, body: string, theme?: unknown): void => {
+    cardQueue.push({ id: `card-${Date.now()}-${cardSeq++}`, title, body, theme: normTheme(theme) });
     pumpCard();
   };
 
@@ -753,16 +771,19 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
   };
   /** LEG 3 — drain on window focus: oldest-first, OVERLAY ONLY (these were natively shown once
    * at fire time), ≥NEXT_GAP_MS spacing guaranteed by the serial pump. The first flushed card
-   * carries the "+N older" prefix if overflow ever dropped anything. */
-  const drainMissed = (): void => {
+   * carries the "+N older" prefix if overflow ever dropped anything. C2k — every drained item
+   * is dressed at FLUSH time (flush-moment theme — the overlay outfit is chosen when the card
+   * is actually displayed, not when it was queued). */
+  const drainMissed = (theme?: unknown): void => {
+    const flushTheme = normTheme(theme);
     let first = true;
     while (missedQueue.length > 0) {
       const m = missedQueue.shift()!;
       if (first && missedDropped > 0) {
-        reminderShow(m.title, `+${missedDropped} older — ${m.body}`);
+        reminderShow(m.title, `+${missedDropped} older — ${m.body}`, flushTheme);
         missedDropped = 0;
       } else {
-        reminderShow(m.title, m.body);
+        reminderShow(m.title, m.body, flushTheme);
       }
       first = false;
     }
@@ -999,11 +1020,24 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     cardProbe: async () => {
       const expected = cardShowing ? cardBounds() : cardCollapsedBounds();
       if (!cardView) {
-        return { loaded: false, visible: false, showing: cardShowing, bounds: { x: 0, y: 0, width: 0, height: 0 }, expected, queueLen: cardQueue.length, nextQueueTitle: cardQueue[0]?.title ?? null, currentTitle: cardCurrentTitle, delivered: cardDelivered, missedLen: missedQueue.length, missedDropped, pageCardVisible: 'no-view' as const, pillIsTop: isPillTopChild() };
+        return { loaded: false, visible: false, showing: cardShowing, bounds: { x: 0, y: 0, width: 0, height: 0 }, expected, queueLen: cardQueue.length, nextQueueTitle: cardQueue[0]?.title ?? null, currentTitle: cardCurrentTitle, delivered: cardDelivered, missedLen: missedQueue.length, missedDropped, pageCardVisible: 'no-view' as const, pageTheme: 'no-view' as const, painted: null, pillIsTop: isPillTopChild() };
       }
-      const pageCardVisible = (await cardView.webContents.executeJavaScript(
-        `(function(){ var c = document.getElementById('card'); return !!c && c.classList.contains('show'); })()`
-      )) as boolean;
+      // C2k — ONE round-trip: the old pageCardVisible truth PLUS the theme attr and the
+      // painted computed values the f_c2j_cardFollowsTheme leg asserts on.
+      const pageState = (await cardView.webContents.executeJavaScript(
+        `(function(){
+           var c = document.getElementById('card');
+           var b = document.getElementById('bar');
+           var cs = c ? getComputedStyle(c) : null;
+           return {
+             visible: !!c && c.classList.contains('show'),
+             theme: document.documentElement.dataset.cardTheme || '',
+             barBg: b ? getComputedStyle(b).backgroundColor : '',
+             cardRadius: cs ? cs.borderRadius : '',
+             cardBorderWidth: cs ? cs.borderTopWidth : ''
+           };
+         })()`
+      )) as { visible: boolean; theme: string; barBg: string; cardRadius: string; cardBorderWidth: string };
       return {
         loaded: cardLoaded,
         visible: mainWindow.contentView.children.includes(cardView),
@@ -1016,7 +1050,9 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
         delivered: cardDelivered,
         missedLen: missedQueue.length,
         missedDropped,
-        pageCardVisible,
+        pageCardVisible: pageState.visible,
+        pageTheme: pageState.theme,
+        painted: { barBg: pageState.barBg, cardRadius: pageState.cardRadius, cardBorderWidth: pageState.cardBorderWidth },
         pillIsTop: isPillTopChild(),
       };
     },

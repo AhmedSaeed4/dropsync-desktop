@@ -15,9 +15,11 @@ const api = {
     if (typeof id !== 'string' || id.length === 0 || id.length > 64) return;
     ipcRenderer.send('card:click', id);
   },
-  /** Main pushes a card to display (id/title/body validated; the page is a dumb surface). */
-  onShow: (cb: (p: { id: string; title: string; body: string }) => void): (() => void) => {
-    const wrapped = (_e: Electron.IpcRendererEvent, p: { id: string; title: string; body: string }): void => {
+  /** Main pushes a card to display (id/title/body validated; the page is a dumb surface).
+   * C2k — theme passes through RAW (string or absent); the PAGE normalizes it against the
+   * theme whitelist, so the preload adds no opinion of its own. */
+  onShow: (cb: (p: { id: string; title: string; body: string; theme?: unknown }) => void): (() => void) => {
+    const wrapped = (_e: Electron.IpcRendererEvent, p: { id: string; title: string; body: string; theme?: unknown }): void => {
       if (!p || typeof p.id !== 'string' || typeof p.title !== 'string' || typeof p.body !== 'string') return;
       cb(p);
     };

@@ -5,42 +5,72 @@
     <title>DropSync Reminder Card</title>
     <!-- C2j — the reminder CARD layer: a THIRD trusted local view (pill sibling). ZERO remote
          assets: no fonts, no images, no remote scripts — strict CSP below, styling hand-rolled
-         to the Editorial tokens (cream #FAF7F2 family, ink #1a1a1a, gold accent bar) so the app's
-         Tailwind build is NOT needed here. The page paints NOTHING while idle (no .show class)
-         so the collapsed 0×0 native footprint is invisible. prefers-reduced-motion ⇒ the 180 ms
-         scale/fade is disabled (instant appear/disappear). -->
+         so the app's Tailwind build is NOT needed here. The page paints NOTHING while idle (no
+         .show class) so the collapsed 0×0 native footprint is invisible.
+         C2k — the card wears the app's CURRENT theme: CSS custom properties scoped by the root
+         data-card-theme attribute (set by card.ts at show time), per-theme tokens straight from
+         the app's palette, 8px corners (the app's rounded-lg), 1px hairline edge, and the app's
+         REAL font (Raleway Variable, bundled locally by Vite from @fontsource-variable).
+         prefers-reduced-motion ⇒ the 180 ms scale/fade is disabled (instant appear/disappear). -->
     <meta
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
     />
     <style>
+      /* C2k theme tokens — default (no attribute) = light values; the explicit light block
+         mirrors it for symmetry. Every value is a real app token (owner pick Row B ink bar). */
+      :root {
+        --card-surface: #ffffff; --card-edge: #e0e0e0;
+        --card-t1: #1a1a1a; --card-t2: #666666;
+        --card-bar: #1a1a1a;
+        --card-shadow: 0 8px 22px rgba(26, 26, 26, .08), 0 2px 6px rgba(26, 26, 26, .05);
+      }
+      :root[data-card-theme="light"] {
+        --card-surface: #ffffff; --card-edge: #e0e0e0;
+        --card-t1: #1a1a1a; --card-t2: #666666;
+        --card-bar: #1a1a1a;
+        --card-shadow: 0 8px 22px rgba(26, 26, 26, .08), 0 2px 6px rgba(26, 26, 26, .05);
+      }
+      :root[data-card-theme="dark"] {
+        --card-surface: #1a1a1a; --card-edge: #333333;
+        --card-t1: #ffffff; --card-t2: #888888;
+        --card-bar: #ffffff;
+        --card-shadow: 0 10px 26px rgba(0, 0, 0, .55), 0 2px 8px rgba(0, 0, 0, .4);
+      }
+      :root[data-card-theme="minimal"] {
+        --card-surface: #C5C9B8; --card-edge: #b0b4a5;
+        --card-t1: #1a1a1a; --card-t2: #4a4a4a;
+        --card-bar: #1a1a1a;
+        --card-shadow: 0 8px 20px rgba(26, 26, 26, .12);
+      }
       html, body {
         margin: 0;
         padding: 0;
         background: transparent; /* the whole point — no rectangle behind the card */
         overflow: hidden;
-        font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+        font-family: 'Raleway Variable', 'Raleway', ui-sans-serif, system-ui, sans-serif;
         user-select: none;
       }
       #root { width: 100vw; height: 100vh; }
       /* The card exactly fills the native CARD_W × CARD_H room (348 × 92 at top-right — the
-         native bounds own placement; the page just paints the card at 0,0). Editorial tokens:
-         cream surface, ink text, gold accent bar, rounded-xl, soft shadow. */
+         native bounds own placement; the page just paints the card at 0,0). C2k: themed surface,
+         1px hairline edge, 8px corners (the app's rounded-lg), themed soft shadow. */
       #card {
         position: absolute; top: 0; left: 0; width: 348px; height: 92px; box-sizing: border-box;
         display: flex; align-items: stretch;
-        background: #FAF7F2; color: #1a1a1a;
-        border-radius: 16px;
-        box-shadow: 0 10px 30px rgba(26, 26, 26, .18), 0 2px 8px rgba(26, 26, 26, .12);
+        background: var(--card-surface); color: var(--card-t1);
+        border: 1px solid var(--card-edge);
+        border-radius: 8px;
+        box-shadow: var(--card-shadow);
         cursor: pointer; overflow: hidden;
         opacity: 0; transform: scale(.92) translateY(-6px);
         transition: opacity .18s ease-out, transform .18s ease-out;
       }
       #card.show { opacity: 1; transform: scale(1) translateY(0); }
-      #bar { flex: 0 0 6px; width: 6px; background: #C9A227; } /* gold accent bar */
+      #bar { flex: 0 0 6px; width: 6px; background: var(--card-bar); } /* themed accent bar (Row B ink) */
       #txt { flex: 1; min-width: 0; padding: 16px 18px; display: flex; flex-direction: column; justify-content: center; gap: 4px; }
       #title { font-size: 14px; font-weight: 600; letter-spacing: .01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      #body { font-size: 12px; color: rgba(26, 26, 26, .62); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #body { font-size: 12px; color: var(--card-t2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       @media (prefers-reduced-motion: reduce) { #card { transition: none; } }
     </style>
   </head>

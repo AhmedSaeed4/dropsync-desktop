@@ -72,6 +72,13 @@ let cloudCtl: CloudController | null = null;
 // the manager.setNotifier site) so the DEV battery can drive synthetic reminder fires through
 // the SAME seam (no second engine invented).
 let engineNotifier: ((title: string, body: string) => void) | null = null;
+// C2k — the card dresses in the app's CURRENT theme at display time. Module level so BOTH
+// consumers see it: the engine LEG 2 route (whenReady scope) and the createWindow focus hook.
+// Reminders only fire while the vault is unlocked (getSettings is assertUnlocked-guarded), so
+// the try/catch only covers the crack.
+const currentTheme = (): 'light' | 'dark' | 'minimal' => {
+  try { return manager.getSettings().theme; } catch { return 'light'; }
+};
 let appMode: 'cloud' | 'local' = 'local'; // relaunch always starts Local in C1 (remember-last-mode = C2)
 /** Assigned by registerIpc — shared by mode:set and the DEV probe's switch storm. */
 let applyCloudMode: (next: 'cloud' | 'local') => Promise<'cloud' | 'local'> = async () => appMode;
@@ -105,7 +112,8 @@ function createWindow(): void {
   // C2j LEG 3 — missed reminders greet the owner when the window becomes front-and-center
   // again: drain oldest-first, OVERLAY only (native already shown once at fire time); the
   // serial card pump provides the ≥NEXT_GAP_MS spacing between the greeting cards.
-  mainWindow.on('focus', () => { cloudCtl?.drainMissed(); });
+  // C2k — each drained card is dressed at flush time in the CURRENT theme.
+  mainWindow.on('focus', () => { cloudCtl?.drainMissed(currentTheme()); });
   // C2f FIX 2 — the pill must show the app's ACTUAL boot mode (relaunch starts Local; the
   // renderer's boot-into-last-mode may immediately flip it via mode:set). Queued until the
   // pill layer finishes loading; delivered automatically.
@@ -4456,6 +4464,41 @@ function createWindow(): void {
                   && afterSecond - rearm0 === 2
                   && !rearmPurged.showing && rearmPurged.queueLen === 0;
 
+                // LEG G — C2k — f_c2j_cardFollowsTheme: the card wears the app's CURRENT theme
+                // at DISPLAY time (owner pick Row B ink bar). Fired through the EXACT engine
+                // seam (engineNotifier → engineNotify → reminderShow(title, body, currentTheme())
+                // → card:show → page vars) so the whole route is proven, asserted on the probe's
+                // live pageTheme attr AND the painted computed truth (bar bg, 8px radius, 1px
+                // hairline). Hermetic between legs via cardTestReset (skips the 5.5 s dismiss).
+                type C2kProbe = Awaited<ReturnType<CloudController['cardProbe']>>;
+                await cloudCtl!.cardTestReset();
+                const prevTheme = manager.getSettings().theme;
+                await manager.setSettings({ theme: 'dark' });
+                engineNotifier?.('C2j theme dark', 'row b ink');
+                let themeDark: C2kProbe | null = null;
+                for (let i = 0; i < 20 && !themeDark; i++) {
+                  await sleep(250);
+                  const p = await cloudCtl!.cardProbe();
+                  if (p.pageTheme === 'dark' && p.painted && p.painted.barBg === 'rgb(255, 255, 255)'
+                    && p.painted.cardRadius === '8px' && p.painted.cardBorderWidth === '1px') themeDark = p;
+                }
+                await cloudCtl!.cardTestReset();
+                await manager.setSettings({ theme: 'light' });
+                engineNotifier?.('C2j theme light', 'row b ink');
+                let themeLight: C2kProbe | null = null;
+                for (let i = 0; i < 20 && !themeLight; i++) {
+                  await sleep(250);
+                  const p = await cloudCtl!.cardProbe();
+                  if (p.pageTheme === 'light' && p.painted && p.painted.barBg === 'rgb(26, 26, 26)'
+                    && p.painted.cardRadius === '8px' && p.painted.cardBorderWidth === '1px') themeLight = p;
+                }
+                await manager.setSettings({ theme: prevTheme }); // restore the battery vault's theme
+                await cloudCtl!.cardTestReset();
+                const themePurged = await cloudCtl!.cardProbe();
+                const f_c2j_cardFollowsTheme = !!themeDark && !!themeLight
+                  && themeDark.pageTheme === 'dark' && themeLight.pageTheme === 'light'
+                  && !themePurged.showing && themePurged.queueLen === 0;
+
                 const rectEq = (a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }): boolean =>
                   a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
                 const f_c2j_cardOverBothWorlds = probeLocal.showing && probeLocal.visible && probeLocal.loaded
@@ -4474,10 +4517,17 @@ function createWindow(): void {
                 console.log('[c2j]', JSON.stringify({
                   f_c2j_cardOverBothWorlds,
                   f_c2j_rearmFiresAgain,
+                  f_c2j_cardFollowsTheme,
                   rearmMatrix: {
                     tempDropCreated: !!tempDrop, firstFire: fire1, rearmSecondFire: fire2,
                     firstDelta: afterFirst - rearm0, secondDelta: afterSecond - afterFirst,
                     purgedClean: !rearmPurged.showing && rearmPurged.queueLen === 0,
+                  },
+                  themeMatrix: {
+                    prevTheme, restored: manager.getSettings().theme === prevTheme,
+                    darkLeg: themeDark ? { pageTheme: themeDark.pageTheme, barBg: themeDark.painted?.barBg, radius: themeDark.painted?.cardRadius, edge: themeDark.painted?.cardBorderWidth } : null,
+                    lightLeg: themeLight ? { pageTheme: themeLight.pageTheme, barBg: themeLight.painted?.barBg, radius: themeLight.painted?.cardRadius, edge: themeLight.painted?.cardBorderWidth } : null,
+                    purgedClean: !themePurged.showing && themePurged.queueLen === 0,
                   },
                   matrix: {
                     localShown: probeLocal.showing && probeLocal.pageCardVisible === true,
@@ -4496,11 +4546,12 @@ function createWindow(): void {
                   raw: {
                     winFocused, delivered0, deliveredBeforeStorm,
                     probeLocal, probeCloud, probeHome, probeDismissed, stormMid, stormEnd, missedCapped, drainedProbe, purged,
+                    themeDark, themeLight, themePurged,
                   },
                 }));
-                // No cleanup needed: LEG E + LEG F ended with cardTestReset (collapsed + empty
-                // queues, temp drop deleted) — the card layer is inert for the dead-last C2h
-                // idle stage that follows.
+                // No cleanup needed: LEG E + LEG F + LEG G ended with cardTestReset (collapsed +
+                // empty queues, temp drop deleted, theme restored) — the card layer is inert and
+                // the vault theme is back for the dead-last C2h idle stage that follows.
               }
 
               // (6) C2h FIX 6 — f_c2h_cloudActivityFeedsIdleLock — DEAD-LAST in this stage; its
@@ -5085,7 +5136,7 @@ function registerIpc(): void {
         notifyFallback(title, body);
       }
     }
-    cloudCtl?.reminderShow(title, body); // LEG 2 — ALWAYS (C2j red-proof: comment me out)
+    cloudCtl?.reminderShow(title, body, currentTheme()); // LEG 2 — ALWAYS (C2j red-proof: comment me out); C2k — CURRENT theme
     if (!mainWindow || mainWindow.isMinimized() || !mainWindow.isFocused()) {
       cloudCtl?.enqueueMissed(title, body); // LEG 3 — cannot be seen anywhere right now
     }
