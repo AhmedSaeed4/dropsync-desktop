@@ -66,6 +66,11 @@ interface VaultStoreValue {
   handleLocked: () => void;
   /** Exit door: flip to the first-run Create flow keeping the recorded folder (M7). */
   startCreateFlow: () => void;
+  /** C2i FIX B — bare status reconcile for CloudModeShell's homecoming whisper-check: sets the
+   * status WITHOUT any data traffic (no loading flip, no list/category/settings fetches),
+   * exactly mirroring what the 8 s watcher already does when it observes a changed world under
+   * us (it merely setStatus-es). Not part of any user flow. */
+  reconcileStatus: (s: Status) => void;
   fetchTextPayload: (dropId: string) => Promise<string>;
   getMediaUrl: (dropId: string, kind: 'file' | 'image') => Promise<string | null>;
   /** Size-capped payload bytes for in-page use (drawing scene extraction). */
@@ -215,6 +220,13 @@ export function VaultStoreProvider({ children }: { children: ReactNode }) {
     setStatus('none');
   }, []);
 
+  // C2i FIX B — see interface doc: the whisper-check's neutral branch (a non-unlocked world
+  // observed on homecoming that the watcher would otherwise settle within ≤8 s). Bare setState,
+  // nothing else — counterpart of handleLocked/handleUnlocked for the 'none' case.
+  const reconcileStatus = useCallback((s: Status) => {
+    setStatus(s);
+  }, []);
+
   // THE 30-SECOND HEARTBEAT — recreates the drops array ref so the whole list re-renders and
   // countdown/expiry/reminder-tier logic recomputes against fresh wall-clock time.
   useEffect(() => {
@@ -339,6 +351,7 @@ export function VaultStoreProvider({ children }: { children: ReactNode }) {
     handleUnlocked,
     handleLocked,
     startCreateFlow,
+    reconcileStatus,
     fetchTextPayload,
     getMediaUrl,
     getMediaBytes,

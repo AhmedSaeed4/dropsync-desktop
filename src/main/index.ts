@@ -4234,6 +4234,118 @@ function createWindow(): void {
                 }));
               }
 
+              // (5b) C2i FIX D — f_c2i_warmHomecomingNoRefetch — placed between the non-destructive
+              // C2h switch-trip above and the destructive idle-lock stage below. ALL trips run
+              // through the REAL relay path (pill:flipRequested ≡ pill click). Warm trip proves
+              // REMOUNT-lessness (dataset sentinel survives React reconciliation only while the
+              // underlying DOM node survives) and ZERO refetch (the drop-list call counter the
+              // S2 close-Settings zero-refetch leg consumes — index.ts dev:testOnly actions
+              // 'resetListCallCount'/'listCallStats', rendered-counter increment at
+              // handle('drop:list')'s dropListCallCount += 1). Lock-behind trip proves the
+              // whisper-check catches the idle-lock AT ARRIVAL with zero list traffic.
+              {
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                if ((await readModeSafe()) !== 'local') {
+                  await applyCloudMode('local');
+                  await sleep(1200);
+                }
+                if (manager.status().state !== 'unlocked') { // defensive only (neighbors leave it open)
+                  await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
+                  await sleep(400);
+                }
+                const cardsWarmBefore = await countDropCards();
+                const tokenSent = `c2i-warm-${Date.now()}`;
+                // Stamp the token AND capture node-object references: a React remount produces
+                // NEW DOM nodes by definition, so same-reference-after-the-trip is the strongest
+                // possible no-remount evidence (belt-and-braces beside the ordered token check).
+                const stampRes = JSON.parse(await win.webContents.executeJavaScript(
+                  `(function(){ var sh = document.querySelector('[data-shell]');
+                     var c = document.querySelector('div.select-none.cursor-pointer.group.overflow-hidden');
+                     if (!c || !sh) return JSON.stringify({ ok: false });
+                     c.dataset.c2iWarm = ${JSON.stringify(tokenSent)};
+                     window.__c2iCardRef = c; window.__c2iShellRef = sh;
+                     return JSON.stringify({ ok: true }); })()`
+                )) as { ok: boolean };
+                await win.webContents.executeJavaScript(
+                  `window.dropsync.dev.testOnly('resetListCallCount', '')`
+                );
+                let sawCloudLeg = false;
+                win.webContents.send('pill:flipRequested', 'cloud'); // out…
+                await sleep(1500);
+                sawCloudLeg = appMode === 'cloud';
+                // C2i-hotfix-1 FIX 2 — REGRESSION-KILLER sample taken WHILE Cloud is up: the
+                // inner container must ALREADY be fixed/visible/cream here (under the buggy C2i
+                // shape this reported static/hidden/rgba(0,0,0,0), and the reveal gap painted
+                // the white flash on the way home). data-shell still flips attr-level only.
+                const cloudSample = JSON.parse(await win.webContents.executeJavaScript(
+                  `(function(){ var el = document.querySelector('[data-shell] > div');
+                     var cs = getComputedStyle(el);
+                     return JSON.stringify({ pos: cs.position, vis: cs.visibility,
+                       bg: cs.backgroundColor, shell: document.querySelector('[data-shell]').getAttribute('data-shell') }); })()`
+                )) as { pos: string; vis: string; bg: string; shell: string };
+                const styleInvariantCloud = cloudSample.pos === 'fixed' && cloudSample.vis === 'visible'
+                  && cloudSample.bg === 'rgb(250, 247, 242)';
+                win.webContents.send('pill:flipRequested', 'local'); // …and home (WARM)
+                await sleep(1500);
+                const sentinelState = JSON.parse(await win.webContents.executeJavaScript(
+                  `(function(){ var c = document.querySelector('div.select-none.cursor-pointer.group.overflow-hidden');
+                     var sh = document.querySelector('[data-shell]');
+                     var el = document.querySelector('[data-shell] > div'); var cs = getComputedStyle(el);
+                     return JSON.stringify({ tokenNow: c ? (c.getAttribute('data-c2iWarm') || '') : '',
+                       sameCardRef: !!window.__c2iCardRef && c === window.__c2iCardRef,
+                       sameShellRef: !!window.__c2iShellRef && sh === window.__c2iShellRef,
+                       shell: sh ? sh.getAttribute('data-shell') : null,
+                       anyVisiblePwd: !!document.querySelector('input[placeholder="Vault password"]'),
+                       localStyle: { pos: cs.position, vis: cs.visibility, bg: cs.backgroundColor } }); })()`
+                )) as { tokenNow: string; sameCardRef: boolean; sameShellRef: boolean; shell: string | null; anyVisiblePwd: boolean; localStyle: { pos: string; vis: string; bg: string } };
+                const styleInvariantLocal = sentinelState.localStyle.pos === 'fixed'
+                  && sentinelState.localStyle.vis === 'visible'
+                  && sentinelState.localStyle.bg === 'rgb(250, 247, 242)';
+                const shellFlippedBothWays = cloudSample.shell === 'cloud' && sentinelState.shell === 'local';
+                const cardsWarmAfter = await countDropCards();
+                const listCallsWarm = Number((await win.webContents.executeJavaScript(
+                  `window.dropsync.dev.testOnly('listCallStats', '').then((r) => r.count)`
+                )) as number);
+                const warmTripOk = stampRes.ok && (sentinelState.tokenNow === tokenSent || sentinelState.sameCardRef)
+                  && sentinelState.sameCardRef && sentinelState.sameShellRef
+                  && cardsWarmAfter === cardsWarmBefore && cardsWarmAfter > 0
+                  && listCallsWarm === 0 && !sentinelState.anyVisiblePwd && sawCloudLeg
+                  // C2i-hotfix-1 — the pinned invariant: permanent+visible container in BOTH worlds.
+                  && styleInvariantCloud && styleInvariantLocal && shellFlippedBothWays;
+
+                // LOCK-BEHIND leg: seal MAIN-SIDE while home (renderer still believes unlocked),
+                // then a Cloud round trip must land INSTANTLY on the password screen with ZERO
+                // drop-list traffic — the whisper reconciling, exactly its reason to exist.
+                await manager.lock();
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(1200);
+                await win.webContents.executeJavaScript(
+                  `window.dropsync.dev.testOnly('resetListCallCount', '')` // isolate the RETURN leg's delta
+                );
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                const pwdDetectedOnArrival = await win.webContents.executeJavaScript(
+                  `!!document.querySelector('input[placeholder="Vault password"]')`
+                ) as boolean;
+                const listCallsReturn = Number((await win.webContents.executeJavaScript(
+                  `window.dropsync.dev.testOnly('listCallStats', '').then((r) => r.count)`
+                )) as number);
+                const lockBehindOk = pwdDetectedOnArrival && listCallsReturn === 0;
+
+                const f_c2i_warmHomecomingNoRefetch = warmTripOk && lockBehindOk;
+                console.log('[c2i]', JSON.stringify({
+                  f_c2i_warmHomecomingNoRefetch,
+                  matrix: { stamped: stampRes.ok, tokenSurvived: sentinelState.tokenNow === tokenSent, sameCardRef: sentinelState.sameCardRef, sameShellRef: sentinelState.sameShellRef, cardsUnchanged: cardsWarmAfter === cardsWarmBefore && cardsWarmAfter > 0, zeroRefetchTrip: listCallsWarm === 0, noPasswordAfterTrip: !sentinelState.anyVisiblePwd, sawCloudLeg, instantPasswordOnLockBehind: pwdDetectedOnArrival, zeroRefetchReturn: listCallsReturn === 0, styleInvariantCloud, styleInvariantLocal, shellFlippedBothWays },
+                  raw: { sentinelBefore: stampRes.ok ? tokenSent : null, sentinelAfter: sentinelState, cloudStyleSample: cloudSample, cardsWarmBefore, cardsWarmAfter, listCallsWarm, listCallsReturn, pwdDetectedOnArrival },
+                }));
+                // CLEANUP: the lock-behind leg genuinely sealed the vault — restore the same sane
+                // unlocked Local stage later work expects (same dance as the C2h cleanup below).
+                try { await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch { /* already */ }
+                win.webContents.reload();
+                await sleep(4000);
+              }
+
               // (6) C2h FIX 6 — f_c2h_cloudActivityFeedsIdleLock — DEAD-LAST in this stage; its
               // cleanup leaves a sane unlocked Local stage for anything that might follow.
               //
@@ -4804,7 +4916,10 @@ function registerIpc(): void {
 
   // ---- DEV-ONLY test seeds (DROPSYNC_E2E_SIT3=1 or the DOM-checks harness). Registered
   // exclusively under harness env flags so production IPC surface stays untouched.
-  if (process.env.DROPSYNC_E2E_SIT3 === '1' || process.env.DROPSYNC_SIT3_DOMCHECKS === '1') {
+  // C2i FIX D — DROPSYNC_CLOUD_DEV joins the gate: its battery consumes the SAME
+  // listCallStats/resetListCallCount counter exposure the S2 zero-refetch leg uses.
+  if (process.env.DROPSYNC_E2E_SIT3 === '1' || process.env.DROPSYNC_SIT3_DOMCHECKS === '1'
+    || process.env.DROPSYNC_CLOUD_DEV === '1') {
     handle('dev:testOnly', async (_e, action: string, dropId: string, value?: number) => {
       if (action === 'expireDrop') {
         // Backdate expiresAt to 1 minute ago through the normal journal chain.

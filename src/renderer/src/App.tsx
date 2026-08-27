@@ -58,7 +58,7 @@ export default function App() {
  * settings door while IN cloud (accepted trade-off: flip to Local for that).
  */
 function CloudModeShell() {
-  const { refreshAll } = useVaultStore();
+  const { status, handleUnlocked, handleLocked, reconcileStatus } = useVaultStore();
   // Boot: read the memory rule BEFORE first paint and render that mode directly.
   const [screen, setScreen] = useState<DesktopMode>(() => readLastMode());
 
@@ -70,17 +70,32 @@ function CloudModeShell() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- boot-only: run once on mount
   }, []);
 
-  /** Actual transition: main seals/raises/hides (and sets the pill knob); renderer flips +
-   * resyncs on Local return. Writes the memory rule (C2 §2 — choice is written on switch). */
+  /** Actual transition: main raises/hides the site view (and sets the pill knob); NOTHING
+   * seals — switching never locks (C2h). The renderer flips its world and the homecoming
+   * WHISPER-CHECK below reconciles status ONLY when reality differs from belief. Writes the
+   * memory rule (C2 §2 — choice is written on switch). */
   const applyMode = useCallback(
     async (next: DesktopMode): Promise<void> => {
       if (next === screen) return;
       await window.dropsync.mode.set(next);
       setScreen(next);
       writeLastMode(next);
-      if (next === 'local') await refreshAll(); // instant entry-branch resync (status may have flipped)
+      // C2i FIX B — homecoming WHISPER-CHECK replaces the C1-era forced refreshAll (obsolete
+      // once C2h stopped sealing the vault on every flip). One cheap status() round-trip;
+      // touch NOTHING unless reality differs from what we believe (vault.status() is
+      // ACTIVITY_EXEMPT, so asking cannot feed the idle clock either):
+      if (next === 'local') {
+        const s = await window.dropsync.vault.status();
+        if (s.state !== status) {
+          if (s.state === 'unlocked') await handleUnlocked(); // unlocked-but-stale ⇒ hydrate like any unlock path does
+          else if (s.state === 'locked') handleLocked(); // idle-lock fired behind Cloud ⇒ instant password screen, ZERO fetches
+          else reconcileStatus('none'); // mirror of the 8 s watcher's bare setStatus for non-unlocked worlds
+        }
+        // Equal state ⇒ strictly NO-OP: no setLoading, no setDropsRaw, no list/category/
+        // settings/spaces refetch of any kind — the warm world simply stays as it is.
+      }
     },
-    [screen, refreshAll]
+    [screen, status, handleUnlocked, handleLocked, reconcileStatus]
   );
 
   /** Guarded switch — if an editor has unsaved changes its OWN discard-confirm runs first
@@ -106,21 +121,31 @@ function CloudModeShell() {
     return () => window.removeEventListener('dropsync:request-mode-cloud', h);
   }, [switchMode]);
 
-  // Single root element (display:contents) keeps the boot probe's `rootChildren: 1` contract
-  // intact. The floating pill is NOT in this DOM — it is a separate native layer (main/cloud.ts).
-  if (screen === 'cloud') {
-    return (
-      <div className="contents" data-shell="cloud">
-        {/* The site view covers the ENTIRE window above this DOM; keep a quiet cream filler
-         * beneath for the first paint instants before the site's first frame lands. */}
-        <div className="fixed inset-0 bg-[#FAF7F2]" />
-      </div>
-    );
-  }
-
+  // C2i-hotfix-1 — the inner container is PERMANENT and ALWAYS VISIBLE. The C2i original
+  // (cream class only while Cloud + visibility:hidden while Cloud) caused two owner-visible
+  // regressions, both measured live (probe: /tmp/c2iflash): (a) main removes the site view
+  // SYNCHRONOUSLY during mode.set, but React only flips this container's visibility one
+  // renderer round-trip + commit later (+126 ms caught on tape) — the reveal gap painted the
+  // page's invisible root over Chromium's default WHITE canvas = the full-screen white flash;
+  // (b) a whole-subtree visibility:hidden wake-up repaint + the class-list swing
+  // ('' ⇄ 'fixed inset-0…') = the post-arrival "flinch". The site view ALREADY covers Local
+  // completely while Cloud is up (native z-order — the same guarantee the pill relies on), so
+  // CSS hiding buys nothing and costs both symptoms. World separation stays attr-level only:
+  // the outer wrapper's data-shell keeps flipping for probes/state, nothing visual toggles.
+  //
+  // Hidden-liveness audit (C2i FIX C, still true): an always-mounted AppBody keeps its global
+  // listeners (useEscapeClose/EditorialSelect keydown captures, EditorialDropZone paste,
+  // EditorialDropList pointerdown, useModalBackClose popstate), yet NONE can misfire while
+  // Cloud is up: keyboard focus belongs to the site view after every flip (cloud.ts show()
+  // ends with site webContents.focus(); hide() hands it back to the window) and site-input
+  // events live in a DIFFERENT webContents that never reaches this DOM. The boot probe's
+  // `rootChildren: 1` contract still holds in every mode (one element-child under this
+  // contents wrapper, as always).
   return (
-    <div className="contents" data-shell="local">
-      <AppBody />
+    <div className="contents" data-shell={screen}>
+      <div className="fixed inset-0 bg-[#FAF7F2]">
+        <AppBody />
+      </div>
     </div>
   );
 }
