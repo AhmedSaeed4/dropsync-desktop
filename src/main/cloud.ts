@@ -88,6 +88,11 @@ export const PILL_A_FLIP_PAD_X = 6;
  * knife-edge room swap overlaps a click, the rebloom can settle with ≤2 frames of ≤6 px twitch. */
 const PILL_A_FLIP_ROOM_HOLD_MS = 620;
 
+/** C2h — minimum gap between gesture→touch feeds so event bursts (key repeats, scroll storms)
+ * collapse to one stamp per half-second on the shared idle-auto-lock clock. Policy constant,
+ * not an animation timing. */
+const ACTIVITY_FEED_MIN_GAP_MS = 500;
+
 /** C2g-hotfix-5 FIX 2 — how long the BLOOMED native room (132 × 44) HOLDS after a collapse
  * request, so the CSS shrink (contract: width 0.55s elastic) can play OUTSIDE any clipping wall
  * and the final 28 px snap lands on an exactly-28-wide, centered, invisible-change pill. This is
@@ -215,6 +220,11 @@ export interface CloudController {
   reloadPillLayer(): Promise<void>;
   /** C2f FIX 5 — site-view evidence for f_c2f_boundsFull: current bounds + visibility. */
   siteProbe(): Promise<{ bounds: Electron.Rectangle; visible: boolean }>;
+  /** C2h FIX 6 — battery-only (env-gated): deliver an INERT wheel gesture through the REAL
+   * input pipeline of the site view — the exact channel the C2h `input-event` activity
+   * listener senses. Wheel ONLY: a synthetic click could navigate the real deployed page.
+   * Throws when DROPSYNC_CLOUD_DEV ≠ 1. */
+  siteDriveWheel(x: number, y: number, deltaY: number): Promise<boolean>;
   /** C2f FIX 5 — z-order truth: the pill must be the LAST contentView child (paints on top). */
   pillIsTopChild(): boolean;
 }
@@ -327,7 +337,10 @@ function pillPageUrl(style: PillStyle): string {
   return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/pill/pill.html') + suffix;
 }
 
-export function initCloud(mainWindow: BrowserWindow): CloudController {
+export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: () => void }): CloudController {
+  // C2h FIX 2/3 — main-provided activity feed: gestures sensed on the cloud view call this
+  // (wired in index.ts to manager.touch()), so Cloud input feeds the SAME idle clock as Local.
+  const { onUserActivity } = opts ?? {};
   let view: WebContentsView | null = null;
   let shown = false;
   let readyMs: number | null = null;
@@ -558,6 +571,20 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
       readyMs = Date.now() - loadStartedAt;
       console.log('[cloud] did-finish-load in', readyMs, 'ms');
     });
+    // C2h FIX 2 — cloud gestures feed the SAME idle-auto-lock clock as Local actions (owner
+    // decision D-B). We sense INPUTS from OUTSIDE the page (main-process listener; this is NOT
+    // site injection — we never execute/read anything in the site, invariant I6/I1). Buttons,
+    // keys and wheel count; mouseMove/mouseEnter/mouseLeave do NOT — mirroring Local, where
+    // pure hovering fires no IPC and never refreshed the idle clock either. Auth POPUP
+    // windows deliberately do NOT feed the clock (separate webContents; brief sign-in moments).
+    let lastFeed = 0;
+    view.webContents.on('input-event', (_event, input) => {
+      if (input.type === 'mouseMove' || input.type === 'mouseEnter' || input.type === 'mouseLeave') return;
+      const now = Date.now();
+      if (now - lastFeed < ACTIVITY_FEED_MIN_GAP_MS) return;
+      lastFeed = now;
+      onUserActivity?.();
+    });
     void view.webContents.loadURL(CLOUD_URL); // stock UA — never spoofed
     // Keep session cookies on disk (persist:) so sign-in survives app + dev-server restarts.
     void session.fromPartition(PARTITION);
@@ -701,6 +728,15 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
       if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('pillEval is DROPSYNC_CLOUD_DEV-only');
       if (!pillView) throw new Error('pill layer missing');
       return (await pillView.webContents.executeJavaScript(expr)) as T;
+    },
+    // C2h FIX 6 — battery-only site gesture driver (I6: no script enters the page; this only
+    // synthesizes a raw input event through Electron's own pipeline, which the C2h activity
+    // listener then observes from OUTSIDE the page).
+    siteDriveWheel: async (x, y, deltaY) => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('siteDriveWheel is DROPSYNC_CLOUD_DEV-only');
+      if (!view) throw new Error('site view missing');
+      view.webContents.sendInputEvent({ type: 'mouseWheel', x, y, deltaY });
+      return true;
     },
     reloadPillLayer: async () => {
       if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('reloadPillLayer is DROPSYNC_CLOUD_DEV-only');

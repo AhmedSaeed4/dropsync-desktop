@@ -93,7 +93,10 @@ function createWindow(): void {
   });
   mainWindow.once('ready-to-show', () => mainWindow?.show());
   // C1: cloud view lifecycle + C2f generalized bounds tracking (resize/maximize/full-screen/move).
-  cloudCtl = initCloud(mainWindow);
+  // C2h FIX 3 — cloud-view gestures feed the SAME idle-auto-lock clock (owner decision D-B):
+  // the controller senses raw inputs from OUTSIDE the page and calls manager.touch() here.
+  // Safe by closure: manager is the module-level singleton (:63) outliving any view swap.
+  cloudCtl = initCloud(mainWindow, { onUserActivity: () => manager.touch() });
   attachCloudResizeTracking(mainWindow, cloudCtl);
   // C2f FIX 2 — the pill must show the app's ACTUAL boot mode (relaunch starts Local; the
   // renderer's boot-into-last-mode may immediately flip it via mode:set). Queued until the
@@ -3426,6 +3429,15 @@ function createWindow(): void {
                 win.webContents.executeJavaScript(
                   `(window.__DC_METRICS ? window.__DC_METRICS.seq.slice(${mark}).some((e) => e.ev === 'mode-guard-confirm-open') : false)`
                 ).then((v) => v === true);
+              // C2h FIX 4 — "REAL list rendered" counter: counts drop CARDS by their stable
+              // rendered root signature in EditorialDropItem.tsx:246-248
+              // (`relative select-none … cursor-pointer group overflow-hidden` on every card,
+              // no data-testid exists). The locked early-return screen renders ZERO such cards,
+              // so >0 is genuine unlocked-UI evidence.
+              const countDropCards = (): Promise<number> =>
+                win.webContents.executeJavaScript(
+                  `document.querySelectorAll('div.select-none.cursor-pointer.group.overflow-hidden').length`
+                ).then((n) => Number(n));
               // (1) Boot evidence: straight-into-last-mode + the pill layer present/transparent.
               await sleep(2500); // pill layer load + boot-into-last-mode settle
               const bootPill = await cloudCtl.pillProbe();
@@ -3522,19 +3534,18 @@ function createWindow(): void {
               const discardMode = await readMode();
               const discardFlips = discardMode === 'cloud' && appMode === 'cloud';
 
-              // Come back — editor must be GONE. Cloud SEALED the vault on entry (applyMode
-              // :3949 manager.lock()), so re-unlock through the bridge and reload first: these
-              // final legs must assert against the REAL Local UI, not the locked early-return
-              // screen (which would make them pass vacuously — no UI, nothing to be open).
+              // Come back — editor must be GONE *and* the world must be INTACT (C2h: switching
+              // never seals). Assert LIVE evidence: vault still unlocked AND the real drop list
+              // rendered (no password screen) — guards against any vacuous pass like before.
               win.webContents.send('pill:flipRequested', 'local');
               await sleep(1500);
-              await win.webContents.executeJavaScript(
-                `(async () => { const d = window.dropsync; await d.vault.prepareFolder('/tmp/ds-c2f-vault').catch(() => {}); await d.vault.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw').catch(() => {}); return true; })()`
-              );
-              win.webContents.reload();
-              await sleep(4500); // boot-into-last-mode ('local', written by the relay flip) + store
+              const backStatus = String(await win.webContents.executeJavaScript(
+                `(window.dropsync ? window.dropsync.vault.status().then((s) => s.state) : Promise.resolve('noBridge'))`
+              ));
               const backDom = await readState();
-              const editorClosedOnReturn = backDom.open === false;
+              const cardCount = await countDropCards();
+              const editorClosedOnReturn = backDom.open === false && backStatus === 'unlocked'
+                && cardCount > 0;
 
               // Clean leg: reopen (discard threw the typing away), do NOT type, flip ⇒ instant,
               // NO confirm — the guard must not nag the clean case.
@@ -3553,7 +3564,7 @@ function createWindow(): void {
                 f_c2f_flipGuardFull: dirtyIntercept && cancelKeeps && discardFlips && editorClosedOnReturn && cleanInstant,
                 f_c2f_flipGuard: cleanInstant, // folded: the old relay key IS the clean-path assertion
                 matrix: { dirtyIntercept, cancelKeeps, discardFlips, editorClosedOnReturn, cleanInstant },
-                raw: { seedId: seeds.g, opened, typedOk, baseState, dirtyState, typedAdded, duringDirty, cancelState, confirmAgain, discardMode, backDom, cleanState },
+                raw: { seedId: seeds.g, opened, typedOk, baseState, dirtyState, typedAdded, duringDirty, cancelState, confirmAgain, discardMode, backDom, backStatus, cardCount, cleanState },
               }));
 
               // (1c) f_c2f_metaSavePreviewKeepsText — THE robot test for hotfix-2. A metadata-only
@@ -4177,6 +4188,112 @@ function createWindow(): void {
               // C1b FIX D — synthetic auth-handler popup through OUR allowlist, end-to-end.
               const c1b = await cloudCtl!.probeSyntheticAuthPopup();
               console.log('[c1b]', JSON.stringify(c1b));
+
+              // (5) C2h FIX 5 — f_c2h_switchKeepsVaultOpen: switching flips the VIEW only, so a
+              // full human-style round trip must keep the vault OPEN and end on the LIVE list.
+              // Runs LAST among this stage's cloud-related keys (FIX 6 below runs dead-last).
+              {
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                if ((await readModeSafe()) !== 'local') { // desync insurance: force both sides local
+                  await applyCloudMode('local');
+                  win.webContents.send('pill:flipRequested', 'local');
+                  await sleep(1200);
+                }
+                // Preconditions: the battery's own fixtures (GuardFixture etc.) live in
+                // /tmp/ds-c2f-vault and are unlocked since (1c)'s restore — main-side guard only,
+                // NEVER an unconditional unlock (on an open vault that would lock-then-reopen).
+                if (manager.status().state !== 'unlocked') {
+                  await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
+                }
+                const preStatus = manager.status();
+                const localCards = await countDropCards(); // reuses the FIX-4 counter
+                win.webContents.send('pill:flipRequested', 'cloud'); // real relay path out…
+                await sleep(1500);
+                const cloudMode = appMode;
+                const cloudStatusMain = manager.status().state;
+                const cloudStatusRenderer = String(await win.webContents.executeJavaScript(
+                  `(window.dropsync ? window.dropsync.vault.status().then((s) => s.state) : Promise.resolve('noBridge'))`
+                ));
+                win.webContents.send('pill:flipRequested', 'local'); // …and home again
+                await sleep(1500);
+                const backMode = appMode;
+                const backStatusMain = manager.status().state;
+                const backPasswordScreen = await win.webContents.executeJavaScript(
+                  `!!document.querySelector('input[placeholder="Vault password"]')`
+                ) as boolean;
+                const backCards = await countDropCards();
+                const f_c2h_switchKeepsVaultOpen = preStatus.state === 'unlocked' && localCards > 0
+                  && cloudMode === 'cloud' && cloudStatusMain === 'unlocked' && cloudStatusRenderer === 'unlocked'
+                  && backMode === 'local' && backStatusMain === 'unlocked'
+                  && backPasswordScreen === false && backCards > 0;
+                console.log('[c2h-switch]', JSON.stringify({
+                  f_c2h_switchKeepsVaultOpen,
+                  matrix: { unlockedBefore: preStatus.state === 'unlocked', localCards: localCards > 0, cloudTripUnlocked: cloudStatusMain === 'unlocked' && cloudStatusRenderer === 'unlocked', homeUnlocked: backStatusMain === 'unlocked', noPasswordScreen: backPasswordScreen === false, homeListRendered: backCards > 0 },
+                  raw: { preStatus, localCards, cloudMode, cloudStatusMain, cloudStatusRenderer, backMode, backStatusMain, backPasswordScreen, backCards },
+                }));
+              }
+
+              // (6) C2h FIX 6 — f_c2h_cloudActivityFeedsIdleLock — DEAD-LAST in this stage; its
+              // cleanup leaves a sane unlocked Local stage for anything that might follow.
+              //
+              // SOUNDNESS (why this isolation proves the wiring): during FEED we synthesize
+              // wheel gestures into the SITE view via sendInputEvent — Electron's native input
+              // pipeline generates ZERO ipcMain traffic and the site has NO bridge (invariant
+              // I1), so the handle()-choke-point toucher can never fire for them. The ONLY code
+              // that can advance lastActivity during FEED is the new C2h `input-event` listener
+              // → onUserActivity → manager.touch(). Sampling uses DIRECT manager.status() calls
+              // (no renderer IPC, no bridge round-trip), so sampling itself cannot feed the
+              // clock either. With autoLockMinutes=1 the existing watchdog WOULD seal by ~60 s
+              // of silence — staying unlocked through ≥65 s of feeding proves gestures reach
+              // the shared clock; locking shortly AFTER feeding stops proves nothing else did.
+              {
+                await manager.setSettings({ autoLockMinutes: 1 }); // minimum legal; this very call touches ⇒ t₀
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(1500);
+                const enteredCloud = appMode === 'cloud';
+                const t0 = Date.now();
+                let lastFeedAt = Date.now();
+                const samples: Array<{ tMs: number; state: string }> = [{ tMs: 0, state: manager.status().state }];
+                let fedOk = true;
+                while (Date.now() - t0 < 70000) { // FEED phase ≥70 s
+                  await sleep(15000);
+                  try {
+                    fedOk = fedOk && (await cloudCtl.siteDriveWheel(300, 300, -120)) === true;
+                    lastFeedAt = Date.now();
+                  } catch { fedOk = false; }
+                  samples.push({ tMs: Date.now() - t0, state: manager.status().state });
+                }
+                const feedElapsedMs = Date.now() - t0;
+                const stayedUnlockedWhileFed = enteredCloud && fedOk
+                  && feedElapsedMs >= 65000 && samples.length >= 4
+                  && samples.every((s) => s.state === 'unlocked');
+                // STARVE phase: stop feeding entirely; watch the SHARED clock do its job alone.
+                let lockedAfterStarve = false;
+                let lockAfterLastFeedMs = -1;
+                while (Date.now() - lastFeedAt < 120000) { // cap 120 s starvation (watchdog granularity 30 s ⇒ expect ~60–90 s)
+                  await sleep(10000);
+                  const st = manager.status().state;
+                  samples.push({ tMs: Date.now() - t0, state: st });
+                  if (st === 'locked') { lockedAfterStarve = true; lockAfterLastFeedMs = Date.now() - lastFeedAt; break; }
+                }
+                const f_c2h_cloudActivityFeedsIdleLock = stayedUnlockedWhileFed && lockedAfterStarve;
+                console.log('[c2h-idle]', JSON.stringify({
+                  f_c2h_cloudActivityFeedsIdleLock,
+                  raw: { enteredCloud, fedOk, feedElapsedMs, stayedUnlockedWhileFed, lockedAfterStarve, lockAfterLastFeedMs, lastFeedIso: new Date(lastFeedAt).toISOString(), sampleCount: samples.length, samples },
+                }));
+                // CLEANUP: one shared clock restored, Local re-entered (lands on the password
+                // screen — fine, the starve legitimately locked it), re-unlocked through the
+                // SAME path other dev paths use (dev:testOnly `vaultUnlock` → manager.unlock),
+                // then a fresh mount so any later stages boots sane.
+                await manager.setSettings({ autoLockMinutes: 10 });
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                try { await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch { /* already open or gone */ }
+                win.webContents.reload();
+                await sleep(4000);
+              }
+
               // Real-restart proof helper: leave a specific memory value behind for the NEXT
               // boot to read (DROPSYNC_CLOUD_DEV_MEM=local ⇒ next launch must open on Local).
               if (process.env.DROPSYNC_CLOUD_DEV_MEM === 'local') {
@@ -4377,16 +4494,18 @@ function registerIpc(): void {
   });
   handle('vault:lock', () => manager.lock());
 
-  // ---- C1 cloud mode --------------------------------------------------------------------
-  // Switch to Cloud: seal the vault via the EXISTING internal lock path (same as
-  // SettingsModal "Lock now" → handle('vault:lock') → manager.lock(), and idle auto-lock
-  // → vault.ts:879 void this.lock()), then raise the view. Entering Cloud NEVER requires
-  // a vault: lock() on a none/locked state is a harmless no-op seal.
+  // ---- C2h cloud mode --------------------------------------------------------------------
+  // Mode switches flip the VIEW ONLY (C2h owner decision): entering Cloud NEVER seals the vault
+  // and leaving it NEVER required a lock — the EXISTING idle auto-lock (vault/vault.ts
+  // startIdleWatch) remains the ONLY thing that locks, driven by lastActivity from REAL activity
+  // in EITHER world. Activity feeding for the cloud view is wired where the view exists — see
+  // initCloud's `onUserActivity` dep in cloud.ts (gestures there → manager.touch()). Entering
+  // Cloud still never requires a vault: touch() on a locked/none state is harmless. The old
+  // "leaving Local locks it" rule (CLOUD-MODE-PLAN §5) was REOPENED by the owner 2026-08-27.
   const applyMode = async (next: 'cloud' | 'local'): Promise<'cloud' | 'local'> => {
     if (next !== 'cloud' && next !== 'local') throw new Error('Invalid mode.');
     if (next === appMode) return appMode;
     if (next === 'cloud') {
-      await manager.lock(); // leaving Local locks it instantly — no prompt (§3)
       appMode = 'cloud';
       if (!cloudCtl) throw new Error('Cloud controller unavailable.');
       cloudCtl.show();
