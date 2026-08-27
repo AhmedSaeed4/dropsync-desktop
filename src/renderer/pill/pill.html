@@ -99,10 +99,19 @@
       }
       .mode-pill button { padding: 7.5px 14px; }
       .mode-pill .knob { top: 2px; left: 2px; height: calc(100% - 4px); width: calc(50% - 2px); }
-      /* ---- A's own footprint (only what is genuinely A-specific) */
+      /* ---- A's own footprint. C2g-hotfix-6 FIX 2 — CENTER-ANCHORED exactly like #pillB
+         (left/top 50% + static translate(-50%,-50%)): when main grows the room to the flip-time
+         124 × 28 skirt (cloud.ts PILL_A_FLIP_PAD_X) so the knob's elastic overshoot paints
+         instead of clipping, both rooms share ONE center ⇒ the painted pill NEVER moves during
+         the swap. Rest room is still exactly 112 ⇒ centered = flush 0..112, pixel-identical to
+         the old inset:0 layout. No entry choreography for A — no blink mask exists here; the
+         accepted micro-residual is a ≤2-frame ≤6 px settle twitch when a knife-edge room
+         swap overlaps a click (documented in cloud.ts). */
       #pillA {
         position: absolute;
-        inset: 0;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
         width: 112px;
         height: 28px;
       }

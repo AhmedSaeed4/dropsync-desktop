@@ -15,7 +15,7 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
 import { VaultManager } from './vault/vault.ts';
-import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, type CloudController } from './cloud';
+import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_FLIP_PAD_X, type CloudController } from './cloud';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -3985,7 +3985,42 @@ function createWindow(): void {
                   .then((s) => JSON.parse(s as string) as { point80_14: string; center: [number, number]; centerHits: string });
                 const greenProofOk = redProof.point80_14 === 'btn-local-a' && redProof.centerHits === 'btn-local-a'
                   && redProof.center[1] >= 0 && redProof.center[1] < 28;
-                await realClick('#btn-local-a');
+                await realClick('#btn-local-a'); // Leg 1 — arms main's Style A flip room AT THE RELAY
+                // f_c2g_knobRoom (C2g-hotfix-6 FIX 3) — Style A FLIP ROOM truth on the REAL path.
+                // The click above armed the skirt: the native room must be 124 × 28 centered
+                // within ~250 ms of the click, the PAINTED #pillA must sit at [6, 0, 112, 28] ±1
+                // while it's big (center-anchor ⇒ paint NEVER moves), and by ~1.2 s the room must
+                // be back to the exact sacred 112 × 28 rest footprint.
+                const knobT0 = Date.now();
+                let knobRoomWideAt = -1;
+                for (let i = 0; i < 12; i++) {
+                  await sleep(50);
+                  const pb = (await g.pillProbe()).bounds;
+                  const cw = win.getContentBounds().width;
+                  if (Math.abs(pb.x - Math.round((cw - (PILL_W + PILL_A_FLIP_PAD_X * 2)) / 2)) <= 1
+                    && pb.y === PILL_TOP && pb.width === PILL_W + PILL_A_FLIP_PAD_X * 2
+                    && pb.height === PILL_H) {
+                    knobRoomWideAt = Date.now() - knobT0;
+                    break;
+                  }
+                }
+                const paintA = await g.pillEval(`(function(){ var r = document.getElementById('pillA').getBoundingClientRect();
+                    return JSON.stringify([+r.left.toFixed(1), +r.top.toFixed(1),
+                      +r.width.toFixed(1), +r.height.toFixed(1)]); })()`)
+                  .then((s) => JSON.parse(s as string) as [number, number, number, number]);
+                const paintStable = Math.abs(paintA[0] - PILL_A_FLIP_PAD_X) <= 1 && Math.abs(paintA[1]) <= 1
+                  && Math.abs(paintA[2] - PILL_W) <= 1 && Math.abs(paintA[3] - PILL_H) <= 1;
+                let knobRoomSettled = false;
+                for (let i = 0; i < 14; i++) { // ≤3.5 s ≫ the 620 ms contract-coupled hold
+                  await sleep(250);
+                  const pb = (await g.pillProbe()).bounds;
+                  const cw = win.getContentBounds().width;
+                  if (pb.x === Math.round((cw - PILL_W) / 2) && pb.y === PILL_TOP
+                    && pb.width === PILL_W && pb.height === PILL_H) {
+                    knobRoomSettled = true;
+                    break;
+                  }
+                }
                 const aWordFlip = await waitMode('local') && (await layerTruth()).mode === 'local';
 
                 // Leg 2 — Style B AT-REST circle click flips (FIX 1: the whole circle is the button).
@@ -4029,15 +4064,16 @@ function createWindow(): void {
                 const styleStillToggles = (await (async () => { await drive('contextmenu'); await sleep(300); const b = (await layerTruth()).style === 'B'; await drive('contextmenu'); await sleep(300); return b && (await layerTruth()).style === 'A'; })());
 
                 const everyHitOk = hitLog.length > 0 && hitLog.every((h) => h.ok);
+                const knobRoomOk = knobRoomWideAt >= 0 && knobRoomWideAt <= 500 && paintStable && knobRoomSettled;
                 console.log('[c2g2]', JSON.stringify({
-                  f_c2g_realClickFlips: startA && greenProofOk && everyHitOk && aWordFlip && circleFlip && bloomedWordFlip
-                    && sameModeNoop && stormOk && backToCloud && styleStillToggles
-                    && bridgeType === 'object' && consoleErrors.length === 0
+                  f_c2g_realClickFlips: startA && greenProofOk && everyHitOk && knobRoomOk && aWordFlip
+                    && circleFlip && bloomedWordFlip && sameModeNoop && stormOk && backToCloud
+                    && styleStillToggles && bridgeType === 'object' && consoleErrors.length === 0
                     && pillFlipRelayCount - flipReceiptsBefore >= 15, // 15 real clicks, 15 receipts
-                  matrix: { aWordFlip, circleFlip, bloomedWordFlip, sameModeNoop, stormOk, backToCloud, styleStillToggles, greenProofOk, everyHitOk },
+                  matrix: { aWordFlip, circleFlip, bloomedWordFlip, sameModeNoop, stormOk, backToCloud, styleStillToggles, greenProofOk, everyHitOk, knobRoomOk },
                   redProof,
                   suspects: { bridgeType, consoleErrors, flipReceipts: pillFlipRelayCount - flipReceiptsBefore },
-                  raw: { hitLog },
+                  raw: { hitLog, knobRoom: { knobRoomWideAt, paintA, paintStable, knobRoomSettled } },
                 }));
               }
               // (3) f_c2f_boundsFull — resize to two sizes + fullscreen; the site view must equal
@@ -4086,13 +4122,27 @@ function createWindow(): void {
               }
               const childViews = win.contentView.children.length;
               const stormPill = await cloudCtl.pillProbe();
+              // C2g-hotfix-6 — each mode delivery now arms the Style A flip room (124 × 28,
+              // contract-coupled hold), so the "rest footprint" part of this key must be read
+              // AFTER the hold snaps back to exactly 112 × 28. Persistence facts (view reuse,
+              // z-order, transparency, load state) are asserted on the INSTANT storm probe;
+              // geometry is asserted once the room has settled (≤1.6 s ≫ the 620 ms hold).
+              let settlePill = stormPill;
+              for (let i = 0; i < 10; i++) {
+                const cw2 = win.getContentBounds().width;
+                if (settlePill.bounds.width === PILL_W && settlePill.bounds.height === PILL_H
+                  && settlePill.bounds.y === PILL_TOP
+                  && Math.abs(settlePill.bounds.x - Math.round((cw2 - PILL_W) / 2)) <= 1) break;
+                await sleep(160);
+                settlePill = await cloudCtl.pillProbe();
+              }
               const stormSite = await cloudCtl.siteProbe();
               console.log('[c2f-pill]', JSON.stringify({
                 f_c2f_pillPersistent: childViews === 2 && stormPill.visible && stormPill.loaded
                   && cloudCtl.pillIsTopChild()
-                  && Math.abs(stormPill.bounds.x - Math.round((win.getContentBounds().width - PILL_W) / 2)) <= 1
-                  && stormPill.bounds.y === PILL_TOP
-                  && stormPill.bounds.width === PILL_W && stormPill.bounds.height === PILL_H
+                  && Math.abs(settlePill.bounds.x - Math.round((win.getContentBounds().width - PILL_W) / 2)) <= 1
+                  && settlePill.bounds.y === PILL_TOP
+                  && settlePill.bounds.width === PILL_W && settlePill.bounds.height === PILL_H
                   && stormPill.bodyBackgroundColor === 'rgba(0, 0, 0, 0)',
                 toggles: modes.length,
                 finalMode: appMode,
@@ -4357,6 +4407,10 @@ function registerIpc(): void {
   ipcMain.on('pill:flip', (_e, next: 'cloud' | 'local') => {
     if (next !== 'cloud' && next !== 'local') return;
     if (!mainWindow || mainWindow.isDestroyed()) return;
+    // C2g-hotfix-6 FIX 2 — arm the Style A flip room BEFORE relaying: the 124 × 28 skirt must
+    // be in place before the renderer's guarded switch lands the knob's class and the elastic
+    // transform starts (its overshoot paints past the trough's ends instead of clipping).
+    cloudCtl?.beginPillFlip();
     pillFlipRelayCount += 1; // C2g-hotfix-1 §5 — relay-receipt evidence for the real-click robot
     console.log('[pill] flip requested →', next);
     mainWindow.webContents.send('pill:flipRequested', next);

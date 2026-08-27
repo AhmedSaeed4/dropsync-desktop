@@ -73,6 +73,21 @@ export const PILL_B_REST_W = 28;
 export const PILL_BLOOM_PAD_X = 10;
 export const PILL_BLOOM_PAD_Y = 8;
 
+/** C2g-hotfix-6 FIX 2 — Style A FLIP-TIME breathing room ONLY. The knob's contracted elastic
+ * transform (0.6s cubic-bezier(0.34,1.56,0.64,1), ~54 px travel) overshoots ≈+6 px past its
+ * target on BOTH flip directions; at a rest room of exactly 112 × 28 that overshoot (+ shadow)
+ * was hard-clipped by the room wall ("a box with a boundary attached to it"). While a Style A
+ * flip is animating or holding, `pillBounds()` returns a 124 × 28 centered room
+ * (112 + 2 × PILL_A_FLIP_PAD_X); pad_Y = 0 because the knob never moves vertically. AT REST the
+ * room is STILL exactly 112 × 28 — the zero-miss footprint is sacred and untouched. These two
+ * constants are NOT animation timings and are NOT part of the ANIMATION CONTRACT: */
+export const PILL_A_FLIP_PAD_X = 6;
+/** …the hold is a CONTRACT COUPLING (= the knob's 0.6 s transform duration + one frame): if the
+ * CONTRACT knob duration ever changes, this constant MUST change with it. Same nature as
+ * hotfix-5's collapse hold. Accepted micro-residual (documented, do NOT blank for it): when a
+ * knife-edge room swap overlaps a click, the rebloom can settle with ≤2 frames of ≤6 px twitch. */
+const PILL_A_FLIP_ROOM_HOLD_MS = 620;
+
 /** C2g-hotfix-5 FIX 2 — how long the BLOOMED native room (132 × 44) HOLDS after a collapse
  * request, so the CSS shrink (contract: width 0.55s elastic) can play OUTSIDE any clipping wall
  * and the final 28 px snap lands on an exactly-28-wide, centered, invisible-change pill. This is
@@ -129,6 +144,9 @@ export interface CloudController {
    * (28 × 28) footprint RE-CENTERED, in the same tick the CSS transition starts. Idempotent;
    * bloom requests while Style A is active are ignored. */
   setPillBloom(bloomed: boolean): void;
+  /** C2g-hotfix-6 FIX 2 — Style A flip room: grow to 124 × 28 BEFORE the knob's flip transform
+   * starts (the `pill:flip` relay calls this first). Contract-coupled hold then snaps back. */
+  beginPillFlip(): void;
   /** C2g FIX 4 — right-click style toggle lands here: flip state, PERSIST to disk, re-assert
    * bounds for the new style's current footprint. */
   setPillStyle(style: PillStyle): void;
@@ -325,6 +343,9 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
   let pillBlooming = false;
   // C2g-hotfix-5 FIX 2 — armed while the collapse room must WAIT for the CSS shrink to finish.
   let pillCollapseHold: ReturnType<typeof setTimeout> | null = null;
+  // C2g-hotfix-6 FIX 2 — mirror pair for Style A's flip room (knob overshoot breathing space).
+  let pillFlipPending = false;
+  let pillFlipHold: ReturnType<typeof setTimeout> | null = null;
   const pillConsole: string[] = []; // C2g-hotfix-1 §5 — layer console ring buffer
 
   /** Shared load-finished path for boot AND battery-driven layer relaunches (C2g FIX 4). */
@@ -356,6 +377,12 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
    * resize/fullscreen handler read bounds through here, so they all inherit the room. */
   const pillBounds = (): Electron.Rectangle => {
     const b = mainWindow.getContentBounds();
+    // C2g-hotfix-6 FIX 2 — Style A FLIP room: only while the knob's elastic transform is
+    // animating or on hold. Rest stays exactly 112 × 28 centered (zero-miss sacred).
+    if (pillStyle === 'A' && (pillFlipPending || pillFlipHold !== null)) {
+      const w = PILL_W + PILL_A_FLIP_PAD_X * 2; // 124
+      return { x: Math.round((b.width - w) / 2), y: PILL_TOP, width: w, height: PILL_H };
+    }
     if (pillStyle === 'B' && (pillBlooming || pillCollapseHold !== null)) {
       const w = PILL_W + PILL_BLOOM_PAD_X * 2; // 132
       const h = PILL_H + PILL_BLOOM_PAD_Y * 2; // 44
@@ -430,6 +457,28 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
       return;
     }
     pillView?.webContents.send('pill:setMode', mode);
+    // C2g-hotfix-6 — every DELIVERED mode can start the knob's elastic slide (boot-time slide
+    // included), so arm the flip room here too. A same-mode push runs no transition and a
+    // re-arm is harmless (620 ms later, syncBounds finds no drift). Early-returns inside
+    // beginPillFlip for non-A styles.
+    beginPillFlip();
+  };
+
+  // C2g-hotfix-6 FIX 2 — Style A flip room: called from the `pill:flip` relay BEFORE the
+  // renderer even starts its guarded switch (room big before the knob's class lands) and from
+  // setPillMode's delivery path. Re-flips re-arm idempotently (a rapid storm holds the room;
+  // ONE snap PILL_A_FLIP_ROOM_HOLD_MS after the last flip, onto the settled pixel-identical
+  // pill). Style B is unaffected: its bloom/collapse room logic owns bounds while style B.
+  const beginPillFlip = (): void => {
+    if (!pillView || pillStyle !== 'A') return;
+    pillFlipPending = true;
+    if (pillFlipHold !== null) clearTimeout(pillFlipHold);
+    pillFlipHold = setTimeout(() => {
+      pillFlipHold = null;
+      pillFlipPending = false; // room returns to the exact rest footprint
+      syncBounds();
+    }, PILL_A_FLIP_ROOM_HOLD_MS);
+    syncBounds(); // grow NOW (before the knob's class lands)
   };
 
   // C2g FIX 3 — bloom coupling. Idempotent + validated: Style A never blooms, and a request for
@@ -469,9 +518,11 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
     if (pillStyle === style) return;
     pillStyle = style;
     if (style === 'A') pillBlooming = false; // A's footprint is always the full pill
-    // C2g-hotfix-5 — a right-click mid-collapse must leave NO stale room-hold timer behind
-    // (the new style's footprint is asserted right below).
+    // C2g-hotfix-5/6 — a right-click mid-collapse or mid-flip must leave NO stale room-hold
+    // timer behind (the new style's footprint is asserted right below).
     if (pillCollapseHold !== null) { clearTimeout(pillCollapseHold); pillCollapseHold = null; }
+    if (pillFlipHold !== null) { clearTimeout(pillFlipHold); pillFlipHold = null; }
+    pillFlipPending = false;
     savePillStyle(style);
     console.log('[pill] style persisted:', style);
     syncBounds();
@@ -550,6 +601,7 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
     syncBounds,
     setPillMode,
     setPillBloom,
+    beginPillFlip,
     setPillStyle,
     resyncPill,
     pillConsoleTail: () => [...pillConsole],
@@ -660,8 +712,10 @@ export function initCloud(mainWindow: BrowserWindow): CloudController {
       // divergence the cleared-store leg exercises).
       pillStyle = loadPillStyle();
       pillBlooming = false; // a fresh layer always boots at rest
-      // C2g-hotfix-5 — battery relaunch must boot with no stale collapse-hold timer.
+      // C2g-hotfix-5/6 — battery relaunch must boot with no stale room-hold timers.
       if (pillCollapseHold !== null) { clearTimeout(pillCollapseHold); pillCollapseHold = null; }
+      if (pillFlipHold !== null) { clearTimeout(pillFlipHold); pillFlipHold = null; }
+      pillFlipPending = false;
       syncBounds();
       pillLoaded = false;
       await pillView.webContents.loadURL(pillPageUrl(loadPillStyle()));

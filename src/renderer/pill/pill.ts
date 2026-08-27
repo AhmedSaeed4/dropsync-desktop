@@ -134,12 +134,31 @@ root?.addEventListener('mouseenter', () => {
   if (bloomed) return;
   bloomed = true; // logical state FIRST — collapse/circle-click logic must stay correct while hidden
   const pillEl = document.getElementById('pillB');
-  if (pillEl) {
-    pillEl.style.visibility = 'hidden'; /* instant, transition-free blank across the room swap */
-    pillEl.classList.remove('bloomed');
-  }
-  requireBridge('bloom')?.bloom(true); /* room swaps over blank paint */
   if (!pillEl) return;
+  if (window.innerWidth > 28) {
+    // C2g-hotfix-6 FIX 1 — RE-ENTRY while the room is ALREADY big (collapse hold pending or a
+    // just-regrown bloom): NO gate, NO visibility churn, NO poll. Nothing here can flash, so
+    // nothing may blink — the old unconditional hide could present one fully-blank frame when
+    // this configuration raced real-machine scheduling (the owner's caught-on-frame blink).
+    // bloom(true) lands on main's existing 132 × 44 hold and CANCELS it — the room never
+    // shrinks under the returning cursor.
+    // Accepted micro-residual (do NOT blank for it): if main's snap fired between the owner's
+    // leave and re-entry (knife-edge), the room resizes 132→28→132 around the visible rebloom —
+    // ≤2 frames of ≤6 px settle twitch on small mid-shrink paint.
+    pillEl.classList.add('bloomed'); /* CSS rebloom starts from the CURRENT width */
+    requireBridge('bloom')?.bloom(true);
+    return;
+  }
+  /* FROM REST (room still exactly 28): the full hotfix-5 entry choreography — hide the paint
+   * INSTANTLY and transition-free (inline `visibility:hidden`; NOT opacity — the dots/inner own
+   * their opacity transitions), send `pill:bloom(true)` so the native swap happens over BLANK
+   * paint, then reveal ONLY when the page can see that the room landed (`innerWidth > 28`) —
+   * the CSS bloom starts fresh from width 28 in its FINAL room. The reveal re-checks `bloomed`
+   * (a graze that collapsed during the hidden window restores clean rest paint instead of
+   * resurrecting a dead bloom); the safety timeout guarantees no stuck-hidden paint. */
+  pillEl.style.visibility = 'hidden'; /* instant, transition-free blank across the room swap */
+  pillEl.classList.remove('bloomed');
+  requireBridge('bloom')?.bloom(true); /* room swaps over blank paint */
   const startedAt = Date.now();
   const reveal = (): void => {
     if (!bloomed) { // collapsed while hidden (fast graze): restore clean REST paint, no bloom class
