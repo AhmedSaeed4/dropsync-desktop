@@ -83,6 +83,12 @@ let appMode: 'cloud' | 'local' = 'local'; // relaunch always starts Local in C1 
 /** Assigned by registerIpc — shared by mode:set and the DEV probe's switch storm. */
 let applyCloudMode: (next: 'cloud' | 'local') => Promise<'cloud' | 'local'> = async () => appMode;
 let pillFlipRelayCount = 0; // C2g-hotfix-1 §5 — receipts of REAL pill:flip ipc (incremented in the relay)
+/** C2m — USER-FLIP ARM for the flip dissolve: the pill:flip ipc handler stamps this; applyMode
+ * melts iff Date.now() - transitionArmedAt < 10 s (the flag self-expires, so a cancelled
+ * unsaved-guard leaves nothing behind). Boot-into-last-mode, dev probes, battery storms and
+ * every programmatic applyMode NEVER arm it — they stay instant. One-shot: applyMode clears
+ * it on read. The DEV battery writes it directly to simulate the pill path's arm step. */
+let transitionArmedAt = 0;
 /** DEV-only: the C1/C2 battery reloads the renderer (memory test) — this guard keeps its
  * did-finish-load handler from re-triggering the whole sequence on every reload. */
 let cloudDevBatteryStarted = false;
@@ -4289,11 +4295,13 @@ function createWindow(): void {
               }
               const childViews = win.contentView.children.length;
               const stormPill = await cloudCtl.pillProbe();
-              // C2j — childViews is now 3: site + card + pill (the card layer is a PERMANENT
-              // third native view, added below the pill per the C2j z-law). The intent of this
-              // assert is unchanged — the flip storm must not leak/duplicate views (a leaked
-              // site would read 4+); the +1 is the card's accounted-for membership.
-              const expectedChildViews = 3;
+              // C2m — childViews is now 4: site + fader + card + pill (the fader layer is a
+              // PERMANENT fourth native view, added below the card/pill per the C2m z-law,
+              // collapsed 0×0 + hidden at rest). The intent of this assert is unchanged — the
+              // flip storm must not leak/duplicate views (a leaked site would read 5+); the
+              // +1 is the fader's accounted-for membership (same accounting-for bump the C2j
+              // card addition used).
+              const expectedChildViews = 4;
               // C2g-hotfix-6 — each mode delivery now arms the Style A flip room (124 × 28,
               // contract-coupled hold), so the "rest footprint" part of this key must be read
               // AFTER the hold snaps back to exactly 112 × 28. Persistence facts (view reuse,
@@ -4342,7 +4350,11 @@ function createWindow(): void {
                   && iso.pillDropsyncType === 'undefined' && iso.pillBridgeType === 'object'
                   // C2j — the card bridge exists ONLY on the card page (never site, never pill).
                   && iso.pillCardBridgeType === 'undefined'
-                  && iso.cardDropsyncType === 'undefined' && iso.cardBridgeType === 'object',
+                  && iso.cardDropsyncType === 'undefined' && iso.cardBridgeType === 'object'
+                  // C2m — the fader bridge exists ONLY on the fader page (never site/pill/card).
+                  && iso.faderDropsyncType === 'undefined' && iso.faderBridgeType === 'object'
+                  && iso.faderCardBridgeType === 'undefined'
+                  && iso.pillFaderBridgeType === 'undefined' && iso.cardFaderBridgeType === 'undefined',
                 isolationRaw: iso,
                 f_c1_authSeen: auth.firebaseAuthKeys > 0 || auth.accountChip,
                 authSeenRaw: auth,
@@ -4694,6 +4706,156 @@ function createWindow(): void {
                 // the vault theme is back for the dead-last C2h idle stage that follows.
               }
 
+              // (5d) C2m — f_c2m_flipDissolve — THE FLIP DISSOLVE battery. Placed per order:
+              // immediately AFTER the C2j stage (Local + unlocked + card inert) and BEFORE the
+              // dead-last C2h idle stage. User flips are driven through the REAL relay
+              // (`pill:flipRequested`, as the existing robot legs do) with the ARM step a real
+              // click performs: the `pill:flip` ipc handler stamps transitionArmedAt, so each
+              // armed leg stamps it here directly (the identical write, same module variable)
+              // before the relay — FIX 3's gate in applyMode reads exactly this. STEP 0.5
+              // outcome B: no click pass-through API exists on this Electron build (spike,
+              // 2026-08-28), so leg 2's PROMPT 0×0 collapse IS the zero-miss-click guarantee.
+              // C2m-hotfix-1 (THE COVERED SWAP): meltLeg now also asserts the curtain comes up
+              // BEFORE the world swap (in-flight + full-ish bounds while appMode is STILL the
+              // outgoing mode — sampled at 25 ms; decode ≈ tens of ms) — one continuous
+              // dissolve, no new-world peek-through.
+              {
+                const faderSnap = (): Promise<{ attached: boolean; inFlight: boolean; bounds: Electron.Rectangle | null; collapsed: boolean }> =>
+                  cloudCtl!.faderProbe();
+                type FaderSnap = Awaited<ReturnType<typeof faderSnap>>;
+                const fullish = (b: FaderSnap['bounds']): boolean => {
+                  const cb = win.getContentBounds();
+                  return !!b && b.x === 0 && b.y === 0
+                    && Math.abs(b.width - cb.width) <= 2 && Math.abs(b.height - cb.height) <= 2;
+                };
+                const flat = (b: FaderSnap['bounds']): boolean => !!b && b.width === 0 && b.height === 0;
+                /** One melt round-trip: ARM + relay, poll for the in-flight window (bounds ≈
+                 * content) at 25 ms cadence — the FIRST observable fact must be the curtain up
+                 * while appMode is STILL the outgoing mode (covered swap) — then poll settle
+                 * to collapsed 0×0. */
+                const meltLeg = async (next: 'cloud' | 'local') => {
+                  const outgoing = appMode; // the world on screen BEFORE the relay lands
+                  transitionArmedAt = Date.now(); // the pill:flip handler's exact arm write
+                  win.webContents.send('pill:flipRequested', next);
+                  let inFlightSnap: FaderSnap | null = null;
+                  let coveredSwap = false;
+                  let curtainUpAt = -1; // first in-flight (full-ish bounds) observation, ms clock
+                  const t0 = Date.now();
+                  while (Date.now() - t0 < 1000) { // melt window ≈ decode + pad + fade + delay
+                    const p = await faderSnap();
+                    if (p.inFlight && p.attached && fullish(p.bounds)) {
+                      inFlightSnap = p;
+                      curtainUpAt = Date.now();
+                      coveredSwap = appMode === outgoing; // curtain BEFORE the swap ⇒ no peek
+                      break;
+                    }
+                    if (!p.inFlight && flat(p.bounds) && Date.now() - t0 > 700) break; // already over
+                    await sleep(25);
+                  }
+                  // C2m-hotfix-1 — the mode applies only AFTER the ready handshake (the swap
+                  // waits for the painted curtain), so "later" is sampled explicitly: poll
+                  // until the flip lands, THEN read modeAfterArm (in C2m the swap preceded the
+                  // observable in-flight, so the old single-sample read the applied mode).
+                  const tMode = Date.now();
+                  while (Date.now() - tMode < 800 && appMode !== next) await sleep(20);
+                  const modeAfterArm = appMode;
+                  // C2m-hotfix-2 — observed span from curtain-up to the flip landing: the
+                  // MELT_SWAP_PAD_MS headroom + decode tail + poll resolution. The battery
+                  // cannot observe `fader:ready` directly (main-internal), so this is the
+                  // honest observable proxy — printed raw per leg.
+                  const swapPadMs = curtainUpAt >= 0 ? Date.now() - curtainUpAt : -1;
+                  let settledSnap: FaderSnap | null = null;
+                  const t1 = Date.now();
+                  while (Date.now() - t1 < 1200) { // settle: inFlight clears, footprint 0×0
+                    const p = await faderSnap();
+                    if (!p.inFlight && flat(p.bounds) && p.attached) { settledSnap = p; break; }
+                    await sleep(25);
+                  }
+                  return { inFlightSnap, settledSnap, modeAfterArm, coveredSwap, swapPadMs, next };
+                };
+
+                // Start Local through the REAL relay (renderer re-synced, c2f-storm discipline).
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+
+                // LEG 1+2 — Local→Cloud: melt observed in-flight (≈ full-window fader), then a
+                // prompt settle to 0×0; the mode applied REGARDLESS of the effect.
+                const legOut = await meltLeg('cloud');
+                // LEG 3+4 — Cloud→Local: same two legs, both directions dissolve.
+                await sleep(400);
+                const legHome = await meltLeg('local');
+
+                // LEG 5 — RAPID STORM: three armed flips ~150 ms apart — melts cancel serially
+                // (owner decision 4), nothing stacks, no leaked/duplicated views (children 4).
+                transitionArmedAt = Date.now();
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(150);
+                transitionArmedAt = Date.now();
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(150);
+                transitionArmedAt = Date.now();
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(1500);
+                const stormProbe = await faderSnap();
+                const stormChildViews = win.contentView.children.length;
+                const stormFinalMode = appMode;
+
+                // LEG 6 — SYSTEM flips don't dissolve: drive applyCloudMode DIRECTLY (the storm
+                // path). No arm ⇒ NO in-flight window observable (sampled immediately + a few
+                // beats); the mode still flips.
+                // C2m-hotfix-2 — clear any STALE USER ARM first: a storm flip the RENDERER
+                // dropped (its in-flight switch guard eats a relay that lands mid-switch —
+                // more likely since the hotfix pads widened the apply window) leaves a warm
+                // transitionArmedAt that would LEGITIMATELY melt this programmatic flip inside
+                // FIX 3's 10 s expiry. Leg 6's premise is "a system flip carries no user arm"
+                // — make the premise literal instead of timing-dependent.
+                transitionArmedAt = 0;
+                const sysSamples: FaderSnap[] = [];
+                await applyCloudMode('local');
+                sysSamples.push(await faderSnap());
+                await sleep(80);
+                sysSamples.push(await faderSnap());
+                await sleep(200);
+                sysSamples.push(await faderSnap());
+                const sysMode = appMode;
+
+                const meltOk = (leg: Awaited<ReturnType<typeof meltLeg>>): boolean =>
+                  !!leg.inFlightSnap && leg.inFlightSnap.inFlight && leg.inFlightSnap.attached
+                  && fullish(leg.inFlightSnap.bounds)
+                  && leg.coveredSwap // C2m-hotfix-1 — curtain BEFORE the swap, both directions
+                  && !!leg.settledSnap && !leg.settledSnap.inFlight && flat(leg.settledSnap.bounds)
+                  && leg.modeAfterArm === leg.next;
+                const f_c2m_flipDissolve = meltOk(legOut) && meltOk(legHome)
+                  && !stormProbe.inFlight && flat(stormProbe.bounds) && stormProbe.attached
+                  && stormChildViews === 4 && stormFinalMode === 'cloud'
+                  && sysSamples.every((p) => !p.inFlight) && sysMode === 'local';
+
+                console.log('[c2m]', JSON.stringify({
+                  f_c2m_flipDissolve,
+                  matrix: {
+                    outInFlight: !!legOut.inFlightSnap && legOut.inFlightSnap.inFlight && fullish(legOut.inFlightSnap.bounds),
+                    outCoveredSwap: legOut.coveredSwap,
+                    outSwapPadMs: legOut.swapPadMs,
+                    outSettledFlat: !!legOut.settledSnap && flat(legOut.settledSnap.bounds),
+                    homeInFlight: !!legHome.inFlightSnap && legHome.inFlightSnap.inFlight && fullish(legHome.inFlightSnap.bounds),
+                    homeCoveredSwap: legHome.coveredSwap,
+                    homeSwapPadMs: legHome.swapPadMs,
+                    homeSettledFlat: !!legHome.settledSnap && flat(legHome.settledSnap.bounds),
+                    stormCleanEnd: !stormProbe.inFlight && flat(stormProbe.bounds) && stormProbe.attached && stormChildViews === 4,
+                    systemFlipNeverMelts: sysSamples.every((p) => !p.inFlight && flat(p.bounds)) && sysMode === 'local',
+                  },
+                  raw: { legOut, legHome, stormProbe, stormChildViews, stormFinalMode, sysSamples, sysMode },
+                }));
+                // Re-sync renderer ⇄ main through the REAL relay after leg 6's main-side flip
+                // (the c2f-storm discipline): leg 6 leaves main LOCAL but the renderer still on
+                // 'cloud' — a battery-only desync that MUST NOT leak into the dead-last C2h
+                // idle stage (its own relay flip to 'cloud' would no-op against a cloud
+                // renderer). A relay flip to main's current mode re-aligns both sides.
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                // Leave Local — the dead-last C2h idle stage takes it from here.
+              }
+
               // (6) C2h FIX 6 — f_c2h_cloudActivityFeedsIdleLock — DEAD-LAST in this stage; its
               // cleanup leaves a sane unlocked Local stage for anything that might follow.
               //
@@ -4990,9 +5152,45 @@ function registerIpc(): void {
   // initCloud's `onUserActivity` dep in cloud.ts (gestures there → manager.touch()). Entering
   // Cloud still never requires a vault: touch() on a locked/none state is harmless. The old
   // "leaving Local locks it" rule (CLOUD-MODE-PLAN §5) was REOPENED by the owner 2026-08-27.
-  const applyMode = async (next: 'cloud' | 'local'): Promise<'cloud' | 'local'> => {
+  // C2m-hotfix-1 — overlapping flips SERIALIZE through a promise chain ("serial, like the
+  // card pump"): beginMelt's ready handshake widened applyMode's async window to ~100-200 ms,
+  // so a rapid flip arriving mid-melt used to early-return as a same-mode no-op (appMode not
+  // yet swapped ⇒ the guard misread it) — a DROPPED flip. The chain makes every queued flip
+  // apply, in arrival order. Rejections (invalid mode) still propagate to their caller
+  // without poisoning the chain (the next link runs on either outcome).
+  let modeApplyChain: Promise<'cloud' | 'local'> = Promise.resolve(appMode);
+  const applyModeNow = async (next: 'cloud' | 'local'): Promise<'cloud' | 'local'> => {
     if (next !== 'cloud' && next !== 'local') throw new Error('Invalid mode.');
     if (next === appMode) return appMode;
+    // C2m — the dissolve plays ONLY for USER-armed flips (pill:flip stamps transitionArmedAt;
+    // here the flag must still be warm). Boot-into-last-mode, dev probes, battery storms and
+    // every programmatic applyMode stay INSTANT. The Settings-modal switch line stays instant
+    // too (it never routes through pill:flip) — extendable later if the owner asks.
+    const armed = Date.now() - transitionArmedAt < 10_000;
+    transitionArmedAt = 0; // one-shot — an unapplied arm never outlives the next real flip
+    // C2m FIX 3 step 1 — capture the OUTGOING world BEFORE the swap (fail-open: any error or
+    // empty frame ⇒ null ⇒ today's instant flip; the effect can never break a flip).
+    // Cloud→Local captures the SITE view; Local→Cloud captures the MAIN window's page (the
+    // local page only — native overlays are separate views and never in the shot).
+    let png: string | null = null;
+    if (armed) {
+      try {
+        if (next === 'local') {
+          png = cloudCtl ? await cloudCtl.captureViewPng() : null;
+        } else if (mainWindow && !mainWindow.isDestroyed()) {
+          const image = await mainWindow.webContents.capturePage();
+          png = image.isEmpty() ? null : `data:image/png;base64,${image.toPNG().toString('base64')}`;
+        }
+      } catch {
+        png = null;
+      }
+    }
+    // C2m-hotfix-1 (THE COVERED SWAP) step 2 — raise the curtain FIRST: beginMelt inflates
+    // the fader over the OUTGOING world (identical pixels ⇒ seamless) and returns only when
+    // the snapshot is fully painted (or false on deadline ⇒ instant flip below). The world
+    // swap happens ONLY under a painted curtain — no new-world peek-through, no two-step melt.
+    let ready = false;
+    if (png && cloudCtl) ready = await cloudCtl.beginMelt(png);
     if (next === 'cloud') {
       appMode = 'cloud';
       if (!cloudCtl) throw new Error('Cloud controller unavailable.');
@@ -5003,7 +5201,18 @@ function registerIpc(): void {
     }
     // C2f FIX 2 — the knob slides ONLY when the mode ACTUALLY applied (never on request).
     cloudCtl?.setPillMode(appMode);
+    // C2m-hotfix-1 step 3 — the swap is hidden; start the fade over the live new world. No
+    // curtain in time ⇒ cancel (collapse) — the fail-open path, nothing left behind.
+    if (png && cloudCtl) {
+      if (ready) cloudCtl.runMelt();
+      else cloudCtl.cancelMelt();
+    }
     return appMode;
+  };
+  const applyMode = (next: 'cloud' | 'local'): Promise<'cloud' | 'local'> => {
+    const run = (): Promise<'cloud' | 'local'> => applyModeNow(next);
+    modeApplyChain = modeApplyChain.then(run, run);
+    return modeApplyChain;
   };
   applyCloudMode = applyMode;
   handle('mode:get', () => appMode);
@@ -5014,6 +5223,9 @@ function registerIpc(): void {
   ipcMain.on('pill:flip', (_e, next: 'cloud' | 'local') => {
     if (next !== 'cloud' && next !== 'local') return;
     if (!mainWindow || mainWindow.isDestroyed()) return;
+    // C2m — arm the flip dissolve: THIS ipc is the user path (the pill click). applyMode melts
+    // only while the stamp is warm (< 10 s); everything programmatic stays instant.
+    transitionArmedAt = Date.now();
     // C2g-hotfix-6 FIX 2 — arm the Style A flip room BEFORE relaying: the 124 × 28 skirt must
     // be in place before the renderer's guarded switch lands the knob's class and the elastic
     // transform starts (its overshoot paints past the trough's ends instead of clipping).
@@ -5045,6 +5257,16 @@ function registerIpc(): void {
   ipcMain.on('card:click', (_e, id: unknown) => {
     if (typeof id !== 'string' || id.length === 0) return;
     cloudCtl?.reminderClick(id);
+  });
+  // C2m — the fader page reports its melt settled (transitionend or the page's safety net):
+  // collapse to 0×0 + hidden NOW. Idempotent — the grace deadline and repeats are no-ops.
+  ipcMain.on('fader:done', () => {
+    cloudCtl?.faderDone();
+  });
+  // C2m-hotfix-1 — the fader page reports its curtain painted (snapshot decoded + committed):
+  // resolve the pending beginMelt ⇒ main may swap the world beneath it. Strays are no-ops.
+  ipcMain.on('fader:ready', () => {
+    cloudCtl?.faderReady();
   });
   // DEV-ONLY probes (I6): never registered without DROPSYNC_CLOUD_DEV=1.
   if (process.env.DROPSYNC_CLOUD_DEV === '1') {

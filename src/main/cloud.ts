@@ -78,6 +78,26 @@ export const AUTO_DISMISS_MS = 5500;
 export const NEXT_GAP_MS = 400;
 export const MAX_MISSED = 20;
 
+/** C2m — THE FLIP DISSOLVE: the outgoing world melts away over the live new world. 250 ms was
+ * picked by the owner from a live demo they could feel (desktop-docs/mode-flip-fade-preview.html).
+ * The grace is the main-side settle deadline: `fader:done` from the page OR this timer,
+ * whichever first — both paths idempotent (the fader can never stay inflated).
+ * C2m-hotfix-1 (THE COVERED SWAP): beginMelt waits for the page's `fader:ready` (curtain
+ * painted) at most THIS long; on deadline it resolves false ⇒ the flip proceeds instantly
+ * (fail-open — a curtain that never paints never blocks a flip). */
+export const FLIP_FADE_MS = 250;
+export const FADER_DONE_GRACE_MS = 500;
+export const MELT_READY_TIMEOUT_MS = 400;
+/** C2m-hotfix-2 (PRESENTATION HEADROOM) — `fader:ready` fires on LAYOUT commit (the reflow),
+ * not on PRESENTED pixels. Owner 2026-08-28: still flickered 7-8/10 — the curtain's first
+ * painted frame raced the old world's removal across two independent rendering pipelines and
+ * the removal usually won by 1-3 frames. This pad lets the curtain's first frames REACH THE
+ * SCREEN before the world beneath changes: beginMelt resolves true only after the pad — 2-3
+ * presented frames of headroom. Invisible by construction (the screen shows the outgoing
+ * world under the identical curtain pixels); the melt starts ~50 ms later, still well inside
+ * the pill knob's 600 ms swing. */
+export const MELT_SWAP_PAD_MS = 50;
+
 /** C2g-hotfix-4 FIX 2 — Style-B BLOOM-TIME breathing room ONLY (explicit owner-approved
  * trade-off). While bloomed, the native room grows to 132 × 44 so TWO things never clip inside
  * the page: the contracted elastic overshoot (bezier peaks ≈ +8 px past 112 mid-bounce) and the
@@ -183,8 +203,9 @@ export interface CloudController {
   /** Probe data for DROPSYNC_CLOUD_DEV: did-finish-load latency for the site origin, if loaded. */
   probeState(): { readyMs: number | null; url: string | null };
   /** f_c1_isolationGuard — evaluate INSIDE the cloud contents (I1: no bridge may exist), now
-   * ALSO covering the pill layer (its bridge must be `dropsyncPill`, never `dropsync`) and,
-   * C2j, the card layer (`dropsyncCard` exists ONLY on the card page — never site, never pill). */
+   * ALSO covering the pill layer (its bridge must be `dropsyncPill`, never `dropsync`), and,
+   * C2j, the card layer (`dropsyncCard` exists ONLY on the card page — never site, never pill)
+   * and, C2m, the fader layer (`dropsyncFader` exists ONLY on the fader page — same pin). */
   probeIsolation(): Promise<{
     dropsyncType: string;
     hasPreloadKey: true;
@@ -193,6 +214,11 @@ export interface CloudController {
     pillCardBridgeType: string;
     cardDropsyncType: string;
     cardBridgeType: string;
+    faderDropsyncType: string;
+    faderBridgeType: string;
+    faderCardBridgeType: string;
+    pillFaderBridgeType: string;
+    cardFaderBridgeType: string;
   }>;
   /**
    * f_c1_authSeen — READ-ONLY signed-in marker inside the persist:cloud session. Marker chain
@@ -288,6 +314,39 @@ export interface CloudController {
   /** C2j — battery-only hermetic purge of ALL card/missed state (env-gated like pillDrive):
    * queues, timers, the live card. The missed-queue unit leg uses it to stay deterministic. */
   cardTestReset(): Promise<void>;
+  /** C2m-hotfix-1 (THE COVERED SWAP) — PHASE 1: inflate the fader over the OUTGOING world and
+   * hand it the still frame (`png`, a PNG data URL captured by index.ts BEFORE the swap),
+   * then await the page's `fader:ready` (curtain painted). true ⇒ the caller swaps the world
+   * beneath the curtain; false ⇒ fail-open instant flip (MELT_READY_TIMEOUT_MS deadline, page
+   * not loaded, or a cancel). Serial: a new flip while a melt is in flight collapses
+   * instantly and proceeds. STEP 0.5 outcome B: no click pass-through exists on this Electron
+   * build — the melt is owner-accepted click-waited, which is exactly why settle collapses to
+   * 0×0 promptly (zero-miss rule). */
+  beginMelt(pngBase64: string): Promise<boolean>;
+  /** C2m-hotfix-1 — PHASE 2: the swap is complete — fire the fade + arm the settle deadline
+   * (`fader:done` OR FADER_DONE_GRACE_MS). No-op without an in-flight melt. */
+  runMelt(): void;
+  /** C2m-hotfix-1 — fail-open: collapse + clear in-flight (no curtain in time ⇒ instant flip). */
+  cancelMelt(): void;
+  /** C2m-hotfix-1 — the layer's `fader:ready` landed (ipcMain in index.ts forwards here):
+   * resolve the pending beginMelt with true; strays are no-ops. */
+  faderReady(): void;
+  /** C2m — the layer's `fader:done` landed (ipcMain in index.ts forwards here): collapse now.
+   * Idempotent — the grace timer and repeated dones are all no-ops once settled. */
+  faderDone(): void;
+  /** C2m — capture the CURRENT site view as a PNG data URL for the melt (main-process
+   * compositor READ — same class as the C2h sendInputEvent sensing; nothing is injected or
+   * navigated, I1/I6 intact). null on ANY failure/empty frame (fail-open — owner decision 5). */
+  captureViewPng(): Promise<string | null>;
+  /** C2m — fader-layer evidence for f_c2m_flipDissolve: attach/z-membership, melt-in-flight
+   * (spans begin→settle — same meaning for the battery), live bounds, and the
+   * collapsed-at-rest fact (no lingering click-catcher). */
+  faderProbe(): Promise<{
+    attached: boolean;
+    inFlight: boolean;
+    bounds: Electron.Rectangle | null;
+    collapsed: boolean;
+  }>;
 }
 
 /** https-only external handoff (I2). Returns true when handed off. */
@@ -406,6 +465,14 @@ function cardPageUrl(): string {
   return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/card/card.html');
 }
 
+/** C2m — where the FADER page lives (cloned from cardPageUrl): dev server in dev, built
+ * multi-page output in production. No query params — the fader carries no persisted state. */
+function faderPageUrl(): string {
+  const devRoot = process.env.ELECTRON_RENDERER_URL;
+  if (devRoot) return `${devRoot}/fader/fader.html`;
+  return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/fader/fader.html');
+}
+
 export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: () => void }): CloudController {
   // C2h FIX 2/3 — main-provided activity feed: gestures sensed on the cloud view call this
   // (wired in index.ts to manager.touch()), so Cloud input feeds the SAME idle clock as Local.
@@ -429,6 +496,21 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
   let pillFlipPending = false;
   let pillFlipHold: ReturnType<typeof setTimeout> | null = null;
   const pillConsole: string[] = []; // C2g-hotfix-1 §5 — layer console ring buffer
+  // C2m — the fader layer is created EAGERLY at boot (card recipe) and NEVER removed; it is
+  // collapsed 0×0 + hidden at rest, so it paints nothing and catches nothing until a melt.
+  let faderView: WebContentsView | null = null;
+  let faderLoaded = false;
+  let faderInFlight = false; // a melt is playing RIGHT NOW — begin→settle (bounds = full window)
+  let faderDoneTimer: ReturnType<typeof setTimeout> | null = null; // grace settle deadline
+  // C2m-hotfix-1 — the pending `fader:ready` handshake: beginMelt's promise resolves true when
+  // the page reports the curtain painted, false on the deadline (or any collapse — a cancel
+  // must NEVER leave a beginMelt awaiter hanging).
+  let faderReadyResolve: ((ok: boolean) => void) | null = null;
+  let faderReadyTimer: ReturnType<typeof setTimeout> | null = null;
+  // C2m-hotfix-2 — the swap pad: `fader:ready` does NOT resolve the awaiter directly; the pad
+  // timer does (presented-pixels headroom). Cleared by collapseFader with the same discipline
+  // as the ready deadline — no pad may fire after a cancel, no awaiter may hang.
+  let faderSwapPadTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Shared load-finished path for boot AND battery-driven layer relaunches (C2g FIX 4). */
   const onPillLoadFinished = (): void => {
@@ -502,6 +584,17 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
       if (cur.x !== expected.x || cur.y !== expected.y || cur.width !== expected.width || cur.height !== expected.height) {
         cardView.setBounds(expected);
         console.log('[card] bounds set', JSON.stringify({ from: cur, to: expected }));
+      }
+    }
+    // C2m — the fader joins the self-heal: full-window rect while a melt is in flight,
+    // collapsed 0×0 at rest (zero-footprint discipline — the 1 s watchdog re-asserts BOTH,
+    // so even a missed collapse is corrected within a second). Idempotent.
+    if (faderView) {
+      const expected = faderInFlight ? faderBounds() : faderCollapsedBounds();
+      const cur = faderView.getBounds();
+      if (cur.x !== expected.x || cur.y !== expected.y || cur.width !== expected.width || cur.height !== expected.height) {
+        faderView.setBounds(expected);
+        console.log('[fader] bounds set', JSON.stringify({ from: cur, to: expected }));
       }
     }
   };
@@ -684,6 +777,168 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     pumpCard(); // a fire that arrived before the page was ready displays now
   };
 
+  // ==== C2m — THE FADER LAYER (the flip dissolve) — card recipe verbatim ====
+
+  /** The melt room: the window's content area (the world's exact footprint). Same math as
+   * siteBounds — a pure function of the window, so the watchdog re-asserts it for free. */
+  const faderBounds = (): Electron.Rectangle => siteBounds();
+  /** At rest the fader is NOTHING: 0×0 at the origin, hidden (zero-miss rule — STEP 0.5 proved
+   * a full-window overlay intercepts every click, so rest MUST be collapsed + invisible). */
+  const faderCollapsedBounds = (): Electron.Rectangle => ({ x: 0, y: 0, width: 0, height: 0 });
+
+  /** Z-ORDER LAW (C2m, extends C2j): site view < faderView < cardView < pillView ALWAYS — the
+   * melt covers ONLY the world; card and pill stay crisp above it. After ANY attach of the
+   * site view or the fader, re-stack in order fader → card → pill (children paint in
+   * add-order — the existing raise* idiom: remove+add). */
+  const raiseFader = (): void => {
+    if (!faderView || mainWindow.isDestroyed()) return;
+    mainWindow.contentView.removeChildView(faderView);
+    mainWindow.contentView.addChildView(faderView);
+  };
+
+  const ensureFader = (): WebContentsView => {
+    if (faderView) return faderView;
+    faderView = new WebContentsView({
+      webPreferences: {
+        preload: join(fileURLToPath(new URL('.', import.meta.url)), '../preload/faderPreload.cjs'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+    faderView.setBackgroundColor('#00000000'); // WSLg-transparency-safe (pill precedent)
+    attachPillLockdown(faderView.webContents); // same trusted-layer lockdown: no nav, no popups
+    faderView.webContents.once('did-finish-load', () => {
+      faderLoaded = true;
+      console.log('[fader] layer loaded');
+    });
+    void faderView.webContents.loadURL(faderPageUrl());
+    faderView.setBounds(faderCollapsedBounds()); // COLLAPSED + hidden until a melt plays
+    faderView.setVisible(false);
+    // Added FIRST at boot (before card and pill) ⇒ the z-order law (site < fader < card < pill)
+    // holds from the very first frame.
+    mainWindow.contentView.addChildView(faderView);
+    return faderView;
+  };
+
+  /** The ONE settle path — `fader:done` from the page, the FADER_DONE_GRACE_MS deadline, or a
+   * cancel-by-new-flip: all three land here. Idempotent; collapse = 0×0 + hidden + clear
+   * in-flight (prompt, because with no pass-through API the inflated fader IS a click
+   * catcher — zero-miss rule). C2m-hotfix-1: a pending `fader:ready` handshake is resolved
+   * FALSE here too — a cancel/early-done must never leave beginMelt's awaiter hanging.
+   * C2m-hotfix-2: a pending swap pad is cleared with the same discipline (no pad fires after
+   * a cancel). */
+  const collapseFader = (): void => {
+    if (faderDoneTimer !== null) {
+      clearTimeout(faderDoneTimer);
+      faderDoneTimer = null;
+    }
+    if (faderReadyTimer !== null) {
+      clearTimeout(faderReadyTimer);
+      faderReadyTimer = null;
+    }
+    if (faderSwapPadTimer !== null) {
+      clearTimeout(faderSwapPadTimer);
+      faderSwapPadTimer = null;
+    }
+    if (faderReadyResolve !== null) {
+      const resolve = faderReadyResolve;
+      faderReadyResolve = null;
+      resolve(false);
+    }
+    faderInFlight = false;
+    if (faderView && !mainWindow.isDestroyed()) {
+      faderView.setBounds(faderCollapsedBounds());
+      faderView.setVisible(false);
+    }
+  };
+
+  /** C2m-hotfix-1 — PHASE 1 of the covered swap: inflate the fader and hand it the outgoing
+   * world's still frame (`png`, captured BEFORE the swap by index.ts), then WAIT for the
+   * page's `fader:ready` (curtain painted) PLUS the hotfix-2 swap pad (presented pixels).
+   * Resolves true ⇒ the caller may swap the world beneath the curtain; false ⇒ fail-open
+   * instant flip (deadline, page not loaded, or a cancel). A new flip while a melt is in
+   * flight collapses instantly (cancel — owner decision 4) and proceeds. The settle grace is
+   * NOT armed here — runMelt owns it. */
+  const beginMelt = (png: string): Promise<boolean> => {
+    const v = ensureFader();
+    if (!faderLoaded) return Promise.resolve(false); // page not ready (sub-second boot) — instant flip
+    collapseFader(); // cancel any in-flight melt NOW (idempotent; resolves any stale pending)
+    faderInFlight = true;
+    v.setBounds(faderBounds()); // the window's content area
+    v.setVisible(true);
+    raiseFader(); // above the OUTGOING world (the swap has not happened yet)...
+    raiseCard(); // ...but below card + pill — the FULL z-law re-asserted in order
+    raisePill();
+    const promise = new Promise<boolean>((resolve) => {
+      faderReadyResolve = resolve;
+      faderReadyTimer = setTimeout(() => {
+        if (faderReadyResolve === null) return;
+        const resolve = faderReadyResolve;
+        faderReadyResolve = null;
+        faderReadyTimer = null;
+        resolve(false);
+      }, MELT_READY_TIMEOUT_MS);
+    });
+    v.webContents.send('fader:show', { image: png, ms: FLIP_FADE_MS });
+    // STEP 0.5 outcome B (2026-08-28 spike): no pass-through API exists on Electron 43 — the
+    // inflated curtain is a click catcher until settle; owner-accepted click-wait stands.
+    return promise;
+  };
+
+  /** C2m-hotfix-1 — the page's `fader:ready` landed (ipcMain in index.ts forwards here):
+   * C2m-hotfix-2 — do NOT resolve the awaiter directly: arm the MELT_SWAP_PAD_MS pad so the
+   * curtain's first frames reach the SCREEN before the caller swaps the world (ready = layout
+   * commit, not presented pixels). A stray ready with none pending = no-op. */
+  const faderReady = (): void => {
+    if (faderReadyTimer !== null) {
+      clearTimeout(faderReadyTimer);
+      faderReadyTimer = null;
+    }
+    if (faderReadyResolve !== null && faderSwapPadTimer === null) {
+      faderSwapPadTimer = setTimeout(() => {
+        faderSwapPadTimer = null;
+        if (faderReadyResolve !== null) {
+          const resolve = faderReadyResolve;
+          faderReadyResolve = null;
+          resolve(true);
+        }
+      }, MELT_SWAP_PAD_MS);
+    }
+  };
+
+  /** C2m-hotfix-1 — PHASE 2: the swap is complete beneath the painted curtain — fire the fade
+   * and arm the settle deadline (`fader:done` OR the grace timer, whichever first). Idempotent:
+   * without in-flight it is a no-op; a double call re-arms nothing twice. */
+  const runMelt = (): void => {
+    if (!faderInFlight || !faderView || mainWindow.isDestroyed()) return;
+    faderView.webContents.send('fader:run');
+    if (faderDoneTimer === null) {
+      faderDoneTimer = setTimeout(collapseFader, FADER_DONE_GRACE_MS);
+    }
+  };
+
+  /** C2m-hotfix-1 — the fail-open path: the curtain never painted in time (or the flip ran
+   * snapshot-less) ⇒ collapse + clear in-flight — today's instant flip, nothing left behind. */
+  const cancelMelt = (): void => {
+    collapseFader();
+  };
+
+  /** Compositor READ of the current site view (Cloud→Local's outgoing world). No injection,
+   * no navigation — I1/I6 intact. Fail-open: any error or empty frame ⇒ null (instant flip). */
+  const captureViewPng = async (): Promise<string | null> => {
+    if (!view || !shown || view.webContents.isDestroyed()) return null;
+    try {
+      const image = await view.webContents.capturePage();
+      if (image.isEmpty()) return null;
+      return `data:image/png;base64,${image.toPNG().toString('base64')}`;
+    } catch {
+      return null;
+    }
+  };
+
+  // ==== END C2m fader layer ====
+
   const ensureCard = (): WebContentsView => {
     if (cardView) return cardView;
     cardView = new WebContentsView({
@@ -840,6 +1095,9 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     if (!shown) {
       mainWindow.contentView.addChildView(v);
       shown = true;
+      // The site view was just stacked ON TOP of everything — undo, in z-law order (C2m:
+      // fader → card → pill; the melt layer lives just above the site view, C2j z-law).
+      raiseFader();
       raiseCard(); // the site view was just stacked ON TOP of the card too — undo (C2j z-law)
       raisePill(); // the site view was just stacked ON TOP of the pill — undo that, always
     }
@@ -880,8 +1138,11 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     blurPill,
     probeState: () => ({ readyMs, url: view ? CLOUD_URL : null }),
     probeIsolation: async () => {
-      if (!view || !pillView || !cardView) {
-        return { dropsyncType: 'no-view', hasPreloadKey: true as const, pillDropsyncType: 'no-view', pillBridgeType: 'no-view', pillCardBridgeType: 'no-view', cardDropsyncType: 'no-view', cardBridgeType: 'no-view' };
+      if (!view || !pillView || !cardView || !faderView) {
+        return {
+          dropsyncType: 'no-view', hasPreloadKey: true as const, pillDropsyncType: 'no-view', pillBridgeType: 'no-view', pillCardBridgeType: 'no-view', cardDropsyncType: 'no-view', cardBridgeType: 'no-view',
+          faderDropsyncType: 'no-view', faderBridgeType: 'no-view', faderCardBridgeType: 'no-view', pillFaderBridgeType: 'no-view', cardFaderBridgeType: 'no-view',
+        };
       }
       const dropsyncType = await view.webContents.executeJavaScript('typeof window.dropsync');
       // The pill layer must have ITS bridge and NEVER the main app's.
@@ -891,7 +1152,13 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
       const pillCardBridgeType = await pillView.webContents.executeJavaScript('typeof window.dropsyncCard');
       const cardDropsyncType = await cardView.webContents.executeJavaScript('typeof window.dropsync');
       const cardBridgeType = await cardView.webContents.executeJavaScript('typeof window.dropsyncCard');
-      return { dropsyncType, hasPreloadKey: true as const, pillDropsyncType, pillBridgeType, pillCardBridgeType, cardDropsyncType, cardBridgeType };
+      // C2m — the fader bridge exists ONLY on the fader page (never site, pill, or card).
+      const faderDropsyncType = await faderView.webContents.executeJavaScript('typeof window.dropsync');
+      const faderBridgeType = await faderView.webContents.executeJavaScript('typeof window.dropsyncFader');
+      const faderCardBridgeType = await faderView.webContents.executeJavaScript('typeof window.dropsyncCard');
+      const pillFaderBridgeType = await pillView.webContents.executeJavaScript('typeof window.dropsyncFader');
+      const cardFaderBridgeType = await cardView.webContents.executeJavaScript('typeof window.dropsyncFader');
+      return { dropsyncType, hasPreloadKey: true as const, pillDropsyncType, pillBridgeType, pillCardBridgeType, cardDropsyncType, cardBridgeType, faderDropsyncType, faderBridgeType, faderCardBridgeType, pillFaderBridgeType, cardFaderBridgeType };
     },
     probeAuthSeen: async () => {
       if (!view) return { firebaseAuthKeys: -1, accountChip: false };
@@ -1071,13 +1338,35 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
       }
       syncBounds(); // collapse the footprint immediately (no hide-hold in the hermetic reset)
     },
+    beginMelt,
+    runMelt,
+    cancelMelt,
+    faderReady,
+    faderDone: collapseFader, // `fader:done` and the grace deadline land on the ONE settle path
+    captureViewPng,
+    faderProbe: async () => {
+      if (!faderView || mainWindow.isDestroyed()) {
+        return { attached: false, inFlight: false, bounds: null, collapsed: true };
+      }
+      const b = faderView.getBounds();
+      return {
+        attached: mainWindow.contentView.children.includes(faderView),
+        inFlight: faderInFlight,
+        bounds: b,
+        collapsed: b.x === 0 && b.y === 0 && b.width === 0 && b.height === 0,
+      };
+    },
   };
 
   // Boot: the pill layer exists from the first frame; create it eagerly.
   // C2j — the card layer too (EAGER, never removed), created BEFORE the pill so the z-order
   // law (site < card < pill) holds from the very first frame.
+  // C2m — the fader layer joins (EAGER, never removed), created BEFORE the card so the
+  // extended z-order law (site < fader < card < pill) holds from the very first frame.
+  ensureFader();
   ensureCard();
   ensurePill();
+  console.log('[fader] layer booted (eager, collapsed 0×0, hidden)'); // C2m boot evidence
 
   return controller;
 }
