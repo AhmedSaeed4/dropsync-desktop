@@ -97,7 +97,12 @@
         padding: 2px;
         font-size: 10.5px;
       }
-      .mode-pill button { padding: 7.5px 14px; }
+      /* C2l FIX 3 — content-sized buttons (word + side padding) overflowed the pill and drifted
+         the word pair ~4px right of the midline, leaving "Local" visibly off-center in the knob
+         (measured 20px left vs 8px right of the word). Each button now takes EXACTLY one
+         geometric half (54px of the 108px content box at rest), so every word centers dead under
+         its knob half and each half is fully clickable. Vertical padding untouched. */
+      .mode-pill button { flex: 1 1 0; min-width: 0; padding: 7.5px 0; }
       .mode-pill .knob { top: 2px; left: 2px; height: calc(100% - 4px); width: calc(50% - 2px); }
       /* ---- A's own footprint. C2g-hotfix-6 FIX 2 — CENTER-ANCHORED exactly like #pillB
          (left/top 50% + static translate(-50%,-50%)): when main grows the room to the flip-time

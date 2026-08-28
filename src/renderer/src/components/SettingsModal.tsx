@@ -51,7 +51,9 @@ export function SettingsModal({ onClose, onLockNow, onVaultMoved, onSwitchToClou
   const [moveMessage, setMoveMessage] = useState<string | null>(null);
   const [moveError, setMoveError] = useState<string | null>(null);
 
-  const autoLock = settings?.autoLockMinutes ?? 10;
+  // C2l FIX 1 — `?? 10` treated the STORED "Off" (null) as "never set" and displayed 10 minutes.
+  // Only a truly-absent setting falls back to the 10-minute default; an explicit Off stays Off.
+  const autoLock = settings?.autoLockMinutes === undefined ? 10 : settings.autoLockMinutes;
 
   const handleChangePassword = async () => {
     if (newPassword.length < 8) {

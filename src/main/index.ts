@@ -819,6 +819,24 @@ function createWindow(): void {
       out.rejectsOver480 = await rejects(() => dropsync.vault.settingsSet({ autoLockMinutes: 481 }));
       out.rejectsBadTheme = await rejects(() => dropsync.vault.settingsSet({ theme: 'blue' }));
       out.accepts240 = ((await dropsync.vault.settingsSet({ autoLockMinutes: 240 })).autoLockMinutes === 240);
+      // ---- C2l (4a): picking Off must STORE null AND DISPLAY "Off". The owner symptom was the
+      // display snapping back to "10 minutes" while the store kept null (the old '?? 10' reader).
+      // autoLockOffDisplayed is THE red-proof-sensitive half: with the old reader the stored
+      // check passes but the display lies, so autoLockOffReal (both conjuncts) goes false.
+      selRoot.querySelector('button').click();
+      await sleep(300);
+      document.querySelector('[data-editorial-select-menu] [data-value="off"]').click();
+      await sleep(700);
+      out.autoLockOffStored = (await dropsync.vault.settingsGet()).autoLockMinutes === null;
+      selRoot.querySelector('button').click();
+      await sleep(300);
+      const offLabel = ((selRoot.querySelector('button span') || selRoot.querySelector('button')).textContent || '').trim();
+      out.autoLockOffTriggerLabel = offLabel;
+      out.autoLockOffDisplayed = offLabel.toLowerCase() === 'off';
+      out.autoLockOffReal = out.autoLockOffStored && out.autoLockOffDisplayed;
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await sleep(300);
+      out.offMenuEscCloses = !document.querySelector('[data-editorial-select-menu]');
       await dropsync.vault.settingsSet({ autoLockMinutes: 10 }); // restore default
       // FIX 3: closing Settings must be SILENT — zero drop:list refetches, modal just goes.
       // (Move-vault's refresh is logic-level: wired to onVaultMoved in App.tsx, fired only on
@@ -3873,8 +3891,10 @@ function createWindow(): void {
                 const bloomOk = await waitBloomRoom();
                 const bloomFlag = (await pillState()).bloomed;
                 // C2g-hotfix-3 §5 B-side asserts, read with the bloom settled: inner knob must be
-                // ≈54 × 24 (measured 0×0 before the shared .mode-pill sizing), words 10.5px with
-                // 7.5px/14px padding (were UA 16px / 1px 6px).
+                // ≈54 × 24 (measured 0×0 before the shared .mode-pill sizing), words 10.5px.
+                // C2l FIX 3 — the button padding pin followed the ordered CSS change: the demo's
+                // content-sizing `14px 7.5px` became `7.5px 0` + flex halves (word centering is
+                // now proven geometrically by f_c2l_pillWordsCentered, not by side padding).
                 await sleep(400);
                 const bStyle = await g.pillEval(`(function(){
                     var ks = getComputedStyle(document.querySelector('#pillB .inner .knob'));
@@ -3883,7 +3903,7 @@ function createWindow(): void {
                       fs: bs.fontSize, pad: bs.paddingLeft + ' ' + bs.paddingTop }); })()`)
                   .then((s) => JSON.parse(s as string) as { kw: number; kh: number; fs: string; pad: string });
                 const bStyled = Math.abs(bStyle.kw - 54) <= 1 && Math.abs(bStyle.kh - 24) <= 1
-                  && bStyle.fs === '10.5px' && bStyle.pad === '14px 7.5px';
+                  && bStyle.fs === '10.5px' && bStyle.pad === '0px 7.5px';
                 // HOTFIX-4 painted-pill truth inside the bloomed room: #pillB centered in its
                 // 132 × 44 page ⇒ x ≈ 10..122, y ≈ 8..36 — symmetric growth around the stable
                 // center (the instant room swap moves only transparent skirt margins, not paint).
@@ -4101,6 +4121,126 @@ function createWindow(): void {
                   redProof,
                   suspects: { bridgeType, consoleErrors, flipReceipts: pillFlipRelayCount - flipReceiptsBefore },
                   raw: { hitLog, knobRoom: { knobRoomWideAt, paintA, paintStable, knobRoomSettled } },
+                }));
+              }
+              // (2b3) C2l FIX 3 — f_c2l_pillWordsCentered: each word must center DEAD under its
+              // knob half. The old content-sized buttons (padding 7.5px 14px) overflowed the
+              // 108px content box and drifted the word pair ~4px right ("Local" text center
+              // ≈ 87.6 vs knob-half center 83; 20px whitespace left vs 8px right). Reuses the
+              // robot's seams ONLY (pillEval / pillDrive / hit-test-gated click / appMode poll)
+              // — no new channels. All geometry derives from LIVE rects (trough content box,
+              // buttons, text ranges, knob); thresholds are the order's: boundary ≤1px off the
+              // midline, widths ≤0.5px apart, word-vs-button and word-vs-knob-half ≤1.5px.
+              {
+                const g = cloudCtl;
+                const waitMode = async (want: string): Promise<boolean> => {
+                  for (let i = 0; i < 12; i++) { if (appMode === want) return true; await sleep(500); }
+                  return appMode === want;
+                };
+                const drive = (ev: 'mouseenter' | 'mouseleave' | 'contextmenu'): Promise<void> => g.pillDrive(ev);
+                const realClick = async (sel: string): Promise<boolean> => {
+                  // same MANDATORY hit-test gate as the (2b2) robot — never a blind click
+                  const ht = await g.pillEval(`(function(){ var el = document.querySelector('${sel}');
+                      if (!el) return JSON.stringify({ ok:false });
+                      var r = el.getBoundingClientRect();
+                      var h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+                      return JSON.stringify({ ok: !!h && (h === el || el.contains(h)) }); })()`)
+                    .then((s) => JSON.parse(s as string) as { ok: boolean });
+                  if (!ht.ok) return false;
+                  return g.pillEval(`(function(){ var el = document.querySelector('${sel}'); if (!el) return false; el.click(); return true; })()`) as Promise<boolean>;
+                };
+                const restRoom = async (): Promise<boolean> => {
+                  for (let i = 0; i < 22; i++) { // ≤5.5 s ≫ the 620 ms contract-coupled skirt hold
+                    const pb = (await g.pillProbe()).bounds;
+                    if (pb.width === PILL_W && pb.height === PILL_H) return true;
+                    await sleep(250);
+                  }
+                  return false;
+                };
+                const knobSettled = async (knobSel: string): Promise<void> => {
+                  let last = -1; // the .6s elastic knob may still be overshooting after a flip
+                  for (let i = 0; i < 12; i++) {
+                    const c = await g.pillEval(`(function(){ var k = document.querySelector('${knobSel}'); if (!k) return -1; var r = k.getBoundingClientRect(); return +(r.left + r.width / 2).toFixed(2); })()`).then(Number);
+                    if (last >= 0 && Math.abs(c - last) <= 0.3) return;
+                    last = c;
+                    await sleep(250);
+                  }
+                };
+                interface C2lGeom {
+                  missing?: boolean; boundary: number; mid: number; boundaryOff: number;
+                  midAt56: number | null; widthDelta: number; cloudWordOff: number; localWordOff: number;
+                  cloudHalfOff: number; localHalfOff: number; tCloudCx: number; tLocalCx: number;
+                  cloudHalf: number; localHalf: number; knobCx: number;
+                }
+                const measure = async (style: 'A' | 'B'): Promise<C2lGeom> => JSON.parse(await g.pillEval(`(function(){
+                    function box(el){ if (!el) return null; var r = el.getBoundingClientRect();
+                      return { r:+r.right.toFixed(2), w:+r.width.toFixed(2), cx:+(r.left + r.width/2).toFixed(2) }; }
+                    function txt(el){ if (!el) return null; var t = document.createRange(); t.selectNodeContents(el);
+                      var r = t.getBoundingClientRect(); return { cx:+(r.left + r.width/2).toFixed(2) }; }
+                    var isA = ${style === 'A'};
+                    var trough = document.querySelector(isA ? '#pillA' : '#pillB .inner .pill');
+                    var bc = document.getElementById(isA ? 'btn-cloud-a' : 'btn-cloud-b');
+                    var bl = document.getElementById(isA ? 'btn-local-a' : 'btn-local-b');
+                    if (!trough || !bc || !bl) return JSON.stringify({ missing: true });
+                    var tr = trough.getBoundingClientRect();
+                    var cL = tr.left + 2, cR = tr.right - 2, mid = (cL + cR) / 2;
+                    var kC = box(bc), kL = box(bl), tC = txt(bc), tL = txt(bl);
+                    var knob = box(document.querySelector(isA ? '#pillA .knob' : '#pillB .inner .knob'));
+                    return JSON.stringify({
+                      boundary: +kC.r.toFixed(2), mid: +mid.toFixed(2),
+                      boundaryOff: +Math.abs(kC.r - mid).toFixed(2),
+                      midAt56: isA ? +Math.abs(mid - 56).toFixed(2) : null,
+                      widthDelta: +Math.abs(kC.w - kL.w).toFixed(2),
+                      cloudWordOff: +Math.abs(tC.cx - kC.cx).toFixed(2),
+                      localWordOff: +Math.abs(tL.cx - kL.cx).toFixed(2),
+                      cloudHalfOff: +Math.abs(tC.cx - (cL + mid) / 2).toFixed(2),
+                      localHalfOff: +Math.abs(tL.cx - (mid + cR) / 2).toFixed(2),
+                      tCloudCx: tC.cx, tLocalCx: tL.cx,
+                      cloudHalf: +((cL + mid) / 2).toFixed(2), localHalf: +((mid + cR) / 2).toFixed(2),
+                      knobCx: knob ? knob.cx : -1
+                    });
+                  })()`));
+                const sideOk = (m: C2lGeom, pinMid: boolean): boolean => !m.missing
+                  && m.boundaryOff <= 1 && (!pinMid || (m.midAt56 !== null && m.midAt56 <= 1))
+                  && m.widthDelta <= 0.5
+                  && m.cloudWordOff <= 1.5 && m.localWordOff <= 1.5
+                  && m.cloudHalfOff <= 1.5 && m.localHalfOff <= 1.5;
+                const originalMode = appMode; // the (2b2) robot handed us Cloud + Style A
+                const c2lLegs: Array<{ tag: string; ok: boolean; geom: C2lGeom }> = [];
+                // Leg 1 — Style A, Local active (real click through the hit-test gate).
+                await realClick('#btn-local-a');
+                const localFlipped = await waitMode('local');
+                await restRoom(); await knobSettled('#pillA .knob');
+                const mLocal = await measure('A');
+                c2lLegs.push({ tag: 'A-local', ok: localFlipped && sideOk(mLocal, true), geom: mLocal });
+                // Leg 2 — flip to Cloud: words must stay centered regardless of knob side.
+                await realClick('#btn-cloud-a');
+                const cloudFlipped = await waitMode('cloud');
+                await restRoom(); await knobSettled('#pillA .knob');
+                const mCloud = await measure('A');
+                c2lLegs.push({ tag: 'A-cloud', ok: cloudFlipped && sideOk(mCloud, true), geom: mCloud });
+                // Leg 3 — Style B BLOOMED: the inner pill shares .mode-pill, so its words must
+                // center automatically — asserted, not assumed.
+                await drive('contextmenu'); // → B
+                await sleep(400);
+                await drive('mouseenter'); // bloom (room widens to 132 × 44; client coords live)
+                await sleep(900); // .55s elastic + .25s reveal (.12s delay)
+                await knobSettled('#pillB .inner .knob');
+                const mB = await measure('B');
+                c2lLegs.push({ tag: 'B-bloom', ok: sideOk(mB, false), geom: mB });
+                // Collapse, back to Style A + the original mode.
+                await drive('mouseleave');
+                await sleep(800);
+                await drive('contextmenu'); // → A
+                await sleep(400);
+                if (originalMode === 'local') { await realClick('#btn-local-a'); await waitMode('local'); }
+                const restoredStyleA = (await g.pillEval('JSON.stringify(window.__c2gPill || null)')
+                  .then((s) => (JSON.parse(s as string) as { style: string } | null)?.style)) === 'A';
+                const f_c2l_pillWordsCentered = c2lLegs.every((l) => l.ok) && restoredStyleA && appMode === originalMode;
+                console.log('[c2l-pill]', JSON.stringify({
+                  f_c2l_pillWordsCentered,
+                  matrix: { originalMode, restoredStyleA, legs: c2lLegs.map((l) => ({ tag: l.tag, ok: l.ok })) },
+                  raw: { legs: c2lLegs },
                 }));
               }
               // (3) f_c2f_boundsFull — resize to two sizes + fullscreen; the site view must equal
@@ -4602,14 +4742,42 @@ function createWindow(): void {
                   f_c2h_cloudActivityFeedsIdleLock,
                   raw: { enteredCloud, fedOk, feedElapsedMs, stayedUnlockedWhileFed, lockedAfterStarve, lockAfterLastFeedMs, lastFeedIso: new Date(lastFeedAt).toISOString(), sampleCount: samples.length, samples },
                 }));
-                // CLEANUP: one shared clock restored, Local re-entered (lands on the password
-                // screen — fine, the starve legitimately locked it), re-unlocked through the
-                // SAME path other dev paths use (dev:testOnly `vaultUnlock` → manager.unlock),
-                // then a fresh mount so any later stages boots sane.
-                await manager.setSettings({ autoLockMinutes: 10 });
+                // CLEANUP: Local re-entered (lands on the password screen — fine, the starve
+                // legitimately locked it), re-unlocked through the SAME path other dev paths use
+                // (dev:testOnly `vaultUnlock` → manager.unlock), then the C2l Off leg, then a
+                // fresh mount so any later stages boots sane.
+                // C2l 4b NOTE: the restore used to be this block's FIRST line — but setSettings
+                // asserts unlocked, so while the starve-lock was still sealed it THREW
+                // ('[c1] failed: Vault is locked.' sits in every prior green log) and the
+                // flip/unlock/reload never ran. The restore now happens after the unlock.
                 win.webContents.send('pill:flipRequested', 'local');
                 await sleep(1500);
                 try { await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch { /* already open or gone */ }
+                // C2l (4b) — watchdog Off leg: with autoLockMinutes = null (explicit Off — legal
+                // per the engine validator) the starved watchdog must NEVER lock. Same no-feed
+                // discipline as the starve control above: sampling is DIRECT manager.status()
+                // (no IPC, no renderer bridge round-trip), the renderer sits idle, zero gestures.
+                // Honest scope: 90 s proves "no lock in a window where minutes=1 provably locks"
+                // (the control above locked after ~83 s of starvation); the full 10-minute
+                // equivalence rests on code review + the owner's hands-on, not a 10-minute leg.
+                const offLegT0 = Date.now();
+                const offSamples: Array<{ tMs: number; state: string }> = [];
+                let autoLockOffStaysUnlocked90s = false;
+                const offLegUnlocked = manager.status().state === 'unlocked';
+                if (offLegUnlocked) {
+                  await manager.setSettings({ autoLockMinutes: null });
+                  while (Date.now() - offLegT0 < 92000) {
+                    await sleep(10000);
+                    offSamples.push({ tMs: Date.now() - offLegT0, state: manager.status().state });
+                  }
+                  autoLockOffStaysUnlocked90s = offSamples.length > 0
+                    && offSamples.every((s) => s.state === 'unlocked');
+                }
+                console.log('[c2l-off]', JSON.stringify({
+                  autoLockOffStaysUnlocked90s,
+                  raw: { offLegUnlocked, elapsedMs: Date.now() - offLegT0, sampleCount: offSamples.length, offSamples },
+                }));
+                await manager.setSettings({ autoLockMinutes: 10 }); // C2l 4b — restore at stage end
                 win.webContents.reload();
                 await sleep(4000);
               }
