@@ -7,15 +7,15 @@
  * for, and opaque media:// tokens.
  */
 
-import { app, BrowserWindow, ipcMain, dialog, Notification, protocol, shell, net } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Notification, protocol, session, shell, net } from 'electron';
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';import { createWriteStream, readFileSync, rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';import { createWriteStream, existsSync, readFileSync, rmSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
 import { VaultManager } from './vault/vault.ts';
-import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_FLIP_PAD_X, type CloudController } from './cloud';
+import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_FLIP_PAD_X, CAPTURE_DEADLINE_MS, ENTRY_CONNECT_TIMEOUT_MS, STATUS_TOP, STATUS_H, CLOUD_URL, type CloudController } from './cloud';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -113,7 +113,7 @@ function createWindow(): void {
   // C2h FIX 3 — cloud-view gestures feed the SAME idle-auto-lock clock (owner decision D-B):
   // the controller senses raw inputs from OUTSIDE the page and calls manager.touch() here.
   // Safe by closure: manager is the module-level singleton (:63) outliving any view swap.
-  cloudCtl = initCloud(mainWindow, { onUserActivity: () => manager.touch() });
+  cloudCtl = initCloud(mainWindow, { onUserActivity: () => manager.touch(), currentTheme });
   attachCloudResizeTracking(mainWindow, cloudCtl);
   // C2j LEG 3 — missed reminders greet the owner when the window becomes front-and-center
   // again: drain oldest-first, OVERLAY only (native already shown once at fire time); the
@@ -4295,13 +4295,14 @@ function createWindow(): void {
               }
               const childViews = win.contentView.children.length;
               const stormPill = await cloudCtl.pillProbe();
-              // C2m — childViews is now 4: site + fader + card + pill (the fader layer is a
-              // PERMANENT fourth native view, added below the card/pill per the C2m z-law,
-              // collapsed 0×0 + hidden at rest). The intent of this assert is unchanged — the
-              // flip storm must not leak/duplicate views (a leaked site would read 5+); the
-              // +1 is the fader's accounted-for membership (same accounting-for bump the C2j
-              // card addition used).
-              const expectedChildViews = 4;
+              // C2m — childViews became 4: site + fader + card + pill. C3 — childViews is now
+              // 5: the STATUS layer joins (site + fader + card + status + pill), a PERMANENT
+              // fifth native view added between the card and the pill per the C3 z-law,
+              // collapsed 0×0 + hidden at rest. The intent of this assert is unchanged — the
+              // flip storm must not leak/duplicate views (a leaked site would read 6+); the
+              // +1 is the status layer's accounted-for membership (same accounting-for bump
+              // the C2j card and C2m fader additions used).
+              const expectedChildViews = 5;
               // C2g-hotfix-6 — each mode delivery now arms the Style A flip room (124 × 28,
               // contract-coupled hold), so the "rest footprint" part of this key must be read
               // AFTER the hold snaps back to exactly 112 × 28. Persistence facts (view reuse,
@@ -4354,7 +4355,12 @@ function createWindow(): void {
                   // C2m — the fader bridge exists ONLY on the fader page (never site/pill/card).
                   && iso.faderDropsyncType === 'undefined' && iso.faderBridgeType === 'object'
                   && iso.faderCardBridgeType === 'undefined'
-                  && iso.pillFaderBridgeType === 'undefined' && iso.cardFaderBridgeType === 'undefined',
+                  && iso.pillFaderBridgeType === 'undefined' && iso.cardFaderBridgeType === 'undefined'
+                  // C3 — the status bridge exists ONLY on the status page (never site/pill/card/fader).
+                  && iso.statusDropsyncType === 'undefined' && iso.statusBridgeType === 'object'
+                  && iso.statusCardBridgeType === 'undefined' && iso.statusFaderBridgeType === 'undefined'
+                  && iso.pillStatusBridgeType === 'undefined' && iso.cardStatusBridgeType === 'undefined'
+                  && iso.faderStatusBridgeType === 'undefined',
                 isolationRaw: iso,
                 f_c1_authSeen: auth.firebaseAuthKeys > 0 || auth.accountChip,
                 authSeenRaw: auth,
@@ -4825,9 +4831,12 @@ function createWindow(): void {
                   && leg.coveredSwap // C2m-hotfix-1 — curtain BEFORE the swap, both directions
                   && !!leg.settledSnap && !leg.settledSnap.inFlight && flat(leg.settledSnap.bounds)
                   && leg.modeAfterArm === leg.next;
+                // C3 — the storm's child count is now 5 (status layer membership, accounted
+                // for above); the zero-leak intent is unchanged.
+                const stormExpectedChildViews = 5;
                 const f_c2m_flipDissolve = meltOk(legOut) && meltOk(legHome)
                   && !stormProbe.inFlight && flat(stormProbe.bounds) && stormProbe.attached
-                  && stormChildViews === 4 && stormFinalMode === 'cloud'
+                  && stormChildViews === stormExpectedChildViews && stormFinalMode === 'cloud'
                   && sysSamples.every((p) => !p.inFlight) && sysMode === 'local';
 
                 console.log('[c2m]', JSON.stringify({
@@ -4841,7 +4850,7 @@ function createWindow(): void {
                     homeCoveredSwap: legHome.coveredSwap,
                     homeSwapPadMs: legHome.swapPadMs,
                     homeSettledFlat: !!legHome.settledSnap && flat(legHome.settledSnap.bounds),
-                    stormCleanEnd: !stormProbe.inFlight && flat(stormProbe.bounds) && stormProbe.attached && stormChildViews === 4,
+                    stormCleanEnd: !stormProbe.inFlight && flat(stormProbe.bounds) && stormProbe.attached && stormChildViews === stormExpectedChildViews,
                     systemFlipNeverMelts: sysSamples.every((p) => !p.inFlight && flat(p.bounds)) && sysMode === 'local',
                   },
                   raw: { legOut, legHome, stormProbe, stormChildViews, stormFinalMode, sysSamples, sysMode },
@@ -4854,6 +4863,716 @@ function createWindow(): void {
                 win.webContents.send('pill:flipRequested', 'local');
                 await sleep(1500);
                 // Leave Local — the dead-last C2h idle stage takes it from here.
+              }
+
+              // (5e) C3 — PLUMBING & OFFLINE battery. Placed per order: immediately AFTER the
+              // C2m stage and BEFORE the dead-last C2h idle stage. All controller probes here
+              // are DEV-gated (DROPSYNC_CLOUD_DEV=1 — this battery's own boot gate). The
+              // download seam arms under the same dev gate (see cloud.ts e2eSeamArmed).
+              {
+                type StatusSnap = Awaited<ReturnType<typeof cloudCtl.statusProbe>>;
+                const statusSnap = (): Promise<StatusSnap> => cloudCtl!.statusProbe();
+                /** Poll until cond() holds (or timeout) — the standard leg cadence. */
+                const waitFor = async (cond: () => Promise<boolean>, timeoutMs: number, step = 50): Promise<boolean> => {
+                  const t0 = Date.now();
+                  for (;;) {
+                    if (await cond()) return true;
+                    if (Date.now() - t0 > timeoutMs) return false;
+                    await sleep(step);
+                  }
+                };
+                const cbW = (): number => win.getContentBounds().width;
+
+                // ---- f_c3_doorman (STEP 3) — direct invocation of the registered handlers ----
+                const door = await cloudCtl!.doormanProbe();
+                const f_c3_doorman = door.mediaSite === true && door.mediaEvil === false
+                  && door.geoSite === false
+                  && door.checkMediaSite === true && door.checkMediaEvil === false
+                  && door.checkNotifications === false;
+                console.log('[c3-doorman]', JSON.stringify({
+                  f_c3_doorman,
+                  table: { request: { mediaSite: door.mediaSite, mediaEvil: door.mediaEvil, geoSite: door.geoSite }, check: { mediaSite: door.checkMediaSite, mediaEvil: door.checkMediaEvil, notifications: door.checkNotifications } },
+                }));
+
+                // ---- f_c3_chipBoundsZeroMiss (idle half) + f_c3_chipDownloadFlow (STEP 2) ----
+                const idleSnap = await statusSnap();
+                const chipIdleZeroMiss = idleSnap.attached && !idleSnap.showing && idleSnap.collapsed;
+
+                const dlSession = session.fromPartition('persist:cloud'); // the site partition (cloud.ts PARTITION)
+                // Run 1 lesson (2026-08-29): session.downloadURL on a data: URL creates the
+                // DownloadItem but it NEVER progresses (no 'updated', no 'done', no bytes) —
+                // the battery needs a REAL http URL. The dev server serves any project file
+                // via /@fs; typescript.js (9.1 MB) gives real multi-tick progress + a real
+                // completion, without a native dialog (the e2e seam auto-answers).
+                // Main is ESM ("type": "module") — __dirname does not exist at runtime here;
+                // the file's own idiom is fileURLToPath(new URL('.', import.meta.url)).
+                const dlFile = join(fileURLToPath(new URL('.', import.meta.url)), '..', '..', 'node_modules', 'typescript', 'lib', 'typescript.js');
+                const dlUrl = `${String(process.env.ELECTRON_RENDERER_URL ?? '')}/@fs${encodeURI(dlFile)}`;
+                const chipUpExact = async (): Promise<{ up: boolean; snap: StatusSnap | null }> => {
+                  let snap: StatusSnap | null = null;
+                  const appeared = await waitFor(async () => {
+                    const p = await statusSnap();
+                    if (p.showing && !p.veilUp && p.bounds.width > 0 && p.bounds.y === STATUS_TOP) { snap = p; return true; }
+                    return false;
+                  }, 4000);
+                  if (!appeared) return { up: false, snap: null };
+                  // The measured-width room: main snaps to the page's measure within a beat.
+                  let exact: StatusSnap | null = null;
+                  const exactHit = await waitFor(async () => {
+                    const p = await statusSnap();
+                    if (p.lastMeasure > 0 && p.bounds.width === p.lastMeasure
+                      && p.bounds.height === STATUS_H
+                      && Math.abs(p.bounds.x - Math.round((cbW() - p.bounds.width) / 2)) <= 1) { exact = p; return true; }
+                    return false;
+                  }, 2000);
+                  return { up: exactHit, snap: exact ?? snap };
+                };
+
+                // LEG 1 — the flow: chip up (measured footprint) → progress lands → done
+                // flash → collapse to 0×0 → the saved file exists on disk.
+                cloudCtl!.downloadTestArm(false);
+                dlSession.downloadURL(dlUrl);
+                const flow = await chipUpExact();
+                let flowProgressLanded = false;
+                if (flow.up) {
+                  flowProgressLanded = await waitFor(async () => (await statusSnap()).lastProgress !== null, 3000);
+                }
+                const flowSettled = flow.up
+                  ? await waitFor(async () => {
+                    const p = await statusSnap();
+                    return !p.showing && p.collapsed;
+                  }, 12000)
+                  : false;
+                const flowSnap = await statusSnap();
+                const flowFlash = flowSnap.lastHideFlash === '✓ Saved';
+                const flowFileExists = flowSnap.lastSavePath !== null && existsSync(flowSnap.lastSavePath);
+                if (flowSnap.lastSavePath !== null) {
+                  try {
+                    rmSync(flowSnap.lastSavePath, { force: true }); // keep /tmp clean (9 MB/run)
+                  } catch { /* best-effort cleanup */ }
+                }
+
+                // LEG 2 — cancel mid-flight (held download): item cancelled AND the partial
+                // file is ABSENT on disk AND the chip is gone.
+                cloudCtl!.downloadTestArm(true); // hold: the next item pauses right after its save path
+                dlSession.downloadURL(dlUrl);
+                const cancelUp = await chipUpExact();
+                const cancelPath = (await statusSnap()).lastSavePath;
+                let cancelGone = false;
+                if (cancelUp.up) {
+                  await cloudCtl!.statusDrive('cancel'); // the REAL button → status:action ipc
+                  cancelGone = await waitFor(async () => {
+                    const p = await statusSnap();
+                    return !p.showing && p.collapsed;
+                  }, 6000);
+                }
+                cloudCtl!.downloadTestArm(false);
+                const cancelFileAbsent = cancelPath !== null && !existsSync(cancelPath);
+
+                // LEG 3 — a download outlives a mode flip (D2): hold a download, flip the
+                // world BOTH ways (programmatic main-side — melts never fire), chip persists.
+                cloudCtl!.downloadTestArm(true);
+                dlSession.downloadURL(dlUrl);
+                const persistUp = await chipUpExact();
+                let chipPersists = false;
+                if (persistUp.up) {
+                  await applyCloudMode('cloud');
+                  await sleep(200);
+                  const overCloud = await statusSnap();
+                  await applyCloudMode('local');
+                  await sleep(200);
+                  const overLocal = await statusSnap();
+                  chipPersists = overCloud.showing && !overCloud.collapsed && overLocal.showing && !overLocal.collapsed;
+                  await cloudCtl!.statusDrive('cancel'); // clean up the held download
+                  await waitFor(async () => {
+                    const p = await statusSnap();
+                    return !p.showing && p.collapsed;
+                  }, 6000);
+                }
+                cloudCtl!.downloadTestArm(false);
+
+                const f_c3_chipDownloadFlow = flow.up && flowProgressLanded && flowSettled && flowFlash
+                  && cancelUp.up && cancelGone && cancelFileAbsent;
+                const f_c3_chipBoundsZeroMiss = chipIdleZeroMiss && flow.up && chipPersists;
+                console.log('[c3-chip]', JSON.stringify({
+                  f_c3_chipDownloadFlow,
+                  f_c3_chipBoundsZeroMiss,
+                  matrix: {
+                    chipIdleZeroMiss, flowUpMeasured: flow.up, flowProgressLanded, flowSettled,
+                    flowFlash, flowFileExists, cancelUp: cancelUp.up, cancelGone, cancelFileAbsent,
+                    chipPersists,
+                  },
+                  raw: {
+                    flowBounds: flow.snap?.bounds ?? null, flowMeasure: flow.snap?.lastMeasure ?? 0,
+                    flowFractions: flowSnap.lastProgress, flowSavePath: flowSnap.lastSavePath,
+                    cancelPath, idleRaw: idleSnap,
+                  },
+                }));
+
+                // ---- f_c3_offlineStates (STEP 4) — entry / recovery / degraded / mode-clear ----
+                // Align BOTH sides on cloud through the REAL relay (un-armed ⇒ instant).
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(1500);
+
+                // ENTRY leg — forced main-frame failure while offline ⇒ veil (theme attr set,
+                // full-window room); reconnect ⇒ auto-reload (spy) + veil down.
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const veilUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.showing
+                    && p.bounds.x === 0 && p.bounds.y === 0
+                    && Math.abs(p.bounds.width - win.getContentBounds().width) <= 2
+                    && Math.abs(p.bounds.height - win.getContentBounds().height) <= 2;
+                }, 3000);
+                const veilTheme = await cloudCtl!.statusEval<string>('document.documentElement.dataset.statusTheme || ""');
+                const themeOk = ['light', 'dark', 'minimal'].includes(veilTheme);
+                cloudCtl!.setNetOverride(true);
+                const reloadsBefore = (await statusSnap()).reloadCount;
+                const veilCleared = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.reloadCount > reloadsBefore && !p.veilUp && !p.showing && p.collapsed;
+                }, 8000);
+
+                // DEGRADED leg — net drops WHILE cloud is shown ⇒ pulse chip (no reload, D6);
+                // reconnect ⇒ "✓ Back online" flash, then the chip collapses.
+                cloudCtl!.setNetOverride(false);
+                const degradedUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.showing && !p.veilUp && p.bounds.width > 0
+                    && (p.lastShow as { label?: string } | null)?.label === 'Waiting for internet…'
+                    && (p.lastShow as { pulse?: boolean } | null)?.pulse === true
+                    && (p.lastShow as { action?: string } | null)?.action === 'switch-local';
+                }, 6000);
+                const degradedReloaded = (await statusSnap()).reloadCount; // must NOT change mid-degraded
+                cloudCtl!.setNetOverride(true);
+                const backOnline = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.lastHideFlash === '✓ Back online' && !p.showing && p.collapsed;
+                }, 9000);
+                const degradedNoReload = (await statusSnap()).reloadCount === degradedReloaded;
+
+                // C3-hotfix-1 — f_c3_veilRetrySuccess (THE leg the C3 order lacked): entry-
+                // failed ⇒ the REAL [Try again] button ⇒ reload fires AND the veil LIFTS
+                // (offlineState 'ok'). Driven while the net override is still FALSE so the
+                // 2 s auto-recovery poll (requires `online`) can never race the manual
+                // button — the reload itself succeeds on the real net; FIX A does the lift.
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const rv2Up = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed';
+                }, 3000);
+                const retryReloadsBefore = (await statusSnap()).reloadCount;
+                await cloudCtl!.statusDrive('retry'); // the REAL button → status:action ipc
+                const retryReloaded = await waitFor(async () =>
+                  (await statusSnap()).reloadCount > retryReloadsBefore, 3000);
+                const retryDelta = (await statusSnap()).reloadCount - retryReloadsBefore;
+                // The lift detector is TWO-BRANCH by design: with the net override held
+                // FALSE (blocking the auto-recovery from racing the manual button), the poll
+                // can legitimately fire a degraded chip right after the lift (state ok +
+                // veil gone + shown + flag claims offline). That chip PROVES the lift: with
+                // the override false, the only ok-transition is the retry's own success lift
+                // (entry-failed ⇒ ok is otherwise unreachable). Branch 1 catches the brief
+                // ok+collapsed window; branch 2 catches the chip that follows it.
+                const retryLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  if (!p.showing && p.collapsed && p.siteLoadOk) return true;
+                  if (p.showing && !p.veilUp && p.siteLoadOk
+                    && (p.lastShow as { label?: string } | null)?.label === 'Waiting for internet…') return true;
+                  return false;
+                }, 8000);
+                cloudCtl!.setNetOverride(null); // real net is up ⇒ identical to override true
+                const f_c3_veilRetrySuccess = rv2Up && retryReloaded && retryDelta === 1 && retryLifted;
+                console.log('[c3-veilretry]', JSON.stringify({
+                  f_c3_veilRetrySuccess,
+                  matrix: { rv2Up, retryReloaded, retryDelta, retryLifted },
+                  raw: { retryReloadsBefore },
+                }));
+
+                // C3-hotfix-3 — f_c3_recoveryKeepsCardUntilSuccess (THE OWNER'S MOVE):
+                // entry-failed ⇒ Wi-Fi back on ⇒ the poll tick fires auto-recovery ⇒ the veil
+                // must SWAP to the Connecting presentation (never collapse) and stay up
+                // through the whole reload window; success is the only exit. White-forever
+                // detector: NO card showing while the page has still never succeeded.
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const rkUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed';
+                }, 3000);
+                const rkBefore = (await statusSnap()).reloadCount;
+                cloudCtl!.setNetOverride(true); // the poll tick fires the recovery
+                let rkSwapSeen = false;
+                let rkWhiteForever = false;
+                let rkLifted = false;
+                const rkT0 = Date.now();
+                while (Date.now() - rkT0 < 9000 && !rkLifted) {
+                  const p = await statusSnap();
+                  const rkTitle = (p.lastShow as { title?: string } | null)?.title ?? '';
+                  if (p.reloadCount > rkBefore && p.veilUp && rkTitle === 'Connecting to Cloud…') rkSwapSeen = true;
+                  if (p.reloadCount > rkBefore && !p.showing && p.collapsed && !p.siteLoadOk) rkWhiteForever = true;
+                  if (!p.showing && p.collapsed && p.siteLoadOk && rkSwapSeen) rkLifted = true;
+                  await sleep(100);
+                }
+                cloudCtl!.setNetOverride(null);
+                const f_c3_recoveryKeepsCardUntilSuccess = rkUp && rkSwapSeen && !rkWhiteForever && rkLifted;
+                console.log('[c3-recovery]', JSON.stringify({
+                  f_c3_recoveryKeepsCardUntilSuccess,
+                  matrix: { rkUp, rkSwapSeen, rkWhiteForever, rkLifted },
+                  raw: { rkBefore },
+                }));
+
+                // C3-hotfix-3 — f_c3_flapNeverDowngradesVeil: with the entry-failed veil up, a
+                // net-flag bounce (true→false→true) must never downgrade it — no degraded
+                // chip, no "✓ Back online" flash while the veil lineage is live. (A chip
+                // AFTER a legitimate lift would be a true mid-cloud degraded and is NOT
+                // counted — the assertion is scoped to the veil lineage.)
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const flUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed';
+                }, 3000);
+                const flBefore = (await statusSnap()).reloadCount;
+                cloudCtl!.setNetOverride(true); // recovery fires at the next tick
+                const flSwap = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.reloadCount > flBefore && p.veilUp
+                    && ((p.lastShow as { title?: string } | null)?.title === 'Connecting to Cloud…');
+                }, 4000);
+                cloudCtl!.setNetOverride(false); // FLAP down mid-recovery — must not downgrade
+                let flDegradedSeen = false;
+                const flT0 = Date.now();
+                while (Date.now() - flT0 < 2500) { // ≥1 poll tick guaranteed inside the window
+                  const p = await statusSnap();
+                  const flLabel = (p.lastShow as { label?: string } | null)?.label ?? '';
+                  const veilLineage = p.veilUp || p.connectingUp || p.offlineState === 'entry-failed';
+                  if (veilLineage && flLabel === 'Waiting for internet…') flDegradedSeen = true;
+                  await sleep(100);
+                }
+                cloudCtl!.setNetOverride(true); // flap back up — the reload (real net) completes ⇒ success lift
+                const flLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.showing && p.collapsed && p.siteLoadOk;
+                }, 9000);
+                cloudCtl!.setNetOverride(null);
+                const f_c3_flapNeverDowngradesVeil = flUp && flSwap && !flDegradedSeen && flLifted;
+                console.log('[c3-flap]', JSON.stringify({
+                  f_c3_flapNeverDowngradesVeil,
+                  matrix: { flUp, flSwap, flDegradedSeen, flLifted },
+                  raw: { flBefore },
+                }));
+
+                // MODE-CLEAR leg — veil up ⇒ [Switch to Local] rides the REAL user-flip path
+                // (arm + melt attempt; the D7 deadline keeps a live capture fast) ⇒ mode local
+                // AND every offline state cleared.
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const veil2Up = await waitFor(async () => (await statusSnap()).veilUp, 3000);
+                await cloudCtl!.statusDrive('switch-local');
+                const modeCleared = await waitFor(async () => appMode === 'local', 3500, 25);
+                const veilGoneAfterFlip = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.veilUp && !p.showing && p.collapsed;
+                }, 3000);
+                cloudCtl!.setNetOverride(null);
+
+                const f_c3_offlineStates = veilUp && themeOk && veilCleared
+                  && degradedUp && degradedNoReload && backOnline
+                  && veil2Up && modeCleared && veilGoneAfterFlip;
+                console.log('[c3-offline]', JSON.stringify({
+                  f_c3_offlineStates,
+                  matrix: {
+                    veilUp, themeOk, veilTheme, veilCleared,
+                    degradedUp, degradedNoReload, backOnline,
+                    veil2Up, modeCleared, veilGoneAfterFlip,
+                  },
+                  raw: { reloadsBefore },
+                }));
+                transitionArmedAt = 0; // hygiene: the switch-local flip legitimately armed; clear it
+
+                // ---- f_c3_flipFromDeadCloud (STEP 5 / §2.4) — THE OWNER'S BUG, PINNED ----
+                // Back to cloud through the REAL relay — with the (5)-stage DESYNC INSURANCE:
+                // a relay landing while the renderer's previous guarded switch is still
+                // settling can be DROPPED (documented C2m-hotfix-2 artifact — run 3 hit it:
+                // the switch-local flip's melt widened the window), so poll BOTH sides and
+                // re-send. Battery-only harness discipline; the product path is untouched.
+                let cloudReady = false;
+                for (let attempt = 0; attempt < 3 && !cloudReady; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  cloudReady = await waitFor(async () =>
+                    (await readModeSafe()) === 'cloud' && appMode === 'cloud', 2500, 50);
+                }
+
+                // C3-hotfix-2 — f_c3_connectingSurvivesSubframeNoise: during a hanging fresh
+                // load, a SUBFRAME failure (the real site's helper-frame noise — Firebase
+                // auth iframes, analytics) must NOT silence the connecting backstop. The
+                // real shared failure path is invoked with isMainFrame=false ~1 s in; the
+                // Connecting veil MUST still appear at ~3 s (offlineState still 'ok').
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined);
+                await sleep(1000);
+                cloudCtl!.onSiteLoadFailed(-3, false, CLOUD_URL); // sub-frame noise mid-hang
+                const subNoiseVeil = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.connectingUp && p.veilUp && p.showing && p.offlineState === 'ok'
+                    && p.bounds.x === 0 && p.bounds.y === 0
+                    && Math.abs(p.bounds.width - win.getContentBounds().width) <= 2
+                    && Math.abs(p.bounds.height - win.getContentBounds().height) <= 2;
+                }, 3500);
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined);
+                const subNoiseLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.connectingUp && !p.veilUp && !p.showing && p.collapsed && p.offlineState === 'ok';
+                }, 8000);
+                const f_c3_connectingSurvivesSubframeNoise = subNoiseVeil && subNoiseLifted;
+                console.log('[c3-subframe]', JSON.stringify({
+                  f_c3_connectingSurvivesSubframeNoise,
+                  matrix: { subNoiseVeil, subNoiseLifted },
+                  raw: { noiseAtMs: 1000, noiseCode: -3, noiseIsMainFrame: false, timeoutMs: ENTRY_CONNECT_TIMEOUT_MS },
+                }));
+
+                // C3-hotfix-1 — connecting leg (FIX B): a fresh load that hangs (TEST-NET-1,
+                // no fast did-fail-load and the WSL net-flag backstop can't fire) must show
+                // the CONNECTING veil within ~3 s (≤3.5 s assert) instead of 5–6 s of white.
+                // offlineState stays 'ok' beneath it (the net has NOT failed — honest card).
+                // Restore ⇒ did-finish-load ⇒ FIX A lifts. Runs BEFORE the dead-flip leg
+                // (which re-navigates to the same dead URL and is otherwise untouched).
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined);
+                const connUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.connectingUp && p.veilUp && p.showing && p.offlineState === 'ok'
+                    && p.bounds.x === 0 && p.bounds.y === 0
+                    && Math.abs(p.bounds.width - win.getContentBounds().width) <= 2
+                    && Math.abs(p.bounds.height - win.getContentBounds().height) <= 2;
+                }, 3500);
+                const connTheme = await cloudCtl!.statusEval<string>('document.documentElement.dataset.statusTheme || ""');
+                const connThemeOk = ['light', 'dark', 'minimal'].includes(connTheme);
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined);
+                const connLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.connectingUp && !p.veilUp && !p.showing && p.collapsed && p.offlineState === 'ok';
+                }, 8000);
+                const f_c3_connectingVeil = connUp && connThemeOk && connLifted;
+                console.log('[c3-connecting]', JSON.stringify({
+                  f_c3_connectingVeil,
+                  matrix: { connUp, connTheme, connThemeOk, connLifted },
+                  raw: { timeoutMs: ENTRY_CONNECT_TIMEOUT_MS },
+                }));
+
+                // Point the site view at TEST-NET-1 (hangs forever). Battery-only navigation
+                // of the site view — ordered by the C3 order §4 STEP 6 (I1 stays absolute
+                // outside this DEV leg).
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined);
+                await sleep(600); // the view is now a dead page (white void — owner's screenshot)
+                const deadOutgoing = appMode; // 'cloud'
+                transitionArmedAt = Date.now(); // the pill:flip handler's exact arm write
+                const deadT0 = Date.now();
+                win.webContents.send('pill:flipRequested', 'local');
+                const deadApplied = await waitFor(async () => appMode === 'local', 4000, 25);
+                const deadFlipMs = Date.now() - deadT0;
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined); // restore
+                const f_c3_flipFromDeadCloud = deadOutgoing === 'cloud' && deadApplied && deadFlipMs < 1500;
+                console.log('[c3-deadflip]', JSON.stringify({
+                  f_c3_flipFromDeadCloud,
+                  matrix: { firstClickThrough: deadApplied, underDeadline: deadFlipMs < 1500 },
+                  raw: { deadOutgoing, deadFlipMs, captureDeadlineMs: CAPTURE_DEADLINE_MS },
+                }));
+
+                // C3-hotfix-2 — f_c3_deadReentryRetries: THE OWNER'S BRICK. State after the
+                // dead-flip leg: appMode local, the site view a dead TEST-NET-1 page (its
+                // load never succeeded). Flip back to Cloud must RETRY (show() reloads +
+                // re-arms ⇒ Connecting card), not sit white forever. The re-entry reload
+                // targets CLOUD_URL, which the real net would load fine — this leg cannot
+                // turn Wi-Fi off, so a battery-only webRequest redirect (site origin →
+                // TEST-NET-1, registered here and REMOVED before the restore) makes the
+                // re-entry load hang exactly the way a real offline CLOUD_URL load hangs.
+                // Never registered outside this DEV leg.
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined); // re-dead the view (siteLoadOk=false)
+                await sleep(400);
+                const deBefore = (await statusSnap()).siteLoadCount;
+                let deLocal = false; // the Local hop (both sides are already local here — the relay no-ops; kept for flow fidelity)
+                for (let attempt = 0; attempt < 3 && !deLocal; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'local');
+                  deLocal = await waitFor(async () =>
+                    (await readModeSafe()) === 'local' && appMode === 'local', 2500, 50);
+                }
+                const cloudSes = session.fromPartition('persist:cloud');
+                const deadFilter = { urls: [CLOUD_URL + '/*'] };
+                cloudSes.webRequest.onBeforeRequest(deadFilter, (_details, cb) => { cb({ redirectURL: 'https://192.0.2.1/' }); });
+                let deCloud = false;
+                for (let attempt = 0; attempt < 3 && !deCloud; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  deCloud = await waitFor(async () =>
+                    (await readModeSafe()) === 'cloud' && appMode === 'cloud', 2500, 50);
+                }
+                const deRetried = (await statusSnap()).siteLoadCount > deBefore; // show() reloaded
+                const deVeil = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.connectingUp && p.veilUp && p.showing && p.offlineState === 'ok'
+                    && p.bounds.x === 0 && p.bounds.y === 0
+                    && Math.abs(p.bounds.width - win.getContentBounds().width) <= 2
+                    && Math.abs(p.bounds.height - win.getContentBounds().height) <= 2;
+                }, 3500);
+                cloudSes.webRequest.onBeforeRequest(deadFilter, null); // unpoison
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined);
+                const deLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.connectingUp && !p.veilUp && !p.showing && p.collapsed && p.offlineState === 'ok';
+                }, 8000);
+                const f_c3_deadReentryRetries = deLocal && deCloud && deRetried && deVeil && deLifted;
+                console.log('[c3-deadreentry]', JSON.stringify({
+                  f_c3_deadReentryRetries,
+                  matrix: { deLocal, deCloud, deRetried, deVeil, deLifted },
+                  raw: { deBefore },
+                }));
+
+                // C3-hotfix-2 — warm-entry guard: with a HEALTHY site (the restore above just
+                // loaded it — siteLoadOk true), local → cloud must NOT reload (C2i warmth,
+                // preserved by FIX B's !siteLoadOk gate).
+                const warmBefore = (await statusSnap()).siteLoadCount;
+                let warmLocal = false;
+                for (let attempt = 0; attempt < 3 && !warmLocal; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'local');
+                  warmLocal = await waitFor(async () =>
+                    (await readModeSafe()) === 'local' && appMode === 'local', 2500, 50);
+                }
+                let warmCloud = false;
+                for (let attempt = 0; attempt < 3 && !warmCloud; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  warmCloud = await waitFor(async () =>
+                    (await readModeSafe()) === 'cloud' && appMode === 'cloud', 2500, 50);
+                }
+                await sleep(300); // a (wrong) reload would land within this window
+                const warmSnap = await statusSnap();
+                const f_c3_warmEntryNoReload = warmLocal && warmCloud
+                  && warmSnap.siteLoadCount === warmBefore && !warmSnap.connectingUp;
+                console.log('[c3-warmentry]', JSON.stringify({
+                  f_c3_warmEntryNoReload,
+                  matrix: { warmLocal, warmCloud, warmBefore, warmAfter: warmSnap.siteLoadCount, connectingUp: warmSnap.connectingUp },
+                }));
+
+                // C3-hotfix-3 — f_c3_deadPageAlwaysCards: a main-frame failure of a
+                // NEVER-succeeded page gets the card whatever the code or net flag. Fresh
+                // hang ⇒ force an UNLISTED code (-2) with the net flag reading TRUE (the old
+                // condition: silence ⇒ white forever) ⇒ the offline card MUST appear;
+                // restore ⇒ success lifts it.
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined);
+                await sleep(300);
+                cloudCtl!.onSiteLoadFailed(-2, true, CLOUD_URL); // unlisted code + net flag true
+                const dpCard = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed'
+                    && (p.lastShow as { title?: string } | null)?.title === 'No internet — Cloud mode needs it';
+                }, 3000);
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined);
+                const dpLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.showing && p.collapsed && p.siteLoadOk;
+                }, 8000);
+                const f_c3_deadPageAlwaysCards = dpCard && dpLifted;
+                console.log('[c3-deadpage]', JSON.stringify({
+                  f_c3_deadPageAlwaysCards,
+                  matrix: { dpCard, dpLifted },
+                  raw: { forcedCode: -2, forcedIsMainFrame: true },
+                }));
+
+                // C3-hotfix-4 — f_c3_phantomFinishVetoed (THE KILLER). Chromium LIES: after a
+                // failed main-frame load the view holds the internal ERROR document
+                // (chrome-error://chromewebdata/, empty body — the c3autopsy probe) and a
+                // did-finish-load fires FOR IT ~5 ms after the failure (navtruth.js). The
+                // veto: a finish is only a success if NOTHING failed on the way. Fresh dead
+                // attempt ⇒ forced main-frame -105 ⇒ offline card + stamp ⇒ forced success
+                // (the phantom, via the REAL handler seam) ⇒ MUST be vetoed: no siteLoadOk,
+                // state stays entry-failed, veil stays up.
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined); // fresh attempt (resets the stamp)
+                await sleep(300);
+                cloudCtl!.onSiteLoadFailed(-105, true, CLOUD_URL); // main-frame verdict stamps the attempt
+                const phCard = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed' && p.attemptFailed === true;
+                }, 3000);
+                cloudCtl!.onSiteLoadSucceeded(); // the ERROR document's phantom finish
+                await sleep(120); // any (wrong) lift/settle would land within this window
+                const phSnap = await statusSnap();
+                const f_c3_phantomFinishVetoed = phCard
+                  && phSnap.siteLoadOk === false
+                  && phSnap.offlineState === 'entry-failed'
+                  && phSnap.phantomFinishes === 1
+                  && phSnap.veilUp === true;
+                console.log('[c3-phantom]', JSON.stringify({
+                  f_c3_phantomFinishVetoed,
+                  matrix: { phCard },
+                  raw: {
+                    siteLoadOk: phSnap.siteLoadOk, offlineState: phSnap.offlineState,
+                    phantomFinishes: phSnap.phantomFinishes, veilUp: phSnap.veilUp,
+                    attemptFailed: phSnap.attemptFailed,
+                  },
+                }));
+
+                // C3-hotfix-4 — f_c3_realRecoveryAfterVeto: the veto must never become a NEW
+                // brick. Continue the EXACT phantom state: the real [Try again] button
+                // (statusDrive rides the real ipc path) starts a fresh attempt (resetting the
+                // stamp) and loads the true CLOUD_URL ⇒ a GENUINE finish is BELIEVED ⇒
+                // siteLoadOk true, state 'ok', veil lifted.
+                await cloudCtl!.statusDrive('retry');
+                const rvOk = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.showing && p.collapsed && p.siteLoadOk && !p.attemptFailed
+                    && p.offlineState === 'ok' && p.phantomFinishes === 1;
+                }, 12000);
+                const f_c3_realRecoveryAfterVeto = rvOk;
+                console.log('[c3-vetorecovery]', JSON.stringify({
+                  f_c3_realRecoveryAfterVeto,
+                  matrix: { rvOk },
+                }));
+
+                // C3-hotfix-4 — f_c3_subframeNeverStamps: sub-frame noise NEVER stamps the
+                // attempt (the same !isMainFrame guard that protects the watchdog) and never
+                // poisons a HEALTHY page — the site's next finish is still believed (not
+                // counted as a phantom).
+                cloudCtl!.onSiteLoadFailed(-3, false, CLOUD_URL); // sub-frame noise, healthy site
+                const sfNoiseSnap = await statusSnap();
+                cloudCtl!.onSiteLoadSucceeded(); // the site's genuine finish, after the noise
+                await sleep(120);
+                const sfSnap = await statusSnap();
+                const f_c3_subframeNeverStamps = sfNoiseSnap.attemptFailed === false
+                  && sfSnap.siteLoadOk === true && sfSnap.attemptFailed === false
+                  && sfSnap.phantomFinishes === 1;
+                console.log('[c3-subframe-stamp]', JSON.stringify({
+                  f_c3_subframeNeverStamps,
+                  matrix: { noiseStamped: sfNoiseSnap.attemptFailed },
+                  raw: {
+                    siteLoadOk: sfSnap.siteLoadOk, attemptFailed: sfSnap.attemptFailed,
+                    phantomFinishes: sfSnap.phantomFinishes,
+                  },
+                }));
+
+                // C3-hotfix-4 — f_c3_navResetReArmsSuccess (FIX B): a NEW main-frame
+                // same-origin navigation re-arms success — the error document emits NO
+                // navigation events (navtruth.js), so only a real load attempt (ours, or
+                // Chromium's own connectivity-restore auto-reload) can clear the stamp.
+                // Fired via the DEV seam, which calls the SAME navReArm the listener calls.
+                cloudCtl!.onSiteLoadFailed(-105, true, CLOUD_URL); // stamp a fresh failure
+                const nrStamped = (await statusSnap()).attemptFailed === true;
+                cloudCtl!.siteNavReArm(CLOUD_URL, true); // the FIX B reset (listener logic)
+                const nrReset = (await statusSnap()).attemptFailed === false;
+                cloudCtl!.onSiteLoadSucceeded(); // a following success is BELIEVED again
+                await sleep(120);
+                const nrSnap = await statusSnap();
+                const f_c3_navResetReArmsSuccess = nrStamped && nrReset
+                  && nrSnap.siteLoadOk === true && nrSnap.phantomFinishes === 1
+                  && nrSnap.offlineState === 'ok';
+                console.log('[c3-navreset]', JSON.stringify({
+                  f_c3_navResetReArmsSuccess,
+                  matrix: { nrStamped, nrReset },
+                  raw: {
+                    siteLoadOk: nrSnap.siteLoadOk, offlineState: nrSnap.offlineState,
+                    phantomFinishes: nrSnap.phantomFinishes,
+                  },
+                }));
+
+                // C3-hotfix-5 — THE HIDDEN LEGS (the owner's repro: flip to Local WHILE the
+                // load still hangs ⇒ the -105 fires AFTER the flip, while the site view is
+                // HIDDEN). hf5 FIX A — the STAMP is truth (main-frame ALWAYS, hidden
+                // included); only the VERDICT is UI (cloud-shown). phantomFinishes is a
+                // RUNNING counter across the stage — these legs assert DELTAS. Relay flips
+                // are programmatic (no transitionArmedAt stamp ⇒ instant, no melt —
+                // consistent with systemFlipNeverMelts / f_c2m_flipDissolve).
+                // f_c3_hiddenFailStillStamps (THE NEW KILLER): fresh hanging attempt → flip
+                // to Local → the hidden main-frame -105 → the stamp MUST still land, with
+                // NO verdict and NO card over Local (never veilUp/showing while hidden).
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined); // fresh attempt (resets stamp/truth)
+                await sleep(300); // the load hangs silently — flip out mid-flight (the owner's move)
+                let hidLocal = false;
+                for (let attempt = 0; attempt < 3 && !hidLocal; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'local');
+                  hidLocal = await waitFor(async () =>
+                    (await readModeSafe()) === 'local' && appMode === 'local', 2500, 50);
+                }
+                cloudCtl!.onSiteLoadFailed(-105, true, CLOUD_URL); // the HIDDEN -105 (fires after the flip)
+                await sleep(120);
+                const hidSnap = await statusSnap();
+                const f_c3_hiddenFailStillStamps = hidLocal
+                  && hidSnap.attemptFailed === true
+                  && hidSnap.siteLoadOk === false
+                  && hidSnap.offlineState === 'ok'
+                  && hidSnap.veilUp === false && hidSnap.showing === false;
+                console.log('[c3-hiddenfail]', JSON.stringify({
+                  f_c3_hiddenFailStillStamps,
+                  matrix: { hidLocal },
+                  raw: {
+                    attemptFailed: hidSnap.attemptFailed, siteLoadOk: hidSnap.siteLoadOk,
+                    offlineState: hidSnap.offlineState, veilUp: hidSnap.veilUp,
+                    showing: hidSnap.showing,
+                  },
+                }));
+
+                // C3-hotfix-5 — f_c3_hiddenPhantomVetoed (continue the EXACT state): the
+                // error document's phantom finish arrives while STILL hidden ⇒ the veto must
+                // kill it here too (the lie must not be believed any more than while shown).
+                const hpPfBefore = (await statusSnap()).phantomFinishes;
+                cloudCtl!.onSiteLoadSucceeded(); // the phantom finish (hidden)
+                await sleep(120);
+                const hpSnap = await statusSnap();
+                const f_c3_hiddenPhantomVetoed = hpSnap.siteLoadOk === false
+                  && hpSnap.attemptFailed === true
+                  && hpSnap.phantomFinishes === hpPfBefore + 1
+                  && hpSnap.offlineState === 'ok'
+                  && hpSnap.veilUp === false;
+                console.log('[c3-hiddenphantom]', JSON.stringify({
+                  f_c3_hiddenPhantomVetoed,
+                  matrix: { hpPfBefore },
+                  raw: {
+                    siteLoadOk: hpSnap.siteLoadOk, attemptFailed: hpSnap.attemptFailed,
+                    phantomFinishes: hpSnap.phantomFinishes, offlineState: hpSnap.offlineState,
+                    veilUp: hpSnap.veilUp,
+                  },
+                }));
+
+                // C3-hotfix-5 — f_c3_hiddenFailReentryRetries (the full heal, one leg): flip
+                // back to Cloud ⇒ show() sees the HONEST !siteLoadOk and RETRIES (hf2's FIX B
+                // finally firing on truthful bookkeeping — the owner's white-forever brick,
+                // healed) ⇒ the fresh attempt resets the stamp ⇒ the real CLOUD_URL loads ⇒
+                // lifted. Wi-Fi is ON in the dev env, so the retry load succeeds.
+                const hrScBefore = (await statusSnap()).siteLoadCount;
+                let hidCloud = false;
+                for (let attempt = 0; attempt < 3 && !hidCloud; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  hidCloud = await waitFor(async () =>
+                    (await readModeSafe()) === 'cloud' && appMode === 'cloud', 2500, 50);
+                }
+                const hrRetried = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.siteLoadCount > hrScBefore && p.attemptFailed === false;
+                }, 3000);
+                const hrLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.siteLoadOk === true && !p.showing && p.collapsed
+                    && p.offlineState === 'ok';
+                }, 8000);
+                const f_c3_hiddenFailReentryRetries = hidCloud && hrRetried && hrLifted;
+                console.log('[c3-hiddenreentry]', JSON.stringify({
+                  f_c3_hiddenFailReentryRetries,
+                  matrix: { hidCloud, hrRetried, hrLifted },
+                  raw: { hrScBefore },
+                }));
+
+                // Cleanup for the dead-last C2h idle stage: local, synced, chip idle, veil
+                // down, no net override, real site restored, no warm arm. Same desync
+                // insurance on the way home.
+                let localReady = false;
+                for (let attempt = 0; attempt < 3 && !localReady; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'local');
+                  localReady = await waitFor(async () =>
+                    (await readModeSafe()) === 'local' && appMode === 'local', 2500, 50);
+                }
+                transitionArmedAt = 0;
+                const endSnap = await statusSnap();
+                console.log('[c3-clean]', JSON.stringify({
+                  chipIdleAtEnd: !endSnap.showing && endSnap.collapsed,
+                  finalMode: appMode,
+                }));
               }
 
               // (6) C2h FIX 6 — f_c2h_cloudActivityFeedsIdleLock — DEAD-LAST in this stage; its
@@ -4871,9 +5590,22 @@ function createWindow(): void {
               // the shared clock; locking shortly AFTER feeding stops proves nothing else did.
               {
                 await manager.setSettings({ autoLockMinutes: 1 }); // minimum legal; this very call touches ⇒ t₀
-                win.webContents.send('pill:flipRequested', 'cloud');
-                await sleep(1500);
-                const enteredCloud = appMode === 'cloud';
+                // C3-hotfix-3 run-2 lesson: this was the LAST single-fire relay in the harness
+                // and it got DROPPED (enteredCloud:false — the documented C2m-hotfix-2
+                // dropped-relay artifact; the renderer was still settling from the (5e)
+                // cleanup's guarded switch). Same desync insurance as every (5e) relay.
+                // Harness-only; the product path is untouched. (waitFor is (5e)-scoped —
+                // this sibling block polls with sleep + readModeSafe directly.)
+                let c2hCloudReady = false;
+                for (let attempt = 0; attempt < 3 && !c2hCloudReady; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  const c2hT0 = Date.now();
+                  while (Date.now() - c2hT0 < 2500 && !c2hCloudReady) {
+                    c2hCloudReady = (await readModeSafe()) === 'cloud' && appMode === 'cloud';
+                    if (!c2hCloudReady) await sleep(50);
+                  }
+                }
+                const enteredCloud = c2hCloudReady && appMode === 'cloud';
                 const t0 = Date.now();
                 let lastFeedAt = Date.now();
                 const samples: Array<{ tMs: number; state: string }> = [{ tMs: 0, state: manager.status().state }];
@@ -5159,6 +5891,24 @@ function registerIpc(): void {
   // apply, in arrival order. Rejections (invalid mode) still propagate to their caller
   // without poisoning the chain (the next link runs on either outcome).
   let modeApplyChain: Promise<'cloud' | 'local'> = Promise.resolve(appMode);
+  /** C3 STEP 5 (D7) — race a promise against CAPTURE_DEADLINE_MS; the loser's result is
+   * discarded. A capturePage() on a never-painted (dead cloud) view HANGS — try/catch
+   * catches rejections, not hangs — and the serialized modeApplyChain queued every later
+   * flip behind the stall (owner evidence §2.4: blocked a few tries). Timeout ⇒ null ⇒
+   * the existing instant-flip fail-open. */
+  const withTimeout = async <T>(p: Promise<T>, ms: number): Promise<T | null> => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        p,
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), ms);
+        }),
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  };
   const applyModeNow = async (next: 'cloud' | 'local'): Promise<'cloud' | 'local'> => {
     if (next !== 'cloud' && next !== 'local') throw new Error('Invalid mode.');
     if (next === appMode) return appMode;
@@ -5172,14 +5922,16 @@ function registerIpc(): void {
     // empty frame ⇒ null ⇒ today's instant flip; the effect can never break a flip).
     // Cloud→Local captures the SITE view; Local→Cloud captures the MAIN window's page (the
     // local page only — native overlays are separate views and never in the shot).
+    // C3 STEP 5 (D7) — BOTH captures race the CAPTURE_DEADLINE_MS deadline; a hang or slow
+    // frame ⇒ null ⇒ instant flip. A snapshot may never hold the flip chain hostage.
     let png: string | null = null;
     if (armed) {
       try {
         if (next === 'local') {
-          png = cloudCtl ? await cloudCtl.captureViewPng() : null;
+          png = cloudCtl ? await withTimeout(cloudCtl.captureViewPng(), CAPTURE_DEADLINE_MS) : null;
         } else if (mainWindow && !mainWindow.isDestroyed()) {
-          const image = await mainWindow.webContents.capturePage();
-          png = image.isEmpty() ? null : `data:image/png;base64,${image.toPNG().toString('base64')}`;
+          const image = await withTimeout(mainWindow.webContents.capturePage(), CAPTURE_DEADLINE_MS);
+          png = !image || image.isEmpty() ? null : `data:image/png;base64,${image.toPNG().toString('base64')}`;
         }
       } catch {
         png = null;
@@ -5198,6 +5950,9 @@ function registerIpc(): void {
     } else {
       appMode = 'local';
       cloudCtl?.hide();
+      // C3 STEP 4 — the veil is cloud-only: reaching Local clears ANY active offline state
+      // (entry-failed veil or degraded chip) — the edge case the order names. Idempotent.
+      cloudCtl?.clearOfflineState();
     }
     // C2f FIX 2 — the knob slides ONLY when the mode ACTUALLY applied (never on request).
     cloudCtl?.setPillMode(appMode);
@@ -5220,20 +5975,52 @@ function registerIpc(): void {
   // C2f FIX 2 — the pill's ONE outbound channel: forward the flip request to the MAIN window
   // renderer, which runs the EXISTING guarded switchMode (unsaved-work discard-confirm
   // included). The pill never switches anything by itself. Then give keyboard focus back.
-  ipcMain.on('pill:flip', (_e, next: 'cloud' | 'local') => {
+  // C3 STEP 4 — the body is FACTORED into requestUserFlip so the status veil's
+  // [Switch to Local] button rides THE SAME user-flip path (arm stamp + pill room + relay +
+  // focus return): one user-flip path, no duplicates (D5/D8 — the card-button flip melts
+  // exactly like a pill click, and from a dead page the D7 deadline keeps it instant).
+  const requestUserFlip = (next: 'cloud' | 'local'): void => {
     if (next !== 'cloud' && next !== 'local') return;
     if (!mainWindow || mainWindow.isDestroyed()) return;
-    // C2m — arm the flip dissolve: THIS ipc is the user path (the pill click). applyMode melts
-    // only while the stamp is warm (< 10 s); everything programmatic stays instant.
+    // C2m — arm the flip dissolve: THIS path is the user path. applyMode melts only while
+    // the stamp is warm (< 10 s); everything programmatic stays instant.
     transitionArmedAt = Date.now();
     // C2g-hotfix-6 FIX 2 — arm the Style A flip room BEFORE relaying: the 124 × 28 skirt must
     // be in place before the renderer's guarded switch lands the knob's class and the elastic
     // transform starts (its overshoot paints past the trough's ends instead of clipping).
     cloudCtl?.beginPillFlip();
-    pillFlipRelayCount += 1; // C2g-hotfix-1 §5 — relay-receipt evidence for the real-click robot
     console.log('[pill] flip requested →', next);
     mainWindow.webContents.send('pill:flipRequested', next);
     cloudCtl?.blurPill();
+  };
+  ipcMain.on('pill:flip', (_e, next: 'cloud' | 'local') => {
+    if (next !== 'cloud' && next !== 'local') return;
+    pillFlipRelayCount += 1; // C2g-hotfix-1 §5 — receipts of REAL pill:flip ipc (status-driven
+    // flips deliberately do NOT increment: this counter means pill clicks, robot-leg evidence)
+    requestUserFlip(next);
+  });
+  // C3 STEP 1 — the status layer's action buttons land here (preload enum-checked, main
+  // re-checks): cancel the shown download / take the guarded user-flip home / retry the
+  // dead page (veil stays up while trying).
+  ipcMain.on('status:action', (_e, a: unknown) => {
+    if (!a || typeof a !== 'object') return;
+    const id = (a as { id?: unknown }).id;
+    if (id === 'cancel') {
+      cloudCtl?.statusCancelDownload();
+    } else if (id === 'switch-local') {
+      requestUserFlip('local');
+    } else if (id === 'retry') {
+      cloudCtl?.offlineRetry();
+    }
+  });
+  // C3 STEP 1 — the page measured its chip content: main snaps the native room to the
+  // measured width (zero-miss click rule). Double-validated (preload already did). Payload
+  // is {width:number} per the C3 channel inventory.
+  ipcMain.on('status:measure', (_e, p: unknown) => {
+    if (!p || typeof p !== 'object') return;
+    const w = (p as { width?: unknown }).width;
+    if (typeof w !== 'number' || !Number.isFinite(w) || w < 0 || w > 2000) return;
+    cloudCtl?.statusMeasured(Math.round(w));
   });
   // C2g FIX 3 — Style B hover coupling: the layer reports enter/leave, main resizes the native
   // view (re-centered) in the same tick its CSS bloom starts. Strictly validated.

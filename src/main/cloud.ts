@@ -28,9 +28,10 @@
  *   aware width, always), with the 0/100/400 ms deferred re-apply on geometry events.
  */
 
-import { BrowserWindow, app, session, shell, WebContentsView } from 'electron';
+import { BrowserWindow, app, dialog, net, session, shell, WebContentsView } from 'electron';
 import { join } from 'node:path';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 export const CLOUD_URL = 'https://drag-drop-app.vercel.app';
@@ -97,6 +98,37 @@ export const MELT_READY_TIMEOUT_MS = 400;
  * world under the identical curtain pixels); the melt starts ~50 ms later, still well inside
  * the pill knob's 600 ms swing. */
 export const MELT_SWAP_PAD_MS = 50;
+
+/** C3 STEP 5 (D7) — the snapshot deadline. Owner evidence 2026-08-29: flipping away from a
+ * DEAD cloud page (never-loaded view) blocked the first few flips — capturePage() on the
+ * never-painted view HANGS (try/catch catches rejections, not hangs), and the serialized
+ * modeApplyChain queued every later flip behind the stalled capture. BOTH captures in
+ * applyModeNow (site captureViewPng AND mainWindow capturePage) get THIS long to resolve;
+ * a timeout ⇒ null ⇒ the existing instant-flip fail-open. A slow snapshot may NEVER hold
+ * the flip chain hostage. beginMelt's own ready deadline (MELT_READY_TIMEOUT_MS) unchanged. */
+export const CAPTURE_DEADLINE_MS = 350;
+
+/** C3-hotfix-1 FIX B — the CONNECTING backstop. The veil keyed to did-fail-load alone leaves
+ * a 5–6 s white window on WSL — Chromium takes that long to admit failure, and net.isOnline()
+ * always reads true here (the net-flag backstop can't fire either). 3 s of silence on a FRESH
+ * load ⇒ tell the owner something, honestly (a Connecting card — the net has NOT failed, the
+ * page is just slow). Healthy entries (~1.5 s loads) never see it. */
+export const ENTRY_CONNECT_TIMEOUT_MS = 3000;
+
+/** C3 STEP 1 (D1) — the STATUS layer: compact chip anchored one comfortable row under the
+ * pill band (pill rest bottom edge = PILL_TOP + PILL_H = 38, +12 gap ⇒ 50), height 36.
+ * Owner picked the look live from c3-status-strip-preview.html (2026-08-29): ink-bar chip
+ * (#1A1A1A, white text, gold accent, radius 999), centered horizontally; the offline veil
+ * is a themed full-window page with a centered card. Width is MEASURED by the page
+ * (status:measure) and clamped to ≤60% of the window — the zero-miss click rule: the
+ * native room always EQUALS the visible footprint (idle = collapsed 0×0 + hidden). */
+export const STATUS_TOP = PILL_TOP + PILL_H + 12; // 50
+export const STATUS_H = 36;
+/** D1/D2 — dwell constants: the ✓ flash chip lives ~1.4 s (main collapses the native room
+ * just after the page's flash fades); a plain hide holds the room through the 280 ms
+ * slide-up before collapsing (card dismiss-hold precedent). */
+export const STATUS_FLASH_MS = 1400;
+const STATUS_HIDE_HOLD_MS = 280;
 
 /** C2g-hotfix-4 FIX 2 — Style-B BLOOM-TIME breathing room ONLY (explicit owner-approved
  * trade-off). While bloomed, the native room grows to 132 × 44 so TWO things never clip inside
@@ -219,6 +251,13 @@ export interface CloudController {
     faderCardBridgeType: string;
     pillFaderBridgeType: string;
     cardFaderBridgeType: string;
+    statusDropsyncType: string;
+    statusBridgeType: string;
+    statusCardBridgeType: string;
+    statusFaderBridgeType: string;
+    pillStatusBridgeType: string;
+    cardStatusBridgeType: string;
+    faderStatusBridgeType: string;
   }>;
   /**
    * f_c1_authSeen — READ-ONLY signed-in marker inside the persist:cloud session. Marker chain
@@ -347,6 +386,87 @@ export interface CloudController {
     bounds: Electron.Rectangle | null;
     collapsed: boolean;
   }>;
+  /** C3 STEP 1 — the status layer's `status:measure` landed (ipcMain in index.ts forwards
+   * here): remember the natural content width and re-assert the exact chip room. */
+  statusMeasured(width: number): void;
+  /** C3 STEP 1 — status-layer evidence for f_c3_* (DEV-gated): attach/showing, live bounds,
+   * veil state, the measured width, the last show/progress/hide payloads forwarded, the
+   * offline state machine's state and the auto-recovery reload counter. */
+  statusProbe(): Promise<{
+    attached: boolean;
+    showing: boolean;
+    bounds: Electron.Rectangle;
+    collapsed: boolean;
+    veilUp: boolean;
+    lastMeasure: number;
+    lastShow: Record<string, unknown> | null;
+    lastProgress: { fraction: number | null; label?: string } | null;
+    lastHideFlash: string | null;
+    offlineState: 'ok' | 'entry-failed' | 'degraded';
+    /** C3-hotfix-1 FIX B — the Connecting veil is up (offlineState stays 'ok' beneath it). */
+    connectingUp: boolean;
+    /** C3-hotfix-2 FIX B — site-view load attempts (battery proof that a re-entry reloaded). */
+    siteLoadCount: number;
+    /** C3-hotfix-3 — the load truth itself (the battery's white-forever detector: NO card
+     * while `!siteLoadOk` is exactly the state this hotfix makes impossible). */
+    siteLoadOk: boolean;
+    /** C3-hotfix-4 — the success-veto stamp: TRUE from a main-frame failure until the next
+     * fresh attempt or a FIX B navigation re-arm. */
+    attemptFailed: boolean;
+    /** C3-hotfix-4 — phantom finishes vetoed (a finish after a stamp = the ERROR document). */
+    phantomFinishes: number;
+    reloadCount: number;
+    lastSavePath: string | null;
+  }>;
+  /** C3 — battery-only (env-gated): click the REAL buttons in the REAL layer (chip [Cancel]/
+   * [Switch to Local], veil [Switch to Local]/[Try again]) so status:action rides the real
+   * ipc path. Throws when DROPSYNC_CLOUD_DEV ≠ 1. */
+  statusDrive(event: 'cancel' | 'switch-local' | 'retry'): Promise<void>;
+  /** C3 — battery-only (env-gated): evaluate JS inside the STATUS page (our own page — the
+   * pillEval precedent) for DOM-truth asserts (theme attr, painted classes). */
+  statusEval<T = unknown>(expr: string): Promise<T>;
+  /** C3 STEP 2 (D2) — the chip's [Cancel]: item.cancel() on the download the chip currently
+   * shows; the done handler cleans up the partial + the chip. No-op without an active item. */
+  statusCancelDownload(): void;
+  /** C3 STEP 4 (D5) — the veil's [Try again]: reload the site view; the veil STAYS up while
+   * trying (failure ⇒ did-fail-load ⇒ veil remains — honest). No-op outside entry-failed. */
+  offlineRetry(): void;
+  /** C3 STEP 4 — clear any active offline state + veil/chip. Called on every mode change to
+   * local (the veil is cloud-only) — idempotent. */
+  clearOfflineState(): void;
+  /** C3 STEP 4 — test seam for netStatus(): boolean override (null = real net.isOnline()).
+   * DEV-gated; the battery drives the offline transitions deterministically. */
+  setNetOverride(v: boolean | null): void;
+  /** C3 STEP 4 — the shared site load-failure path (the factored did-fail-load log + the
+   * offline verdict). The real event handler and the battery both land here. */
+  onSiteLoadFailed(code: number, isMainFrame: boolean, url: string, desc?: string): void;
+  /** C3-hotfix-4 — battery-only (env-gated): invoke the REAL success handler directly (the
+   * onSiteLoadFailed seam's mirror) so the veto leg exercises the exact real path. */
+  onSiteLoadSucceeded(): void;
+  /** C3-hotfix-4 — battery-only (env-gated): fire the FIX B re-arm through the SAME
+   * navReArm the did-start-navigation listener calls (main-frame + same-origin shape). */
+  siteNavReArm(url: string, isMainFrame: boolean): void;
+  /** C3-hotfix-1 FIX C — mic diagnostic (DEV-gated, READ-ONLY evaluation on the SITE view,
+   * the probeAuthSeen precedent): what the page's own permission queries + getUserMedia
+   * actually return. The decision tree runs on this evidence. 5 s timeout ⇒ 'timeout'. */
+  mediaDiag(): Promise<{ micQuery: string; camQuery: string; gum: string }>;
+  /** C3 STEP 2 — battery-only (env-gated): arm a hold so the NEXT download pauses right
+   * after its save path is set — makes "cancel mid-flight" deterministic headlessly (a tiny
+   * data: URL download would otherwise complete before the cancel could land). */
+  downloadTestArm(hold: boolean): void;
+  /** C3 STEP 6 — battery-only (env-gated): point the site view at an arbitrary URL (the
+   * dead-cloud leg's TEST-NET-1 target) and restore it. Battery-only I1 exception, ordered. */
+  siteDriveNavigate(url: string): Promise<void>;
+  /** C3 STEP 3 — DEV-gated doorman truth table: invokes the registered site-session handlers
+   * DIRECTLY (the only deterministic allow-path proof — the real site can't be scripted). */
+  doormanProbe(): Promise<{
+    mediaSite: boolean;
+    mediaEvil: boolean;
+    geoSite: boolean;
+    checkMediaSite: boolean;
+    checkMediaEvil: boolean;
+    checkNotifications: boolean;
+  }>;
 }
 
 /** https-only external handoff (I2). Returns true when handed off. */
@@ -385,17 +505,28 @@ function attachGuards(
   wc: Electron.WebContents,
   opts: { strictNav: boolean },
   onFirstLoad: () => void,
+  /** C3 STEP 4 — the shared load-failure path (factored did-fail-load log + offline
+   * verdict). Both the real event and the battery's forced invocations land on it. */
+  onLoadFailed?: (code: number, isMainFrame: boolean, url: string, desc?: string) => void,
+  /** C3-hotfix-1 FIX A — the veil's SUCCESS exit. Fires on EVERY main-frame did-finish-load
+   * (that event IS main-frame-only; deliberately NOT also fired from did-frame-finish-load).
+   * The SITE view's attachGuards call passes the real handler; the POPUP propagation passes
+   * undefined — a popup finishing load must NEVER clear the offline state. */
+  onLoadSucceeded?: () => void,
 ): void {
   let firstLoadSeen = false;
-  wc.once('did-finish-load', () => {
+  wc.on('did-finish-load', () => {
     if (!firstLoadSeen) {
       firstLoadSeen = true;
       onFirstLoad();
     }
+    onLoadSucceeded?.();
   });
-  wc.on('did-fail-load', (_e, code, desc, url) => {
-    // C1: log only — Chromium's default error page is accepted (friendly card is C3).
-    console.log('[cloud] did-fail-load:', code, desc, url.slice(0, 120));
+  wc.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    // C1 logged this; C3 routes it through the SHARED path — the log AND the offline
+    // verdict (veil on entry failure) live in onSiteLoadFailed, so the battery can drive
+    // the exact real path.
+    onLoadFailed?.(code, isMainFrame, url, desc);
   });
   wc.setWindowOpenHandler(({ url }) => {
     // FIX C — every decision path is loud; this class of bug must never be invisible again.
@@ -411,7 +542,7 @@ function attachGuards(
     if (decision === 'external') openExternalHttps(url);
     return { action: 'deny' };
   });
-  wc.on('did-create-window', (child) => attachGuards(child.webContents, { strictNav: false }, onFirstLoad));
+  wc.on('did-create-window', (child) => attachGuards(child.webContents, { strictNav: false }, onFirstLoad, onLoadFailed, undefined));
   if (opts.strictNav) {
     wc.on('will-navigate', (e, url) => {
       try {
@@ -473,10 +604,24 @@ function faderPageUrl(): string {
   return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/fader/fader.html');
 }
 
-export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: () => void }): CloudController {
+/** C3 — where the STATUS page lives (cloned from faderPageUrl): dev server in dev, built
+ * multi-page output in production. No query params — the status layer carries no persisted
+ * state (the veil theme rides each status:show payload). */
+function statusPageUrl(): string {
+  const devRoot = process.env.ELECTRON_RENDERER_URL;
+  if (devRoot) return `${devRoot}/status/status.html`;
+  return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/status/status.html');
+}
+
+export function initCloud(mainWindow: BrowserWindow, opts?: {
+  onUserActivity?: () => void;
+  /** C3 — the app's CURRENT theme reader (index.ts owns the vault settings); the offline
+   * veil dresses in it at display time (C2k display-time theme rule). */
+  currentTheme?: () => unknown;
+}): CloudController {
   // C2h FIX 2/3 — main-provided activity feed: gestures sensed on the cloud view call this
   // (wired in index.ts to manager.touch()), so Cloud input feeds the SAME idle clock as Local.
-  const { onUserActivity } = opts ?? {};
+  const { onUserActivity, currentTheme } = opts ?? {};
   let view: WebContentsView | null = null;
   let shown = false;
   let readyMs: number | null = null;
@@ -511,6 +656,63 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
   // timer does (presented-pixels headroom). Cleared by collapseFader with the same discipline
   // as the ready deadline — no pad may fire after a cancel, no awaiter may hang.
   let faderSwapPadTimer: ReturnType<typeof setTimeout> | null = null;
+  // C3 — the STATUS layer is created EAGERLY at boot (fader recipe) and NEVER removed;
+  // collapsed 0×0 + hidden at rest. The chip is the download/degraded presentation, the veil
+  // the cloud-only offline page. One presentation at a time (statusActive).
+  let statusView: WebContentsView | null = null;
+  let statusLoaded = false;
+  let statusActive = false;
+  let statusVeilUp = false;
+  let statusLastMeasure = 0; // last natural content width reported by the page
+  let statusPendingShow: Record<string, unknown> | null = null; // show before the page finished loading
+  let statusCollapseTimer: ReturnType<typeof setTimeout> | null = null; // main-owned collapse timing
+  let statusLastShow: Record<string, unknown> | null = null; // probe evidence
+  let statusLastProgress: { fraction: number | null; label?: string } | null = null;
+  let statusLastHideFlash: string | null = null;
+  // C3 STEP 4 — the offline state machine. netStatus() is the SEAM (battery override);
+  // ENTRY_FAILED = the site's main frame failed offline-ish while cloud is shown (veil);
+  // DEGRADED = net observed true→false WHILE cloud is shown (chip, NO reload — D6).
+  type OfflineState = 'ok' | 'entry-failed' | 'degraded';
+  let offlineState: OfflineState = 'ok';
+  let netOverride: boolean | null = null;
+  let sawOfflineSinceEntry = false; // entry-failed auto-recovers ONLY on a false→true transition
+  let offlinePollInterval: ReturnType<typeof setInterval> | null = null; // armed ONLY when needed
+  let offlineReloadCount = 0; // auto-recovery reload spy (battery evidence)
+  // C3-hotfix-1 FIX B — the connecting watchdog. Armed ONLY on fresh loads/reloads of the
+  // site view (creation, [Try again], the auto-recovery reload, and the battery-only
+  // siteDriveNavigate seam); NEVER on show() of an already-loaded view. `connectingUp` =
+  // the honest "still connecting" veil is up while offlineState stays 'ok' (the net has NOT
+  // failed — the page is just slow). Cleared by did-finish-load (site view), did-fail-load,
+  // clearOfflineState, and any newer arm (idempotent re-arm).
+  let connectingUp = false;
+  let connectWatchdog: ReturnType<typeof setTimeout> | null = null;
+  // C3-hotfix-2 FIX B — the site view's load TRUTH. `siteLoadOk` is set TRUE by the success
+  // path and FALSE at the start of EVERY fresh load attempt (creation, [Try again], the
+  // auto-recovery reload, the battery seam, and the re-entry reload below). show() reads it:
+  // re-entry into a view whose load never succeeded is treated as a fresh attempt (the
+  // owner's brick — Local → Cloud after a failed load used to sit white forever). Healthy
+  // pages are NEVER reloaded — C2i's warm re-entry stays byte-identical. `siteLoadCount`
+  // counts load attempts (battery evidence: a re-entry must increment it).
+  let siteLoadOk = false;
+  let siteLoadCount = 0;
+  // C3-hotfix-4 FIX A — THE SUCCESS VETO (repair-order-c3-hotfix-4). Chromium LIES: after a
+  // failed main-frame load the view holds the internal ERROR document
+  // (chrome-error://chromewebdata/, EMPTY body, transparent background — the c3autopsy
+  // probe), and a did-finish-load fires FOR THAT DOCUMENT ~5 ms after the did-fail-load
+  // (the navtruth.js probe). A finish is only a success if NOTHING failed on the way:
+  // every main-frame failure stamps `attemptFailed`, and a stamped attempt's finish is a
+  // PHANTOM — vetoed, counted in `phantomFinishes` (battery evidence). The stamp is the
+  // only honest signal: on the error page getURL() still returns the ATTEMPTED https url
+  // and isLoading() is unreliable — both fix directions are dead per the probes.
+  let attemptFailed = false;
+  let phantomFinishes = 0;
+  // C3 STEP 2 — downloads. One chip, latest-active-wins (D2); a download outlives a flip.
+  interface DownloadRec { path: string; name: string }
+  const activeDownloads = new Map<Electron.DownloadItem, DownloadRec>();
+  let currentChipItem: Electron.DownloadItem | null = null;
+  let downloadHoldArmed = false; // battery hold: pause the next item right after its save path
+  let downloadLastSavePath: string | null = null; // probe evidence (battery disk asserts)
+  const e2eSeamArmed = process.env.DROPSYNC_E2E === '1' || process.env.DROPSYNC_CLOUD_DEV === '1';
 
   /** Shared load-finished path for boot AND battery-driven layer relaunches (C2g FIX 4). */
   const onPillLoadFinished = (): void => {
@@ -595,6 +797,16 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
       if (cur.x !== expected.x || cur.y !== expected.y || cur.width !== expected.width || cur.height !== expected.height) {
         faderView.setBounds(expected);
         console.log('[fader] bounds set', JSON.stringify({ from: cur, to: expected }));
+      }
+    }
+    // C3 — the status layer joins the self-heal: chip room (measured width) or full veil
+    // rect while a presentation is active, collapsed 0×0 at rest. Idempotent.
+    if (statusView) {
+      const expected = !statusActive ? statusCollapsedBounds() : (statusVeilUp ? statusVeilBounds() : statusChipBounds());
+      const cur = statusView.getBounds();
+      if (cur.x !== expected.x || cur.y !== expected.y || cur.width !== expected.width || cur.height !== expected.height) {
+        statusView.setBounds(expected);
+        console.log('[status] bounds set', JSON.stringify({ from: cur, to: expected }));
       }
     }
   };
@@ -867,9 +1079,8 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     faderInFlight = true;
     v.setBounds(faderBounds()); // the window's content area
     v.setVisible(true);
-    raiseFader(); // above the OUTGOING world (the swap has not happened yet)...
-    raiseCard(); // ...but below card + pill — the FULL z-law re-asserted in order
-    raisePill();
+    restackAll(); // fader ABOVE the OUTGOING world (the swap has not happened yet), but
+    // below card, status and pill — the FULL z-law re-asserted in order (C3 single entry)
     const promise = new Promise<boolean>((resolve) => {
       faderReadyResolve = resolve;
       faderReadyTimer = setTimeout(() => {
@@ -1056,6 +1267,532 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     } catch { /* window gone */ }
   };
 
+  // ==== C3 — THE STATUS LAYER + OFFLINE + DOWNLOADS + DOORMAN ================================
+
+  /** Chip room: horizontally centered, y = STATUS_TOP, MEASURED width clamped to ≤60% of
+   * the window, height exactly STATUS_H (D1). Zero-miss: the room equals the visible chip. */
+  const statusChipBounds = (): Electron.Rectangle => {
+    const b = mainWindow.getContentBounds();
+    const maxW = Math.max(1, Math.round(b.width * 0.6));
+    const natural = statusLastMeasure > 0 ? statusLastMeasure : 240; // provisional until the first measure lands
+    const w = Math.min(natural, maxW);
+    return { x: Math.round((b.width - w) / 2), y: STATUS_TOP, width: w, height: STATUS_H };
+  };
+  /** The veil room: the FULL content area (it covers the dead site — intended, §5). */
+  const statusVeilBounds = (): Electron.Rectangle => siteBounds();
+  /** At rest the status layer is NOTHING: 0×0 at the origin, hidden (fader rest discipline). */
+  const statusCollapsedBounds = (): Electron.Rectangle => ({ x: 0, y: 0, width: 0, height: 0 });
+
+  const onStatusLoadFinished = (): void => {
+    statusLoaded = true;
+    console.log('[status] layer loaded');
+    if (statusPendingShow) {
+      const p = statusPendingShow;
+      statusPendingShow = null;
+      statusShow(p as never); // a show that arrived before the page was ready displays now
+    }
+  };
+
+  const ensureStatus = (): WebContentsView => {
+    if (statusView) return statusView;
+    statusView = new WebContentsView({
+      webPreferences: {
+        preload: join(fileURLToPath(new URL('.', import.meta.url)), '../preload/statusPreload.cjs'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+    statusView.setBackgroundColor('#00000000'); // WSLg-transparency-safe (pill precedent)
+    attachPillLockdown(statusView.webContents); // same trusted-layer lockdown: no nav, no popups
+    statusView.webContents.once('did-finish-load', () => onStatusLoadFinished());
+    void statusView.webContents.loadURL(statusPageUrl());
+    statusView.setBounds(statusCollapsedBounds()); // COLLAPSED + hidden until a presentation
+    statusView.setVisible(false);
+    // Added BETWEEN the card and the pill at boot ⇒ the z-order law holds from frame one.
+    mainWindow.contentView.addChildView(statusView);
+    return statusView;
+  };
+
+  /** Z-ORDER LAW (C3, extends C2m): site view < faderView < cardView < statusView < pillView
+   * ALWAYS — the chip/veil float over both worlds but UNDER the pill (flipping always works,
+   * even through the veil). The ONE re-stack entry point: no call site can forget the layer. */
+  const raiseStatus = (): void => {
+    if (!statusView || mainWindow.isDestroyed()) return;
+    mainWindow.contentView.removeChildView(statusView);
+    mainWindow.contentView.addChildView(statusView);
+  };
+
+  /** C3 — the FULL z-law re-assertion (site < fader < card < status < pill), used at boot,
+   * in show(), and in beginMelt's raise chain (replaces the individual raise* calls). */
+  const restackAll = (): void => {
+    raiseFader();
+    raiseCard();
+    raiseStatus();
+    raisePill();
+  };
+
+  /** The ONE settle path for the status layer: timers cleared, presentation state cleared,
+   * 0×0 + hidden. Idempotent — every hide path lands here (main owns collapse timing). */
+  const collapseStatus = (): void => {
+    if (statusCollapseTimer !== null) {
+      clearTimeout(statusCollapseTimer);
+      statusCollapseTimer = null;
+    }
+    statusActive = false;
+    statusVeilUp = false;
+    if (statusView && !mainWindow.isDestroyed()) {
+      statusView.setBounds(statusCollapsedBounds());
+      statusView.setVisible(false);
+    }
+  };
+
+  interface StatusShowPayload {
+    kind: 'download' | 'offline';
+    label: string;
+    pulse?: boolean;
+    progress?: boolean;
+    action?: 'cancel' | 'switch-local' | null;
+    veil?: boolean;
+    title?: string;
+    body?: string;
+    theme?: unknown;
+  }
+
+  /** Push a presentation to the layer (chip or veil). Inflate → send → re-stack. One
+   * presentation at a time; a show before the page finished loading is queued (card pump). */
+  const statusShow = (p: StatusShowPayload): void => {
+    const v = ensureStatus();
+    statusLastShow = { ...p } as Record<string, unknown>;
+    if (!statusLoaded) {
+      statusPendingShow = { ...p } as Record<string, unknown>;
+      return;
+    }
+    statusActive = true;
+    statusVeilUp = !!p.veil;
+    v.setBounds(statusVeilUp ? statusVeilBounds() : statusChipBounds());
+    v.setVisible(true);
+    v.webContents.send('status:show', p);
+    restackAll(); // the status layer must never cover the pill
+  };
+
+  /** The page measured its content — remember it and snap the chip room to EXACTLY the
+   * natural width (clamped); the battery asserts bounds == measured footprint. */
+  const statusMeasured = (width: number): void => {
+    statusLastMeasure = width;
+    if (statusActive && !statusVeilUp) syncBounds();
+  };
+
+  /** Hide the current presentation; `flash` swaps in the paper ✓-chip for STATUS_FLASH_MS
+   * (main owns the native collapse: flash ⇒ collapse after the flash + buffer, plain hide ⇒
+   * after the 280 ms slide-up hold). */
+  const statusHide = (flash?: string): void => {
+    if (!statusActive) return;
+    statusLastHideFlash = flash ?? null;
+    statusView?.webContents.send('status:hide', { flash });
+    if (statusCollapseTimer !== null) clearTimeout(statusCollapseTimer);
+    statusCollapseTimer = setTimeout(
+      collapseStatus,
+      flash ? STATUS_FLASH_MS + 400 : STATUS_HIDE_HOLD_MS,
+    );
+  };
+
+  // ---- C3 STEP 4 — the offline state machine ------------------------------------------------
+
+  /** net.isOnline() through the TEST SEAM: the battery overrides it to drive the offline
+   * transitions deterministically (production override is always null). */
+  const netStatus = (): boolean => (netOverride !== null ? netOverride : net.isOnline());
+
+  /** Chromium network error codes that mean "the internet is gone" (STEP 4a). */
+  const OFFLINE_LOAD_CODES = new Set([-105, -106, -109, -118]);
+
+  // ---- C3-hotfix-1 FIX B — the connecting watchdog + FIX A — the success lift --------------
+
+  /** FIX B — arm the fresh-load watchdog (idempotent: a newer arm replaces an older timer). */
+  const armConnectWatchdog = (): void => {
+    if (connectWatchdog !== null) clearTimeout(connectWatchdog);
+    connectWatchdog = setTimeout(onConnectTimeout, ENTRY_CONNECT_TIMEOUT_MS);
+  };
+  const clearConnectWatchdog = (): void => {
+    if (connectWatchdog !== null) {
+      clearTimeout(connectWatchdog);
+      connectWatchdog = null;
+    }
+  };
+
+  /** FIX B — 3 s of silence on a fresh load: the net has NOT failed (offlineState stays
+   * 'ok'), the page is just slow ⇒ show the honest CONNECTING veil. A subsequent
+   * did-fail-load swaps the text to the standard offline card (statusShow replaces the
+   * content); FIX A's success path lifts it; the watchdog does not re-fire (one shot). */
+  const onConnectTimeout = (): void => {
+    connectWatchdog = null;
+    if (mainWindow.isDestroyed()) return;
+    if (offlineState !== 'ok' || !shown) return;
+    connectingUp = true;
+    console.log('[cloud] fresh load still silent after', ENTRY_CONNECT_TIMEOUT_MS, 'ms — showing Connecting veil');
+    statusShow({
+      kind: 'offline',
+      label: '',
+      veil: true,
+      title: 'Connecting to Cloud…',
+      body: 'Cloud is taking a while to reach the internet.',
+      theme: currentTheme?.(),
+    });
+  };
+
+  /** FIX A — the veil's SUCCESS exit (the stuck [Try again] card). When the site view's load
+   * settles successfully while an offline veil OR the connecting veil is up ⇒ clear
+   * EVERYTHING and re-arm the poll. One exit, always true — it lifts the veil for the
+   * [Try again] reload AND the auto-recovery reload alike — for every finish that is
+   * failure-free AND never vetoed. */
+  const onSiteLoadSucceeded = (): void => {
+    // C3-hotfix-4 FIX A — THE VETO: a finish after a main-frame failure is the ERROR
+    // document finishing (chrome-error://chromewebdata/), NOT the site — treating it as
+    // success lifted the veil onto empty white and faked siteLoadOk (the owner's
+    // white-forever + the disabled re-entry retry). No siteLoadOk write, no veil touch,
+    // no watchdog clear.
+    if (attemptFailed) {
+      phantomFinishes += 1;
+      console.log('[cloud] PHANTOM finish VETOED — a main-frame failure already stamped this attempt');
+      return;
+    }
+    siteLoadOk = true; // FIX B — the load truth, regardless of any veil bookkeeping below
+    clearConnectWatchdog();
+    if (offlineState === 'ok' && !connectingUp) return;
+    console.log('[cloud] site load OK — lifting offline/connecting veil');
+    offlineState = 'ok';
+    connectingUp = false;
+    collapseStatus();
+    armOfflinePoll();
+  };
+
+  /** The poll: ONLY while cloud is shown or a non-OK state is active (zero cost otherwise).
+   * ENTRY_FAILED recovers on a false→true transition (reload — a never-loaded page has
+   * nothing to lose, D6); DEGRADED recovers with a flash and NO reload (protects unsaved
+   * compose state); a fresh outage while cloud is shown ENTERS degraded. */
+  const offlineTick = (): void => {
+    if (mainWindow.isDestroyed()) return;
+    const online = netStatus();
+    if (offlineState === 'entry-failed') {
+      if (online && sawOfflineSinceEntry) {
+        offlineReloadCount += 1; // the recovery spy the battery asserts on
+        siteLoadOk = false; // FIX B(h2) — fresh attempt
+        attemptFailed = false; // hf4 FIX A — a new attempt is unjudged
+        siteLoadCount += 1;
+        // C3-hotfix-3 FIX A — the veil NEVER collapses on recovery: it SWAPS to the
+        // Connecting presentation and stays up until the exits own the outcome —
+        // did-finish-load ⇒ FIX A(h1) lifts it; a main-frame did-fail-load ⇒ FIX C brings
+        // the offline card back. Collapsing here used to open a white window: a reload
+        // failing with a non-offline code while the net flag already reads true produced
+        // NO verdict ⇒ no card ⇒ white forever.
+        statusShow({
+          kind: 'offline',
+          label: '',
+          veil: true,
+          title: 'Connecting to Cloud…',
+          body: 'Cloud is taking a while to reach the internet.',
+          theme: currentTheme?.(),
+        });
+        offlineState = 'ok';
+        connectingUp = true;
+        void view?.webContents.loadURL(CLOUD_URL);
+        armConnectWatchdog(); // FIX B(h2) — a fresh recovery reload is watchdog-covered too
+        armOfflinePoll();
+      }
+      return;
+    }
+    if (offlineState === 'degraded') {
+      if (online) {
+        offlineState = 'ok';
+        statusHide('✓ Back online'); // flash; NO reload mid-cloud (D6)
+        armOfflinePoll();
+      }
+      return;
+    }
+    // C3-hotfix-3 FIX B — a Wi-Fi toggle bounce during recovery must NEVER downgrade a live
+    // veil: no degraded chip, no "✓ Back online" flash while the page is still dead (the
+    // degraded path never reloads, by design — downgrading here strands the dead page). A
+    // true mid-cloud degraded — a HEALTHY page whose net dropped, no veil up — is unchanged.
+    if (connectingUp || statusVeilUp) return;
+    if (shown && !online) setOfflineState('degraded');
+  };
+
+  /** Arm/disarm the 2 s poll — exactly when (cloud shown OR a non-OK state is active). */
+  const armOfflinePoll = (): void => {
+    const needed = shown || offlineState !== 'ok';
+    if (needed && offlinePollInterval === null) {
+      offlinePollInterval = setInterval(offlineTick, 2000);
+    } else if (!needed && offlinePollInterval !== null) {
+      clearInterval(offlinePollInterval);
+      offlinePollInterval = null;
+    }
+  };
+
+  const setOfflineState = (next: OfflineState): void => {
+    if (offlineState === next) return;
+    offlineState = next;
+    connectingUp = false; // a real verdict replaces the connecting card (statusShow swaps content)
+    if (next === 'entry-failed') {
+      sawOfflineSinceEntry = !netStatus();
+      // D1 — the themed veil + centered card. Theme = the app's CURRENT theme at display time.
+      statusShow({
+        kind: 'offline',
+        label: '',
+        veil: true,
+        title: 'No internet — Cloud mode needs it',
+        body: "The website can't load until you're back online.",
+        theme: currentTheme?.(),
+      });
+    } else if (next === 'degraded') {
+      statusShow({ kind: 'offline', label: 'Waiting for internet…', pulse: true, action: 'switch-local' });
+    }
+    armOfflinePoll();
+  };
+
+  /** Mode change to local: the veil is cloud-only — clear EVERYTHING offline (edge case).
+   * FIX B: the connecting veil and the watchdog die here too (offlineState may still read
+   * 'ok' while the connecting card is up — never early-return past it). */
+  const clearOfflineState = (): void => {
+    clearConnectWatchdog();
+    if (offlineState === 'ok' && !connectingUp) return;
+    offlineState = 'ok';
+    connectingUp = false;
+    collapseStatus();
+    armOfflinePoll();
+  };
+
+  /** C3 STEP 4 — the SHARED load-failure path: the C1 did-fail-load log + the offline
+   * verdict. attachGuards routes the real event here; the battery invokes it directly with
+   * the same signature (forced leg). C3-hotfix-5 FIX A — the STAMP is main-frame ALWAYS
+   * (hidden included — truth-bookkeeping never depends on visibility); only the VERDICT
+   * (the veil/card) is main-frame + cloud-shown, and an already-up veil stays (no flicker,
+   * honest). */
+  const onSiteLoadFailed = (code: number, isMainFrame: boolean, url: string, desc?: string): void => {
+    // C3-hotfix-2 FIX A — the log distinguishes main/sub-frame so forensics never needs a
+    // second discovery round. Stays FIRST — hidden failures must keep landing in the log
+    // (this very line is how hotfix-5's hole was proven).
+    console.log('[cloud] did-fail-load:', isMainFrame ? 'main-frame' : 'sub-frame', code, desc ?? '', url.slice(0, 120));
+    // C3-hotfix-2 FIX A (comment rewritten by hotfix-5 to match the split guard) — ONLY a
+    // MAIN-frame failure gets past the first gate: helper frames of the real site (Firebase
+    // auth iframes, analytics) fail fast offline — they are noise, never a verdict, and
+    // they must never stamp the attempt (hf5) nor silence the connecting backstop
+    // (hf1/hf2 — the owner once waited the full 5–6 s for the main frame while subframes
+    // had already killed the watchdog).
+    if (!isMainFrame) return;
+    // C3-hotfix-5 FIX A — THE STAMP IS TRUTH, NOT UI: a main-frame failure stamps the
+    // attempt EVEN WHILE HIDDEN. The owner flipped to Local mid-load ⇒ the -105 fired after
+    // the flip ⇒ hf4's stamp sat behind the !shown clause and was suppressed ⇒ the phantom
+    // finish arrived unstamped and was BELIEVED ⇒ siteLoadOk lied ⇒ white forever. Truth
+    // (this stamp) never depends on visibility; only the verdict below does. Sub-frame
+    // noise STILL never stamps — that guard stays in front, unchanged (hf4 owns it).
+    attemptFailed = true;
+    // C3-hotfix-5 FIX A — the VERDICT is UI: the veil/card are cloud-only (never a card
+    // over Local). Everything below this line is presentation; everything above is truth.
+    if (!shown) return;
+    clearConnectWatchdog();
+    if (offlineState === 'entry-failed') return;
+    // C3-hotfix-3 FIX C — a main frame that FAILED and has NEVER succeeded is a dead page:
+    // it always gets the card, whatever the error code or what the net flag claims. (The old
+    // condition needed an offline-ish code or a false net flag — a reload failing with an
+    // unlisted code while the net flag reads true produced NO verdict ⇒ white forever.)
+    // Healthy-page main-frame failures — the SPA never top-navigates — remain untouched:
+    // siteLoadOk is true for them, so only the code/net legs of this condition can fire.
+    if (!siteLoadOk || OFFLINE_LOAD_CODES.has(code) || !netStatus()) setOfflineState('entry-failed');
+  };
+
+  /** The veil's [Try again]: reload the site view; the veil STAYS up while trying (D5).
+   * FIX A does the lifting on did-finish-load; FIX B: the CONNECTING card's [Try again] is
+   * the same reload path, and the retry counts as a recovery reload (battery spy). */
+  const offlineRetry = (): void => {
+    if (offlineState !== 'entry-failed' && !connectingUp) return;
+    offlineReloadCount += 1;
+    siteLoadOk = false; // FIX B — fresh attempt
+    attemptFailed = false; // hf4 FIX A — a new attempt is unjudged
+    siteLoadCount += 1;
+    void view?.webContents.loadURL(CLOUD_URL);
+    armConnectWatchdog(); // FIX B — a retry is a fresh load; the watchdog covers it
+  };
+
+  // ---- C3 STEP 2 — downloads (session-level: auth-popup downloads are covered too) ----------
+
+  /** The chip shows the LATEST active item (insertion order). Promotion only ever SHOWS —
+   * hides are owned by the done paths, so the ✓ flash can never be double-hidden. */
+  const promoteLatestDownload = (): void => {
+    let latest: Electron.DownloadItem | null = null;
+    for (const key of activeDownloads.keys()) latest = key;
+    if (!latest) return;
+    const rec = activeDownloads.get(latest)!;
+    currentChipItem = latest;
+    statusShow({ kind: 'download', label: `Saving ${rec.name}…`, action: 'cancel', progress: true });
+  };
+
+  // STEP 3 (D3) — the DOORMAN handlers, hoisted to controller scope so doormanProbe can
+  // invoke them DIRECTLY (the only deterministic allow-path proof). Registered on the site
+  // partition session ONLY — our tiny layers keep their deny-all handlers on the default
+  // session. Allow ONLY 'media' (mic + camera) AND only from the site origin; everything
+  // else denies with a one-line log. The CHECK handler is what makes the site's own
+  // Permissions-API gate report "granted" (un-deads the voice buttons).
+  // electron.d.ts verified: details.requestingUrl exists (PermissionRequest, REQUIRED);
+  // wc.mainFrameUrl does NOT exist on this build — the verified fallback is wc.mainFrame.url
+  // (flagged in the report; see the correction comment in sitePermissionRequest).
+  const originOf = (url: string): string => {
+    try {
+      return new URL(url).origin;
+    } catch {
+      return '';
+    }
+  };
+  const sitePermissionRequest = (
+    wc: Electron.WebContents,
+    permission: string,
+    callback: (granted: boolean) => void,
+    details: { requestingUrl?: string },
+  ): void => {
+    // ORDER FIELD CORRECTION (flagged in the report): the order said "fall back to
+    // wc.mainFrameUrl" — that method does NOT exist on Electron 43 (electron.d.ts verified).
+    // The verified equivalent is `wc.mainFrame.url` (WebFrameMain.url: string, d.ts:19189).
+    const source = details.requestingUrl ?? (wc.isDestroyed() ? '' : wc.mainFrame.url);
+    const ok = permission === 'media' && originOf(source) === CLOUD_ORIGIN;
+    // FIX C — EVERY verdict is loud, grants included (the mic bug taught us: an invisible
+    // refusal path is undebuggable; the request log shows the EXACT permission string the
+    // site sent, which is the evidence the allowlist must match).
+    console.log('[cloud] permission-' + (ok ? 'granted' : 'denied'), permission, source.slice(0, 120));
+    callback(ok);
+  };
+  const sitePermissionCheck = (
+    _wc: Electron.WebContents | null,
+    permission: string,
+    requestingOrigin: string,
+  ): boolean => {
+    const ok = permission === 'media' && originOf(requestingOrigin) === CLOUD_ORIGIN;
+    // FIX C — log EVERY invocation: what the site's Permissions-API query asked us, and what
+    // we answered. If the query never consults this handler, the silence is itself evidence.
+    console.log('[cloud] permission-check', permission, requestingOrigin, ok ? '→ granted' : '→ denied');
+    return ok;
+  };
+
+  /** Shared chip wiring once a save path is settled: the chip rides the copy phase, progress
+   * streams into it, and the done handler owns the flash / partial-file cleanup (D2). */
+  const wireDownloadChip = (item: Electron.DownloadItem, savePath: string, name: string): void => {
+    if (downloadHoldArmed) item.pause(); // battery hold: makes "cancel mid-flight" deterministic
+    activeDownloads.set(item, { path: savePath, name });
+    currentChipItem = item;
+    downloadLastSavePath = savePath;
+    statusShow({ kind: 'download', label: `Saving ${name}…`, action: 'cancel', progress: true });
+    item.on('updated', (_e2, state) => {
+      if (state !== 'progressing' || item !== currentChipItem) return;
+      const total = item.getTotalBytes();
+      const received = item.getReceivedBytes();
+      statusProgress(total > 0 ? received / total : null); // unknown total ⇒ pulsing dot, no %
+    });
+    item.on('done', (_e2, state) => {
+      const rec = activeDownloads.get(item);
+      activeDownloads.delete(item);
+      const wasCurrent = currentChipItem === item;
+      if (wasCurrent) {
+        currentChipItem = null;
+        if (state === 'completed') {
+          statusHide('✓ Saved'); // D2 flash
+        } else {
+          statusHide(); // cancelled | interrupted — same cleanup, NO flash
+        }
+      }
+      // cancelled | interrupted — no partial file may survive, current or not.
+      if (state !== 'completed' && rec) {
+        try {
+          rmSync(rec.path, { force: true });
+        } catch { /* must-not-throw cleanup */ }
+      }
+      if (wasCurrent) promoteLatestDownload(); // a still-active download takes the chip
+    });
+  };
+
+  const attachC3SessionHandlers = (): void => {
+    const partitionSession = session.fromPartition(PARTITION);
+
+    // STEP 2 (D2) — native Save As EVERY time; chip rides the copy phase; Cancel/interrupt
+    // leaves NO partial file. BUILD-SPECIFIC FINDING (standalone probe, 2026-08-29): on this
+    // Electron, `event.preventDefault()` makes ANY downloadURL-initiated item fire
+    // done('cancelled') @ 0 bytes — even with a later setSavePath — so the e2e seam uses the
+    // documented no-dialog pattern (sync setSavePath, NO preventDefault) instead, and the
+    // real user path keeps the order's letter (preventDefault → OUR dialog → setSavePath).
+    partitionSession.on('will-download', (event, item) => {
+      const name = item.getFilename();
+      if (e2eSeamArmed) {
+        // E2E SEAM — a native save dialog cannot be answered headlessly; DROPSYNC_E2E/
+        // DROPSYNC_CLOUD_DEV are dev-only env vars, so this silent auto-answer is prod-
+        // impossible. (The order's DROPSYNC_E2E gate ALSO arms the legacy boot e2e harness,
+        // which collides with the battery — the seam arms under EITHER dev gate.)
+        const savePath = join(tmpdir(), `dropsync-c3-dl-${Date.now()}-${name.replace(/[^\w.-]+/g, '_')}`);
+        console.log('[status] e2e auto-answer save path:', savePath);
+        if (item.getState() !== 'progressing') return;
+        item.setSavePath(savePath);
+        wireDownloadChip(item, savePath, name);
+        return;
+      }
+      event.preventDefault(); // we own the save path (never Electron's implicit dialog)
+      void dialog.showSaveDialog(mainWindow, { defaultPath: name }).then((r) => {
+        if (r.canceled || !r.filePath) {
+          item.cancel(); // the user said no — nothing was written yet
+          return;
+        }
+        if (item.getState() !== 'progressing') return; // interrupted while the dialog was open
+        item.setSavePath(r.filePath);
+        wireDownloadChip(item, r.filePath, name);
+      });
+    });
+
+    partitionSession.setPermissionRequestHandler((wc, permission, callback, details) => {
+      sitePermissionRequest(wc, permission, callback, details as { requestingUrl?: string });
+    });
+    partitionSession.setPermissionCheckHandler((wc, permission, requestingOrigin) =>
+      sitePermissionCheck(wc, permission, requestingOrigin));
+
+    // STEP 3 (D4) — screen share: Windows' own picker where it exists (useSystemPicker);
+    // this body runs ONLY where no system picker exists (this WSL dev box) — deny loudly.
+    // electron.d.ts verified: Streams' fields are all optional ⇒ callback({}) denies.
+    partitionSession.setDisplayMediaRequestHandler((_request, callback) => {
+      console.error('[cloud] screen-share DENIED (no system picker on this platform — dev/WSL; the real Windows build gets the native "choose what to share" picker)');
+      callback({});
+    }, { useSystemPicker: true });
+  };
+  attachC3SessionHandlers();
+
+  /** The chip's [Cancel] ⇒ cancel the item the chip currently shows; its done handler does
+   * the cleanup (partial deleted + chip hidden). */
+  const statusCancelDownload = (): void => {
+    currentChipItem?.cancel();
+  };
+
+  /** Progress for the CURRENT download chip (probe-visible evidence). */
+  const statusProgress = (fraction: number | null, label?: string): void => {
+    statusLastProgress = { fraction, label };
+    if (statusActive && !statusVeilUp) statusView?.webContents.send('status:progress', { fraction, label });
+  };
+
+  // ==== END C3 ================================================================================
+
+  // C3-hotfix-4 FIX B — a NEW main-frame same-origin navigation RE-ARMS success. The error
+  // page emits NO navigation events of its own (navtruth.js), so only a REAL load attempt —
+  // ours, or a genuine connectivity-restore auto-reload — can clear the stamp; the phantom
+  // finish can never fake one. If connectivity returns and Chromium truly reloads the site,
+  // the fresh attempt succeeds and FIX A lifts the veil by itself; if Electron never
+  // auto-reloads, the card simply stays with [Try again] — also correct. Factored so the
+  // battery seam exercises the SAME function the listener calls.
+  const navReArm = (url: string, isMainFrame: boolean): void => {
+    if (!isMainFrame) return;
+    try { if (new URL(url).origin !== CLOUD_ORIGIN) return; } catch { return; }
+    attemptFailed = false;
+  };
+
+  // C3-hotfix-4 FIX C — the void color for the CURRENT theme, via the same currentTheme
+  // opt the status veil dresses from and normTheme's tolerant normalization (unknown or
+  // missing ⇒ light): light #FAF7F2, dark #161616, minimal #C5C9B8.
+  const voidColor = (): string => {
+    const t = normTheme(currentTheme?.());
+    return t === 'dark' ? '#161616' : t === 'minimal' ? '#C5C9B8' : '#FAF7F2';
+  };
+
   const ensureView = (): WebContentsView => {
     if (view) return view;
     view = new WebContentsView({
@@ -1065,11 +1802,16 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
         // I1: deliberately NO `preload` key AT ALL — zero window.dropsync in cloud contents.
       },
     });
+    // C3-hotfix-4 FIX C — the themed void (folds in hotfix-2b verbatim): an OPAQUE canvas
+    // in the CURRENT theme's page color. The site paints its own background — only the
+    // pre-paint/dead void ever shows this, and it must read as OUR color, never the alien
+    // white behind the offline card. Pill/fader/card/status keep their #00000000.
+    view.setBackgroundColor(voidColor());
     loadStartedAt = Date.now();
     attachGuards(view.webContents, { strictNav: true }, () => {
       readyMs = Date.now() - loadStartedAt;
       console.log('[cloud] did-finish-load in', readyMs, 'ms');
-    });
+    }, (code, isMainFrame, url, desc) => onSiteLoadFailed(code, isMainFrame, url, desc), onSiteLoadSucceeded);
     // C2h FIX 2 — cloud gestures feed the SAME idle-auto-lock clock as Local actions (owner
     // decision D-B). We sense INPUTS from OUTSIDE the page (main-process listener; this is NOT
     // site injection — we never execute/read anything in the site, invariant I6/I1). Buttons,
@@ -1084,26 +1826,51 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
       lastFeed = now;
       onUserActivity?.();
     });
+    // C3-hotfix-4 FIX B — the re-arm listener (navtruth.js: the error document fires no
+    // navigation events, so anything landing here is a REAL navigation).
+    view.webContents.on('did-start-navigation', (_event, url, _isInPlace, isMainFrame) => {
+      navReArm(url, isMainFrame);
+    });
+    siteLoadOk = false; // FIX B — creation IS a fresh attempt (truth arrives with did-finish-load)
+    attemptFailed = false; // hf4 FIX A — a new attempt is unjudged
+    siteLoadCount += 1;
     void view.webContents.loadURL(CLOUD_URL); // stock UA — never spoofed
+    armConnectWatchdog(); // FIX B — fresh creation load ⇒ the 3 s connecting backstop runs
     // Keep session cookies on disk (persist:) so sign-in survives app + dev-server restarts.
     void session.fromPartition(PARTITION);
     return view;
   };
 
   const show = (): void => {
+    const existed = view !== null; // FIX B — a freshly created view loads in ensureView itself
     const v = ensureView();
+    // C3-hotfix-4 FIX C — refresh the void: cheap + idempotent, so a theme changed while
+    // in Local is honored on the next Cloud entry.
+    v.setBackgroundColor(voidColor());
+    // C3-hotfix-2 FIX B — RE-ENTRY into a dead Cloud RETRIES. show() of an existing view used
+    // to reload nothing, arm nothing, fire nothing: Local → Cloud after a failed load sat
+    // white forever, no card, no retry (the owner's brick). If the view exists but its load
+    // never succeeded, this re-entry IS a fresh attempt. Healthy pages are NEVER reloaded —
+    // C2i's warm re-entry stays byte-identical when the site is fine (this fires only for a
+    // dead/never-finished page, where there is nothing warm to lose).
+    if (existed && !siteLoadOk) {
+      siteLoadOk = false;
+      attemptFailed = false; // hf4 FIX A — a new attempt is unjudged
+      siteLoadCount += 1;
+      void v.webContents.loadURL(CLOUD_URL);
+      armConnectWatchdog();
+    }
     if (!shown) {
       mainWindow.contentView.addChildView(v);
       shown = true;
-      // The site view was just stacked ON TOP of everything — undo, in z-law order (C2m:
-      // fader → card → pill; the melt layer lives just above the site view, C2j z-law).
-      raiseFader();
-      raiseCard(); // the site view was just stacked ON TOP of the card too — undo (C2j z-law)
-      raisePill(); // the site view was just stacked ON TOP of the pill — undo that, always
+      // The site view was just stacked ON TOP of everything — undo, in z-law order (C3:
+      // ONE restack covers fader → card → status → pill; no call site can forget a layer).
+      restackAll();
     }
     syncBounds();
     v.setVisible(true);
     v.webContents.focus();
+    armOfflinePoll(); // cloud shown ⇒ the degraded-outage poll may be needed
   };
 
   const hide = (): void => {
@@ -1113,6 +1880,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     }
     // The pill is NEVER removed (C2f contract) — it keeps floating over Local too.
     if (mainWindow.isFocused()) mainWindow.webContents.focus();
+    armOfflinePoll(); // cloud hidden ⇒ the poll is only needed while a non-OK state lingers
   };
 
   // Bounds watchdog (C2d pattern, generalized): ONE 1 s tick re-asserts BOTH targets — the site
@@ -1138,10 +1906,11 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
     blurPill,
     probeState: () => ({ readyMs, url: view ? CLOUD_URL : null }),
     probeIsolation: async () => {
-      if (!view || !pillView || !cardView || !faderView) {
+      if (!view || !pillView || !cardView || !faderView || !statusView) {
         return {
           dropsyncType: 'no-view', hasPreloadKey: true as const, pillDropsyncType: 'no-view', pillBridgeType: 'no-view', pillCardBridgeType: 'no-view', cardDropsyncType: 'no-view', cardBridgeType: 'no-view',
           faderDropsyncType: 'no-view', faderBridgeType: 'no-view', faderCardBridgeType: 'no-view', pillFaderBridgeType: 'no-view', cardFaderBridgeType: 'no-view',
+          statusDropsyncType: 'no-view', statusBridgeType: 'no-view', statusCardBridgeType: 'no-view', statusFaderBridgeType: 'no-view', pillStatusBridgeType: 'no-view', cardStatusBridgeType: 'no-view', faderStatusBridgeType: 'no-view',
         };
       }
       const dropsyncType = await view.webContents.executeJavaScript('typeof window.dropsync');
@@ -1158,7 +1927,15 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
       const faderCardBridgeType = await faderView.webContents.executeJavaScript('typeof window.dropsyncCard');
       const pillFaderBridgeType = await pillView.webContents.executeJavaScript('typeof window.dropsyncFader');
       const cardFaderBridgeType = await cardView.webContents.executeJavaScript('typeof window.dropsyncFader');
-      return { dropsyncType, hasPreloadKey: true as const, pillDropsyncType, pillBridgeType, pillCardBridgeType, cardDropsyncType, cardBridgeType, faderDropsyncType, faderBridgeType, faderCardBridgeType, pillFaderBridgeType, cardFaderBridgeType };
+      // C3 — the status bridge exists ONLY on the status page (never site/pill/card/fader).
+      const statusDropsyncType = await statusView.webContents.executeJavaScript('typeof window.dropsync');
+      const statusBridgeType = await statusView.webContents.executeJavaScript('typeof window.dropsyncStatus');
+      const statusCardBridgeType = await statusView.webContents.executeJavaScript('typeof window.dropsyncCard');
+      const statusFaderBridgeType = await statusView.webContents.executeJavaScript('typeof window.dropsyncFader');
+      const pillStatusBridgeType = await pillView.webContents.executeJavaScript('typeof window.dropsyncStatus');
+      const cardStatusBridgeType = await cardView.webContents.executeJavaScript('typeof window.dropsyncStatus');
+      const faderStatusBridgeType = await faderView.webContents.executeJavaScript('typeof window.dropsyncStatus');
+      return { dropsyncType, hasPreloadKey: true as const, pillDropsyncType, pillBridgeType, pillCardBridgeType, cardDropsyncType, cardBridgeType, faderDropsyncType, faderBridgeType, faderCardBridgeType, pillFaderBridgeType, cardFaderBridgeType, statusDropsyncType, statusBridgeType, statusCardBridgeType, statusFaderBridgeType, pillStatusBridgeType, cardStatusBridgeType, faderStatusBridgeType };
     },
     probeAuthSeen: async () => {
       if (!view) return { firebaseAuthKeys: -1, accountChip: false };
@@ -1356,6 +2133,134 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
         collapsed: b.x === 0 && b.y === 0 && b.width === 0 && b.height === 0,
       };
     },
+    statusMeasured,
+    statusCancelDownload,
+    offlineRetry,
+    clearOfflineState,
+    onSiteLoadFailed,
+    onSiteLoadSucceeded: (): void => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('onSiteLoadSucceeded is DROPSYNC_CLOUD_DEV-only');
+      onSiteLoadSucceeded();
+    },
+    siteNavReArm: (url: string, isMainFrame: boolean): void => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('siteNavReArm is DROPSYNC_CLOUD_DEV-only');
+      navReArm(url, isMainFrame);
+    },
+    setNetOverride: (v: boolean | null): void => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('setNetOverride is DROPSYNC_CLOUD_DEV-only');
+      netOverride = v;
+    },
+    downloadTestArm: (hold: boolean): void => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('downloadTestArm is DROPSYNC_CLOUD_DEV-only');
+      downloadHoldArmed = hold;
+    },
+    siteDriveNavigate: async (url: string): Promise<void> => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('siteDriveNavigate is DROPSYNC_CLOUD_DEV-only');
+      if (!view) throw new Error('site view missing');
+      // C3 battery-only navigation of the site view (the dead-cloud leg's TEST-NET-1 target
+      // + its CLOUD_URL restore) — ordered by repair-order-cloud-c3 §4 STEP 6; never used
+      // outside the DEV battery (invariant I1 otherwise absolute).
+      // C3-hotfix-1: a seam navigation IS a fresh load ⇒ the connecting watchdog covers it
+      // (the hotfix battery's connecting leg observes the veil through exactly this path).
+      // Armed BEFORE the await — a hanging load (192.0.2.1) never resolves the promise.
+      // C3-hotfix-2 FIX B — the seam tracks load truth like every other fresh attempt
+      // (without this, a dead seam load would leave a stale siteLoadOk=true and the
+      // re-entry reload would never fire).
+      siteLoadOk = false;
+      attemptFailed = false; // hf4 FIX A — a new attempt is unjudged (the battery seam
+      // tracks load truth exactly like every product fresh attempt)
+      siteLoadCount += 1;
+      armConnectWatchdog();
+      await view.webContents.loadURL(url);
+    },
+    statusProbe: async () => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('statusProbe is DROPSYNC_CLOUD_DEV-only');
+      const b = statusView ? statusView.getBounds() : { x: 0, y: 0, width: 0, height: 0 };
+      return {
+        attached: statusView ? mainWindow.contentView.children.includes(statusView) : false,
+        showing: statusActive,
+        bounds: b,
+        collapsed: b.x === 0 && b.y === 0 && b.width === 0 && b.height === 0,
+        veilUp: statusVeilUp,
+        lastMeasure: statusLastMeasure,
+        lastShow: statusLastShow,
+        lastProgress: statusLastProgress,
+        lastHideFlash: statusLastHideFlash,
+        offlineState,
+        connectingUp,
+        siteLoadCount,
+        siteLoadOk,
+        attemptFailed,
+        phantomFinishes,
+        reloadCount: offlineReloadCount,
+        lastSavePath: downloadLastSavePath,
+      };
+    },
+    statusDrive: async (event) => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('statusDrive is DROPSYNC_CLOUD_DEV-only');
+      if (!statusView) throw new Error('status layer missing');
+      // Click the REAL buttons in the REAL layer (pillDrive precedent) — status:action then
+      // rides the genuine ipc path into index.ts's router.
+      const id = event === 'cancel' ? 'act' : event === 'switch-local' ? 'offLocal' : 'offRetry';
+      await statusView.webContents.executeJavaScript(
+        `(function(){ var b = document.getElementById(${JSON.stringify(id)}); if (!b) return false; b.click(); return true; })()`
+      );
+    },
+    statusEval: async <T>(expr: string): Promise<T> => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('statusEval is DROPSYNC_CLOUD_DEV-only');
+      if (!statusView) throw new Error('status layer missing');
+      return (await statusView.webContents.executeJavaScript(expr)) as T;
+    },
+    mediaDiag: async (): Promise<{ micQuery: string; camQuery: string; gum: string }> => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('mediaDiag is DROPSYNC_CLOUD_DEV-only');
+      if (!view) throw new Error('site view missing');
+      // READ-ONLY evaluation on the SITE view (the probeAuthSeen precedent — we observe the
+      // page's own permission reality; we change nothing). micQuery/camQuery: what the
+      // Permissions API reports; gum: getUserMedia({audio:true}) — 'ok' or the error NAME
+      // (tracks stopped immediately). Whole probe wrapped at 5 s ⇒ 'timeout'.
+      const expr = `(async () => {
+        const q = (n) => navigator.permissions.query({ name: n }).then(function (s) { return s.state; }).catch(function (e) { return 'query-error:' + e.name; });
+        const gum = await navigator.mediaDevices.getUserMedia({ audio: true }).then(function (st) { st.getTracks().forEach(function (t) { t.stop(); }); return 'ok'; }).catch(function (e) { return e.name; });
+        return { micQuery: await q('microphone'), camQuery: await q('camera'), gum: gum };
+      })()`;
+      const TIMEOUT: { micQuery: string; camQuery: string; gum: string } = { micQuery: 'timeout', camQuery: 'timeout', gum: 'timeout' };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const race = new Promise<typeof TIMEOUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMEOUT), 5000);
+      });
+      try {
+        return await Promise.race([
+          view.webContents.executeJavaScript(expr) as Promise<{ micQuery: string; camQuery: string; gum: string }>,
+          race,
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    },
+    doormanProbe: async () => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('doormanProbe is DROPSYNC_CLOUD_DEV-only');
+      // Direct invocation of the REGISTERED handlers — the only deterministic allow-path
+      // proof (the real site can't be scripted, I1/I6). The wc argument only feeds the
+      // mainFrameUrl() fallback; the probe always passes an explicit requestingUrl.
+      const probeWc = pillView?.webContents ?? null;
+      const ask = (permission: string, url: string): Promise<boolean> =>
+        new Promise((resolve) => {
+          sitePermissionRequest(
+            probeWc as Electron.WebContents,
+            permission,
+            (granted) => resolve(granted),
+            { requestingUrl: url },
+          );
+        });
+      return {
+        mediaSite: await ask('media', CLOUD_URL),
+        mediaEvil: await ask('media', 'https://evil.example/'),
+        geoSite: await ask('geolocation', CLOUD_URL),
+        checkMediaSite: sitePermissionCheck(null, 'media', CLOUD_ORIGIN),
+        checkMediaEvil: sitePermissionCheck(null, 'media', 'https://evil.example'),
+        checkNotifications: sitePermissionCheck(null, 'notifications', CLOUD_ORIGIN),
+      };
+    },
   };
 
   // Boot: the pill layer exists from the first frame; create it eagerly.
@@ -1363,10 +2268,15 @@ export function initCloud(mainWindow: BrowserWindow, opts?: { onUserActivity?: (
   // law (site < card < pill) holds from the very first frame.
   // C2m — the fader layer joins (EAGER, never removed), created BEFORE the card so the
   // extended z-order law (site < fader < card < pill) holds from the very first frame.
+  // C3 — the status layer joins (EAGER, never removed), BETWEEN card and pill so the full
+  // z-order law (site < fader < card < status < pill) holds from the very first frame.
   ensureFader();
   ensureCard();
+  ensureStatus();
   ensurePill();
+  restackAll(); // belt-and-braces: the law is asserted, not assumed, at boot
   console.log('[fader] layer booted (eager, collapsed 0×0, hidden)'); // C2m boot evidence
+  console.log('[status] layer booted (eager, collapsed 0×0, hidden)'); // C3 boot evidence
 
   return controller;
 }
