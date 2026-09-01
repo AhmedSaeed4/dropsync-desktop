@@ -7,14 +7,16 @@
  * for, and opaque media:// tokens.
  */
 
-import { app, BrowserWindow, ipcMain, dialog, Notification, protocol, shell, net } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Menu, nativeImage, nativeTheme, Notification, protocol, session, shell, net } from 'electron';
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';import { createWriteStream } from 'node:fs';
+import { fileURLToPath } from 'node:url';import { createWriteStream, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
 import { VaultManager } from './vault/vault.ts';
+import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_ROOM_PAD_X, CLOUD_ORIGIN, CAPTURE_DEADLINE_MS, ENTRY_CONNECT_TIMEOUT_MS, STATUS_TOP, STATUS_H, CLOUD_URL, type CloudController } from './cloud';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -35,10 +37,14 @@ protocol.registerSchemesAsPrivileged([
   { scheme: 'media', privileges: { standard: true, stream: true, supportFetchAPI: true, secure: true } },
 ]);
 
-// The UI is text/lists/images — GPU compositing buys nothing here, and hardware acceleration
-// hard-crashes under WSL2's virtual GPU ("GPU process isn't usable"). Software rendering keeps
-// dev-under-WSL and production-Windows behavior identical.
-app.disableHardwareAcceleration();
+// WSL-ONLY WORKAROUND (PACKAGING-1 FIX B): hardware acceleration hard-crashes under WSL2's
+// virtual GPU ("GPU process isn't usable"), so dev-under-WSL runs software-rendered. The old
+// UNCONDITIONAL call — "GPU compositing buys nothing here… keeps behavior identical" — was a
+// dev-era rationalization: production Windows runs GPU-accelerated, and the animation-heavy UI
+// plus video calls need it. Every WSL2 session has WSL_DISTRO_NAME; Windows never does.
+if (process.env.WSL_DISTRO_NAME) {
+  app.disableHardwareAcceleration();
+}
 
 // DEV WORKAROUND (WSL only): the new WSL2 kernel intermittently kills Chromium's sandboxed
 // children (network service → zygote → GPU), FATALing the app minutes into use. Running the
@@ -47,11 +53,16 @@ if (process.env.DROPSYNC_NOSANDBOX === '1') {
   app.commandLine.appendSwitch('no-sandbox');
 }
 
-// DEV WORKAROUND (WSL only): WSL2 kernel 6.18 intermittently fails Chromium's /dev/shm
-// shared-memory operations with nonsensical ESRCH errors (taking sandboxed children down with
-// them), FATALing the app minutes into use. disable-dev-shm-usage makes Chromium back shared
-// memory with plain temp files instead of /dev/shm. Production Windows builds are unaffected.
-app.commandLine.appendSwitch('disable-dev-shm-usage');
+// WSL-ONLY WORKAROUND (PACKAGING-1 FIX B): WSL2 kernel 6.18 intermittently fails Chromium's
+// /dev/shm shared-memory operations with nonsensical ESRCH errors (taking sandboxed children
+// down with them), FATALing the app minutes into use. disable-dev-shm-usage makes Chromium back
+// shared memory with plain temp files instead of /dev/shm. The old call was UNCONDITIONAL — its
+// "Production Windows builds are unaffected" comment described the HOP, not the code. Gated now;
+// production Windows keeps real shared memory under the SAME WSL_DISTRO_NAME gate as FIX B's
+// acceleration line (one condition for both, so they can never drift apart).
+if (process.env.WSL_DISTRO_NAME) {
+  app.commandLine.appendSwitch('disable-dev-shm-usage');
+}
 
 // Dev-only CDP endpoint so headless/WSL sessions can verify the renderer booted cleanly.
 // Must be appended at module scope (before app ready) to take effect.
@@ -65,6 +76,110 @@ const manager = new VaultManager();
 app.setAppUserModelId('com.dropsync.desktop');
 
 let mainWindow: BrowserWindow | null = null;
+/** C1 — cloud-mode controller (created with the window; mode:* handlers below drive it). */
+let cloudCtl: CloudController | null = null;
+// C2j — module-level handle on the EXACT notifier function the vault engine uses (assigned at
+// the manager.setNotifier site) so the DEV battery can drive synthetic reminder fires through
+// the SAME seam (no second engine invented).
+let engineNotifier: ((title: string, body: string) => void) | null = null;
+// C2k — the card dresses in the app's CURRENT theme at display time. Module level so BOTH
+// consumers see it: the engine LEG 2 route (whenReady scope) and the createWindow focus hook.
+// Reminders only fire while the vault is unlocked (getSettings is assertUnlocked-guarded), so
+// the try/catch only covers the crack.
+const currentTheme = (): 'light' | 'dark' | 'minimal' => {
+  try { return manager.getSettings().theme; } catch { return 'light'; }
+};
+// PACKAGING-1 FIX A — the window shell follows the app's theme (owner decision §3.4): the
+// frame stays NATIVE (never frame:false / titleBarStyle) but Windows tints it from
+// nativeTheme. The app theme maps onto themeSource (dark → 'dark'; light/minimal → 'light') —
+// minimal is a light-family theme — assigned ONLY when the value would change (idempotent;
+// themeSource is app-global). Wired at every seam where the main process learns the theme:
+// the vault:settingsSet write path, app boot, vault:unlock, and the pre-unlock localStorage
+// fallback in createWindow.
+const applyFrameTheme = (theme: 'light' | 'dark' | 'minimal'): void => {
+  const source: 'dark' | 'light' = theme === 'dark' ? 'dark' : 'light';
+  if (nativeTheme.themeSource !== source) nativeTheme.themeSource = source;
+};
+
+// 1.0.5 FIX B — THE YOUTUBE REFERER STAMP. A file:// page (the packaged renderer's origin)
+// has no web origin and cannot send a Referer header — and YouTube's embedded player REQUIRES
+// one (their embed terms, documented Dec 2025): every Local Play mounted
+// https://www.youtube-nocookie.com/embed/<id> and died inside the iframe with "Video player
+// configuration error — Error 153". Probe-proven on the owner's real Windows with THIS app's
+// exact Electron (43.4.1 win32-x64, planner probe 2026-09-01): the SAME embed plays from an
+// http://127.0.0.1 page, errors 153 from file://, and errors 153 again from the http page with
+// <meta name="referrer" content="no-referrer"> — the header is the whole mechanism. The stamp
+// is the probe's cure: main-process onBeforeSendHeaders stamping Referer:
+// https://drag-drop-app.vercel.app/ (the web app's own origin, where the same embed
+// legitimately runs) on the two YouTube embed hosts. Evidence: desktop-docs/frames/yt153_probe_referer_stamp_fix.png
+// (stamped ⇒ plays) vs desktop-docs/frames/yt153_probe_noreferrer_control.png (no Referer ⇒
+// 153). DEFAULT session ONLY — Cloud embeds run on the site's own https origin and already
+// work (owner-verified); the cloud PARTITION session must never get this.
+const YT_EMBED_REFERER = 'https://drag-drop-app.vercel.app/';
+const YT_EMBED_URL_FILTER = ['https://www.youtube-nocookie.com/*', 'https://www.youtube.com/*'];
+// urlFilter/label are DEV-test seams ONLY (f_105_refererStampApplied drives this same function
+// against a throwaway session + a dev-server-origin filter); the production boot call below
+// passes neither — the defaults ARE the shipped behavior.
+const attachYouTubeRefererStamp = (
+  ses: Electron.Session,
+  urlFilter: string[] = YT_EMBED_URL_FILTER,
+  label = 'default session',
+): void => {
+  ses.webRequest.onBeforeSendHeaders({ urls: urlFilter }, (details, callback) => {
+    details.requestHeaders['Referer'] = YT_EMBED_REFERER;
+    callback({ requestHeaders: details.requestHeaders });
+  });
+  console.log('[referer-stamp] attached (' + label + ')');
+};
+// f_105_refererStampAttached — DEV-only stdout tap (DROPSYNC_CLOUD_DEV), installed at module
+// scope so it is live BEFORE whenReady attaches the stamp: the battery leg asserts the LITERAL
+// `[referer-stamp] attached` boot line was printed, so the lines are captured, never replayed.
+// Production (env absent) never taps anything.
+const f105BootLines: string[] = [];
+if (process.env.DROPSYNC_CLOUD_DEV === '1') {
+  const origStdoutWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = ((chunk: unknown, ...rest: unknown[]): boolean => {
+    if (typeof chunk === 'string' && chunk.includes('[referer-stamp] attached')) f105BootLines.push(chunk);
+    return (origStdoutWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
+  }) as typeof process.stdout.write;
+}
+
+let appMode: 'cloud' | 'local' = 'local'; // relaunch always starts Local in C1 (remember-last-mode = C2)
+/** Assigned by registerIpc — shared by mode:set and the DEV probe's switch storm. */
+let applyCloudMode: (next: 'cloud' | 'local') => Promise<'cloud' | 'local'> = async () => appMode;
+let pillFlipRelayCount = 0; // C2g-hotfix-1 §5 — receipts of REAL pill:flip ipc (incremented in the relay)
+/** C2m — USER-FLIP ARM for the flip dissolve: the pill:flip ipc handler stamps this; applyMode
+ * melts iff Date.now() - transitionArmedAt < 10 s (the flag self-expires, so a cancelled
+ * unsaved-guard leaves nothing behind). Boot-into-last-mode, dev probes, battery storms and
+ * every programmatic applyMode NEVER arm it — they stay instant. One-shot: applyMode clears
+ * it on read. The DEV battery writes it directly to simulate the pill path's arm step. */
+let transitionArmedAt = 0;
+/** PAC-3 FIX A — the per-USER-flip melt diagnostic (ONE line, prod-safe). performance.now()
+ * deltas of every phase the main process owns: capture (outgoing-world snapshot), ready (the
+ * page's decode + two-rAF submission ack), pad (the MELT_SWAP_PAD_MS tail inside beginMelt),
+ * swapToDone (swap ⇒ the melt settles). Stamps ride the EXISTING fader:ready/fader:done ipc
+ * handlers — no new channels, no behavior change. The line prints when the melt settles
+ * (fader:done), at once when no melt ran (fail-open instant flip), or when the NEXT melt
+ * supersedes a still-unsettled one (swapToDoneMs=-1) — every USER flip gets exactly one line.
+ * This is the owner's Windows tuning data (the investigation's §9 hands-on). */
+let meltDiagReadyAt = -1; // fader:ready arrival for the CURRENT melt (performance.now())
+let meltDiagPending: {
+  armed: boolean;
+  captureMs: number;
+  readyMs: number;
+  padMs: number;
+  tSwap: number;
+} | null = null;
+const printMeltDiag = (
+  d: { armed: boolean; captureMs: number; readyMs: number; padMs: number },
+  swapToDoneMs: number,
+): void => {
+  console.log(`[melt] armed=${d.armed} captureMs=${d.captureMs.toFixed(1)} readyMs=${d.readyMs.toFixed(1)}`
+    + ` padMs=${d.padMs.toFixed(1)} swapToDoneMs=${swapToDoneMs.toFixed(1)}`);
+};
+/** DEV-only: the C1/C2 battery reloads the renderer (memory test) — this guard keeps its
+ * did-finish-load handler from re-triggering the whole sequence on every reload. */
+let cloudDevBatteryStarted = false;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({    width: 1440,
@@ -82,13 +197,49 @@ function createWindow(): void {
     },
   });
   mainWindow.once('ready-to-show', () => mainWindow?.show());
+  // C1: cloud view lifecycle + C2f generalized bounds tracking (resize/maximize/full-screen/move).
+  // C2h FIX 3 — cloud-view gestures feed the SAME idle-auto-lock clock (owner decision D-B):
+  // the controller senses raw inputs from OUTSIDE the page and calls manager.touch() here.
+  // Safe by closure: manager is the module-level singleton (:63) outliving any view swap.
+  cloudCtl = initCloud(mainWindow, { onUserActivity: () => manager.touch(), currentTheme });
+  attachCloudResizeTracking(mainWindow, cloudCtl);
+  // C2j LEG 3 — missed reminders greet the owner when the window becomes front-and-center
+  // again: drain oldest-first, OVERLAY only (native already shown once at fire time); the
+  // serial card pump provides the ≥NEXT_GAP_MS spacing between the greeting cards.
+  // C2k — each drained card is dressed at flush time in the CURRENT theme.
+  mainWindow.on('focus', () => { cloudCtl?.drainMissed(currentTheme()); });
+  // C2f FIX 2 — the pill must show the app's ACTUAL boot mode (relaunch starts Local; the
+  // renderer's boot-into-last-mode may immediately flip it via mode:set). Queued until the
+  // pill layer finishes loading; delivered automatically.
+  cloudCtl.setPillMode(appMode);
   // Polish sweep #1: the window title is ALWAYS "DropSync" — renderer document.title changes
   // (dev overlays, hash routes) are ignored.
   mainWindow.on('page-title-updated', (event) => event.preventDefault());
+  // PACKAGING-1 FIX A — pre-unlock shell theme. getSettings is assertUnlocked-guarded, so a
+  // locked boot starts themeSource 'light'. The renderer ALREADY mirrors the last user-chosen
+  // theme into localStorage ('dropsync.theme' — its THEME_CACHE_KEY, written by setTheme,
+  // vault.tsx) precisely so the unlock/first-run screens render in it before vault settings
+  // exist; the shell reads the SAME source, ONLY while the vault is still locked (after
+  // unlock the real settings own the shell via the vault:unlock and vault:settingsSet seams).
+  // Normalization mirrors the renderer's cachedTheme(). Fires once per main-window load;
+  // applyFrameTheme is idempotent, so reloads are free. (Found by the PACKAGING-1 order's
+  // "if you find a pre-unlock theme source the renderer already uses, wire from THAT" clause.)
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (manager.status().state === 'unlocked') return; // real settings own the shell now
+    void mainWindow?.webContents
+      .executeJavaScript(`(() => { try { return localStorage.getItem('dropsync.theme'); } catch { return null; } })()`)
+      .then((cached) => {
+        if (typeof cached === 'string') {
+          applyFrameTheme(cached === 'dark' ? 'dark' : cached === 'minimal' ? 'minimal' : 'light');
+        }
+      })
+      .catch(() => { /* pre-unlock best-effort only — the shell keeps its boot theme */ });
+  });
   // Dev-only boot probe: proves the contextBridge landed and React mounted.
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.webContents.on('console-message', (_event, _level, message) => {
-      if (process.env.DROPSYNC_E2E_S2 === '1' || process.env.DROPSYNC_SIT3_DOMCHECKS === '1') console.log('[renderer-console]', message);
+      if (process.env.DROPSYNC_E2E_S2 === '1' || process.env.DROPSYNC_SIT3_DOMCHECKS === '1'
+        || process.env.DROPSYNC_CLOUD_DEV === '1') console.log('[renderer-console]', message);
     });
     mainWindow.webContents.on('did-finish-load', () => {
       void mainWindow?.webContents
@@ -782,6 +933,24 @@ function createWindow(): void {
       out.rejectsOver480 = await rejects(() => dropsync.vault.settingsSet({ autoLockMinutes: 481 }));
       out.rejectsBadTheme = await rejects(() => dropsync.vault.settingsSet({ theme: 'blue' }));
       out.accepts240 = ((await dropsync.vault.settingsSet({ autoLockMinutes: 240 })).autoLockMinutes === 240);
+      // ---- C2l (4a): picking Off must STORE null AND DISPLAY "Off". The owner symptom was the
+      // display snapping back to "10 minutes" while the store kept null (the old '?? 10' reader).
+      // autoLockOffDisplayed is THE red-proof-sensitive half: with the old reader the stored
+      // check passes but the display lies, so autoLockOffReal (both conjuncts) goes false.
+      selRoot.querySelector('button').click();
+      await sleep(300);
+      document.querySelector('[data-editorial-select-menu] [data-value="off"]').click();
+      await sleep(700);
+      out.autoLockOffStored = (await dropsync.vault.settingsGet()).autoLockMinutes === null;
+      selRoot.querySelector('button').click();
+      await sleep(300);
+      const offLabel = ((selRoot.querySelector('button span') || selRoot.querySelector('button')).textContent || '').trim();
+      out.autoLockOffTriggerLabel = offLabel;
+      out.autoLockOffDisplayed = offLabel.toLowerCase() === 'off';
+      out.autoLockOffReal = out.autoLockOffStored && out.autoLockOffDisplayed;
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await sleep(300);
+      out.offMenuEscCloses = !document.querySelector('[data-editorial-select-menu]');
       await dropsync.vault.settingsSet({ autoLockMinutes: 10 }); // restore default
       // FIX 3: closing Settings must be SILENT — zero drop:list refetches, modal just goes.
       // (Move-vault's refresh is logic-level: wired to onVaultMoved in App.tsx, fired only on
@@ -3376,16 +3545,3173 @@ function createWindow(): void {
             .catch((error) => console.error('[s4] failed:', error instanceof Error ? error.message : String(error)));
         }, 4000);
       }
+      // DROPSYNC_CLOUD_DEV=1 → C1/C1b/C2f cloud battery. C2f: launch goes STRAIGHT into the last
+      // used mode (no porch), so the battery (1) captures the boot state + pill layer evidence,
+      // (2) proves full-window bounds + corner-glued pill across resize/fullscreen, (3) drives
+      // the pill flip relay through the guarded switch path, then (4) re-runs the kept [c1]/
+      // [c1b] evidence. The porch-era [c2]/[c2b]/[c2c] assertions (memory-remember via porch
+      // remount, dressed-login dance, pill-float DOM probe) are OBSOLETE — removed with this
+      // rewrite (C2f FIX 5: never silently keep a green that tests nothing).
+      if (process.env.DROPSYNC_CLOUD_DEV === '1' && !cloudDevBatteryStarted) {
+        cloudDevBatteryStarted = true;
+        setTimeout(() => {
+          void (async () => {
+            try {
+              const win = mainWindow;
+              if (!win || !cloudCtl) throw new Error('window/controller gone');
+              const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+              // Page-side readers shared by every leg below (defined FIRST — no TDZ traps).
+              const readState = (): Promise<{ open: boolean; saveDisabled: boolean | null; typedChars: number; discardConfirmVisible: boolean }> =>
+                win.webContents.executeJavaScript('JSON.stringify(window.__c2fEditTest ? window.__c2fEditTest.state() : null)').then((s) => {
+                  const parsed = JSON.parse(s as string) as { open: boolean; saveDisabled: boolean | null; typedChars: number; discardConfirmVisible: boolean } | null;
+                  if (!parsed) throw new Error('guard fixture: __c2fEditTest not registered (AppBody not mounted?)');
+                  return parsed;
+                });
+              const readMode = (): Promise<string> =>
+                win.webContents.executeJavaScript('window.dropsync.mode.get()').then((m) => String(m));
+              const readModeSafe = (): Promise<string> =>
+                win.webContents.executeJavaScript('window.dropsync ? window.dropsync.mode.get() : "no-bridge"').then((m) => String(m));
+              const seqLen = (): Promise<number> =>
+                win.webContents.executeJavaScript('window.__DC_METRICS ? window.__DC_METRICS.seq.length : 0').then((n) => Number(n));
+              const seqHasConfirmOpenSince = (mark: number): Promise<boolean> =>
+                win.webContents.executeJavaScript(
+                  `(window.__DC_METRICS ? window.__DC_METRICS.seq.slice(${mark}).some((e) => e.ev === 'mode-guard-confirm-open') : false)`
+                ).then((v) => v === true);
+              // C2h FIX 4 — "REAL list rendered" counter: counts drop CARDS by their stable
+              // rendered root signature in EditorialDropItem.tsx:246-248
+              // (`relative select-none … cursor-pointer group overflow-hidden` on every card,
+              // no data-testid exists). The locked early-return screen renders ZERO such cards,
+              // so >0 is genuine unlocked-UI evidence.
+              const countDropCards = (): Promise<number> =>
+                win.webContents.executeJavaScript(
+                  `document.querySelectorAll('div.select-none.cursor-pointer.group.overflow-hidden').length`
+                ).then((n) => Number(n));
+              // (1) Boot evidence: straight-into-last-mode + the pill layer present/transparent.
+              await sleep(2500); // pill layer load + boot-into-last-mode settle
+              const bootPill = await cloudCtl.pillProbe();
+              console.log('[c2f-boot]', JSON.stringify({
+                mode: appMode,
+                f_c2f_pillPersistent_boot: bootPill.loaded && bootPill.visible
+                  && bootPill.bounds.x === bootPill.expected.x && bootPill.bounds.y === bootPill.expected.y,
+                pillRaw: bootPill,
+              }));
+
+              // ==== 1.0.5 — DOWNLOADS LIVE AGAIN + THE YOUTUBE REFERER STAMP ================
+              // (repair-order-105-downloads-and-youtube.md §8) Both new legs live HERE —
+              // before the heavy stages — on their own evidence (no vault/site/pill state).
+
+              // f_105_refererStampAttached — FIX B leg 1: the literal `[referer-stamp]
+              // attached` boot line, captured by the module-scope DEV stdout tap (f105BootLines)
+              // installed before whenReady runs. RED (comment the boot call): nothing logs the
+              // line ⇒ the array stays empty ⇒ false.
+              {
+                const f_105_refererStampAttached = f105BootLines.some((l) => l.includes('[referer-stamp] attached'));
+                console.log('[f105-stamp-attached]', JSON.stringify({
+                  f_105_refererStampAttached,
+                  raw: { captured: f105BootLines.length },
+                }));
+              }
+
+              // f_105_refererStampApplied — FIX B leg 2: the SAME factored stamp function, on a
+              // THROWAWAY in-memory session (no persist: prefix ⇒ never the default, never the
+              // persist:cloud PARTITION), a filter covering the dev server origin, one fetch
+              // through that session, and a read-only onSendHeaders listener proving the
+              // outgoing headers carry YT_EMBED_REFERER.
+              // RED (skip the registration): the outgoing headers carry no Referer ⇒ false.
+              // ORDER FIELD CORRECTION (flagged in the report; the wc.mainFrameUrl precedent):
+              // the order said `net.fetch` with `{ session }` — Electron 43.4.1 IGNORES that
+              // option at runtime (standalone probe, 2026-09-01: the request rode the DEFAULT
+              // session — the default-session onSendHeaders fired, the throwaway's never did;
+              // d.ts 10227/13088 types net.fetch's init without session and its comment says
+              // "to make a request from another session, use ses.fetch()"). The leg therefore
+              // fetches via the session's own `throwaway.fetch()` — the documented equivalent,
+              // probe-proven to ride the throwaway session (its onBeforeSendHeaders stamped and
+              // its onSendHeaders fired). Tear-down: both webRequest handlers nulled after.
+              {
+                const devBase = process.env.ELECTRON_RENDERER_URL ?? '';
+                const appliedRaw: { saw: boolean; referer: string | null; url: string | null } = { saw: false, referer: null, url: null };
+                if (devBase) {
+                  const throwaway = session.fromPartition('f105-throwaway');
+                  throwaway.webRequest.onSendHeaders({ urls: [devBase + '/*'] }, (details) => {
+                    appliedRaw.saw = true;
+                    appliedRaw.referer = details.requestHeaders['Referer'] ?? null;
+                    appliedRaw.url = details.url;
+                  });
+                  attachYouTubeRefererStamp(throwaway, [devBase + '/*'], 'f105-throwaway');
+                  try {
+                    await throwaway.fetch(devBase + '/');
+                  } catch { /* the evidence is onSendHeaders, not the response */ }
+                  throwaway.webRequest.onBeforeSendHeaders(null);
+                  throwaway.webRequest.onSendHeaders(null);
+                }
+                const f_105_refererStampApplied = !!devBase && appliedRaw.saw
+                  && appliedRaw.referer === YT_EMBED_REFERER;
+                console.log('[f105-stamp-applied]', JSON.stringify({
+                  f_105_refererStampApplied,
+                  matrix: { devServer: !!devBase, saw: appliedRaw.saw, refererMatch: appliedRaw.referer === YT_EMBED_REFERER },
+                  raw: appliedRaw,
+                }));
+              }
+              // (1b) f_c2f_flipGuardFull — THE robot test for the unsaved-work guard
+              // (C2f-hotfix-1). The old relay leg could only prove the CLEAN path; this one
+              // drives a REAL dirty editor through the REAL relay path:
+              //   pill:flip ipc ≡ win.webContents.send('pill:flipRequested', next)
+              // Editors exist only inside an unlocked vault, so: ensure vault → unlock → seed a
+              // text drop through the REAL bridge → reload (renderer mounts Local/unlocked with
+              // the seeded drop) → open the edit modal via the __c2fEditTest dev fixture → type
+              // THROUGH THE DOM (execCommand insertText → native input event → mention editor
+              // onChange). React state is never poked for any action under test.
+              // Return to Local through the REAL path (renderer screen must follow — the reload
+              // below boots into dropsync.mode.last, and ONLY a renderer-driven switch writes it).
+              if (appMode !== 'local') {
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1800);
+              }
+              if ((await readModeSafe()) !== 'local') { // desync insurance: force both sides local
+                await applyCloudMode('local');
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1200);
+              }
+              const META_TEXT = 'META-SAVE-FULL-TEXT-LINE-1\nMETA-SAVE-FULL-TEXT-LINE-2'; // hotfix-2 fixture body
+              const seedId = await win.webContents.executeJavaScript(
+                `(async () => {
+                   try {
+                     const d = window.dropsync;
+                     await d.vault.prepareFolder('/tmp/ds-c2f-vault').catch(() => {});
+                     try { await d.vault.create('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch {}
+                     await d.vault.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
+                     // Two fixtures, ONE reload: GuardFixture (hotfix-1 guard matrix) +
+                     // MetaSaveFixture (hotfix-2 meta-save preview key) with KNOWN body text.
+                     const g = await d.drop.createText({ spaceId: 'personal', name: 'GuardFixture', content: 'original text', categories: [], expirationOption: '24h', locked: false, reminderAt: null });
+                     const m = await d.drop.createText({ spaceId: 'personal', name: 'MetaSaveFixture', content: ${JSON.stringify(META_TEXT)}, categories: [], expirationOption: '24h', locked: false, reminderAt: null });
+                     return JSON.stringify({ g: String(g.id), m: String(m.id) });
+                   } catch (e) { return 'FATAL:' + String(e); }
+                 })()`
+              ) as string;
+              if (seedId.startsWith('FATAL')) throw new Error('guard fixture seeding failed: ' + seedId);
+              const seeds = JSON.parse(seedId) as { g: string; m: string };
+              win.webContents.reload();
+              await sleep(4500); // renderer remount: boot-into-last-mode (local) + store fetch
+              let opened = false;
+              for (let i = 0; i < 10 && !opened; i++) {
+                opened = await win.webContents.executeJavaScript(
+                  `window.__c2fEditTest ? window.__c2fEditTest.open(${JSON.stringify(seeds.g)}) : false`
+                ) as boolean;
+                if (!opened) await sleep(500);
+              }
+              await sleep(800); // modal mount + edit-payload hydration
+              if (!opened) throw new Error('guard fixture: edit modal never opened (seeds.g=' + seeds.g + ') — AppBody mounted? e2eHooks tag present?');
+              const baseState = await readState(); // PRE-typing baseline (fixture opens the list
+              // item directly, so the editor may seed empty — assertions are relative to THIS).
+              const typedOk = await win.webContents.executeJavaScript(
+                `(() => { const ed = document.querySelector('div[contenteditable][role="textbox"]');
+                  if (!ed) return false; ed.focus();
+                  document.execCommand('insertText', false, 'HOTFIX-DIRTY-TEXT'); return true; })()`
+              ) as boolean;
+              await sleep(400); // React flush after the native input event
+              const clickButton = (label: string): Promise<boolean> =>
+                win.webContents.executeJavaScript(
+                  `[...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === ${JSON.stringify(label)}) ? ( [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === ${JSON.stringify(label)}).click(), true ) : false`
+                ).then((v) => v === true);
+
+              const dirtyState = await readState();
+              const typedAdded = dirtyState.typedChars - baseState.typedChars; // == 17 when the
+              // native input event really drove the editor (the React-observable delta)
+              const mark1 = await seqLen();
+              win.webContents.send('pill:flipRequested', 'cloud'); // dirty flip
+              await sleep(900);
+              const duringDirty = { mode: await readMode(), dom: await readState(), sawConfirmEvent: await seqHasConfirmOpenSince(mark1) };
+              const dirtyIntercept = typedOk && typedAdded === 17 /* len('HOTFIX-DIRTY-TEXT') */
+                && appMode === 'local' && duringDirty.mode === 'local'
+                && duringDirty.dom.discardConfirmVisible && duringDirty.sawConfirmEvent;
+
+              await clickButton('Keep editing'); // Cancel leg
+              await sleep(400);
+              const cancelState = { mode: await readMode(), dom: await readState() };
+              const cancelKeeps = cancelState.mode === 'local' && cancelState.dom.open
+                && cancelState.dom.typedChars === dirtyState.typedChars; // typed text intact
+
+              win.webContents.send('pill:flipRequested', 'cloud'); // re-flip while still dirty
+              await sleep(700);
+              const confirmAgain = await readState();
+              await clickButton('Discard'); // Discard leg — fires the stashed continuation
+              await sleep(2000);
+              const discardMode = await readMode();
+              const discardFlips = discardMode === 'cloud' && appMode === 'cloud';
+
+              // Come back — editor must be GONE *and* the world must be INTACT (C2h: switching
+              // never seals). Assert LIVE evidence: vault still unlocked AND the real drop list
+              // rendered (no password screen) — guards against any vacuous pass like before.
+              win.webContents.send('pill:flipRequested', 'local');
+              await sleep(1500);
+              const backStatus = String(await win.webContents.executeJavaScript(
+                `(window.dropsync ? window.dropsync.vault.status().then((s) => s.state) : Promise.resolve('noBridge'))`
+              ));
+              const backDom = await readState();
+              const cardCount = await countDropCards();
+              const editorClosedOnReturn = backDom.open === false && backStatus === 'unlocked'
+                && cardCount > 0;
+
+              // Clean leg: reopen (discard threw the typing away), do NOT type, flip ⇒ instant,
+              // NO confirm — the guard must not nag the clean case.
+              const reopened = await win.webContents.executeJavaScript(
+                `window.__c2fEditTest ? window.__c2fEditTest.open(${JSON.stringify(seeds.g)}) : false`
+              ) as boolean;
+              await sleep(700);
+              const markClean = await seqLen();
+              win.webContents.send('pill:flipRequested', 'cloud');
+              await sleep(1400);
+              const cleanState = { mode: await readMode(), dom: await readState(), sawConfirmEvent: await seqHasConfirmOpenSince(markClean) };
+              const cleanInstant = reopened && cleanState.mode === 'cloud' && !cleanState.dom.discardConfirmVisible
+                && !cleanState.sawConfirmEvent;
+
+              console.log('[c2f-flipguard]', JSON.stringify({
+                f_c2f_flipGuardFull: dirtyIntercept && cancelKeeps && discardFlips && editorClosedOnReturn && cleanInstant,
+                f_c2f_flipGuard: cleanInstant, // folded: the old relay key IS the clean-path assertion
+                matrix: { dirtyIntercept, cancelKeeps, discardFlips, editorClosedOnReturn, cleanInstant },
+                raw: { seedId: seeds.g, opened, typedOk, baseState, dirtyState, typedAdded, duringDirty, cancelState, confirmAgain, discardMode, backDom, backStatus, cardCount, cleanState },
+              }));
+
+              // (1c) f_c2f_metaSavePreviewKeepsText — THE robot test for hotfix-2. A metadata-only
+              // save of a text drop used to leave the preview cache primed with an EMPTY body
+              // (App.tsx primeSavedPreviewPayload primed '' when the meta DTO carried no payload)
+              // ⇒ the reopened preview rendered blank on an unconditional cache hit. Drives the
+              // REAL preview→Edit→save→reopen path and asserts the FULL original text is on screen
+              // (DOM) AND in the re-primed cache (dev hook). Regression leg (a): content-edit save
+              // still renders the new text.
+              // The clean leg above ended in Cloud ⇒ vault sealed ⇒ restore a REAL Local UI
+              // through the bridge before driving any preview (locked early-return renders none).
+              win.webContents.send('pill:flipRequested', 'local');
+              await sleep(1500);
+              await win.webContents.executeJavaScript(
+                `(async () => { const d = window.dropsync; await d.vault.prepareFolder('/tmp/ds-c2f-vault').catch(() => {}); await d.vault.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw').catch(() => {}); return true; })()`
+              );
+              win.webContents.reload();
+              await sleep(4500); // boot-into-last-mode ('local') + store fetch with BOTH fixtures
+              const openPreview = await win.webContents.executeJavaScript(
+                `window.__c2fEditTest ? window.__c2fEditTest.openPreview(${JSON.stringify(seeds.m)}) : false`
+              ) as boolean;
+              await sleep(1200); // preview mount + cold payload fetch banks into the cache
+              const preSave = await win.webContents.executeJavaScript(
+                'JSON.stringify(window.__c2fEditTest ? window.__c2fEditTest.previewState() : null)'
+              ).then((s) => JSON.parse(s as string) as { preText: string | null; editBtnVisible: boolean });
+              // Click the REAL Edit button in the preview → openEditModal's preview-originated
+              // branch (editOriginRef set) → this is the ONLY path that rebuilds the preview.
+              let clickedEdit = false;
+              for (let i = 0; i < 8 && !clickedEdit; i++) {
+                clickedEdit = await clickButton('Edit');
+                if (!clickedEdit) await sleep(400);
+              }
+              await sleep(900); // openEditModal hydrates the payload BEFORE mounting the editor
+              let openedMeta = false;
+              for (let i = 0; i < 8 && !openedMeta; i++) {
+                openedMeta = await win.webContents.executeJavaScript(
+                  'window.__c2fEditTest ? window.__c2fEditTest.state().open : false'
+                ) as boolean;
+                if (!openedMeta) await sleep(400);
+              }
+              // Rename via a NATIVE input event (React onChange) — no state poking.
+              const NEW_NAME = 'MetaSaveFixture RENAMED';
+              const renamed = await win.webContents.executeJavaScript(
+                `(() => { const inp = document.querySelector('input[placeholder="Text snippet"]');
+                  if (!inp) return false;
+                  const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                  set.call(inp, ${JSON.stringify(NEW_NAME)});
+                  inp.dispatchEvent(new Event('input', { bubbles: true }));
+                  return true; })()`
+              ) as boolean;
+              await sleep(300); // React flush
+              await clickButton('Save changes');
+              // Save → invalidate → PRIME(fixed fetch) → reopen; poll for the reopened preview body.
+              let postMeta: { preText: string | null } = { preText: null };
+              for (let i = 0; i < 12; i++) {
+                await sleep(500);
+                const st = await win.webContents.executeJavaScript(
+                  'window.__c2fEditTest ? JSON.stringify({ ed: document.querySelector("div[contenteditable][role=\\"textbox\\"]") ? true : false, pv: window.__c2fEditTest.previewState() }) : "null"'
+                ).then((s) => JSON.parse(s as string) as { ed: boolean; pv: { preText: string | null } } | null);
+                if (!st) continue;
+                if (!st.ed && st.pv.preText !== null) { postMeta = st.pv; break; }
+              }
+              const cachedAfterMeta = await win.webContents.executeJavaScript(
+                `JSON.stringify(window.__previewCacheGet ? window.__previewCacheGet(${JSON.stringify(seeds.m)}) : null)`
+              ).then((s) => JSON.parse(s as string) as { text: string } | null);
+              const metaSaveKeepsFullText = preSave.preText === META_TEXT && postMeta.preText === META_TEXT;
+              const cachePrimedWithFullText = !!cachedAfterMeta && cachedAfterMeta.text === META_TEXT;
+
+              // Regression leg (a): CONTENT-edit save still renders the new text.
+              await clickButton('Edit');
+              await sleep(900);
+              let reopenedForContent = false;
+              for (let i = 0; i < 8 && !reopenedForContent; i++) {
+                reopenedForContent = await win.webContents.executeJavaScript(
+                  'window.__c2fEditTest ? window.__c2fEditTest.state().open : false'
+                ) as boolean;
+                if (!reopenedForContent) await sleep(400);
+              }
+              const contentTyped = await win.webContents.executeJavaScript(
+                `(() => { const ed = document.querySelector('div[contenteditable][role="textbox"]');
+                  if (!ed) return false; ed.focus();
+                  document.execCommand('selectAll', false, null);
+                  document.execCommand('insertText', false, 'CONTENT-EDITED-BODY'); return true; })()`
+              ) as boolean;
+              await sleep(400);
+              await clickButton('Save changes');
+              let postContent: { preText: string | null } = { preText: null };
+              for (let i = 0; i < 12; i++) {
+                await sleep(500);
+                const st = await win.webContents.executeJavaScript(
+                  'window.__c2fEditTest ? JSON.stringify({ ed: document.querySelector("div[contenteditable][role=\\"textbox\\"]") ? true : false, pv: window.__c2fEditTest.previewState() }) : "null"'
+                ).then((s) => JSON.parse(s as string) as { ed: boolean; pv: { preText: string | null } } | null);
+                if (!st) continue;
+                if (!st.ed && st.pv.preText !== null) { postContent = st.pv; break; }
+              }
+              const cachedAfterContent = await win.webContents.executeJavaScript(
+                `JSON.stringify(window.__previewCacheGet ? window.__previewCacheGet(${JSON.stringify(seeds.m)}) : null)`
+              ).then((s) => JSON.parse(s as string) as { text: string } | null);
+              const contentEditStillRenders = contentTyped && postContent.preText === 'CONTENT-EDITED-BODY'
+                && !!cachedAfterContent && cachedAfterContent.text === 'CONTENT-EDITED-BODY';
+
+              console.log('[c2f-metasave]', JSON.stringify({
+                f_c2f_metaSavePreviewKeepsText: openPreview && renamed && metaSaveKeepsFullText && cachePrimedWithFullText && contentEditStillRenders,
+                matrix: { metaSaveKeepsFullText, cachePrimedWithFullText, contentEditStillRenders },
+                raw: { seedsM: seeds.m, openPreview, preSave, clickedEdit, openedMeta, renamed, postMeta, cachedAfterMeta, reopenedForContent, contentTyped, postContent, cachedAfterContent },
+              }));
+              // (2) Enter Cloud through the REAL user path — the pill flip relay. The site view
+              // is created lazily on first Cloud entry, so bounds legs must run with it alive.
+              // (Driving the raw mode:set bridge would leave the renderer's screen state out of
+              // sync — the relay IS the real path: pill → main → guarded switchMode → mode:set.)
+              win.webContents.send('pill:flipRequested', 'cloud');
+              let readyMs: number | null = null;
+              for (let i = 0; i < 30 && readyMs === null; i++) {
+                await sleep(1000);
+                readyMs = cloudCtl.probeState().readyMs ?? null;
+              }
+              // (2b) f_c2g_* — THE PUNCH-HOLE PILL battery (C2g FIX 5). Runs BEFORE the c2f
+              // bounds/storm legs and restores Style A at the end, so those carried keys keep
+              // asserting against the known full-width footprint. All layer actions ride the
+              // REAL DOM listeners via pillDrive/pillEval (env-gated); bounds truth is main-side.
+              {
+                const g = cloudCtl; // narrowed alias — TS can't keep null-checks inside closures
+                const pillState = (): Promise<{ style: string; bloomed: boolean }> =>
+                  g.pillEval('JSON.stringify(window.__c2gPill || null)').then((s) => JSON.parse(s as string) as { style: string; bloomed: boolean } | null)
+                    .then((p) => p ?? { style: 'missing', bloomed: false });
+                const pollStyle = async (want: string): Promise<boolean> => {
+                  for (let i = 0; i < 8; i++) {
+                    if ((await pillState()).style === want) return true;
+                    await sleep(400);
+                  }
+                  return false;
+                };
+
+                // First-boot default proof + normalize: cleared store ⇒ relaunch boots A.
+                const styleFile = join(app.getPath('userData'), 'pill-style.json');
+                const fileStyle = (): string | null => {
+                  try {
+                    return (JSON.parse(readFileSync(styleFile, 'utf8')) as { style?: string }).style ?? null;
+                  } catch { return null; }
+                };
+                rmSync(styleFile, { force: true });
+                await g.reloadPillLayer();
+                await sleep(900);
+                const bootedA = await pollStyle('A');
+
+                // f_c2g_geometry — PERMANENT STAGE truth (PAC-5): the room is a constant per
+                // style — A = 140 × 28 @y10 (center−70..+70); B = 132 × 44 @y2 (center±66) in
+                // EVERY B state. Plus the PAINTED-FOOTPRINT asserts (the page anchors inside
+                // the permanent room): #pillA rect [14,0,112,28] (window center−56..+56,
+                // pixel-identical rest position) and B's rest circle #pillB [52,8,28,28]
+                // (window center−14..+14 × PILL_TOP..+28, byte-identical to every older
+                // layout). Plus hotfix-3's A-side LAYOUT asserts (row display — computed
+                // value blockifies to `flex` on the abspos element — and Local's rect top 2±0.5)
+                // whenever style A is up.
+                const geoLegs: Array<{ tag: string; ok: boolean; disp?: string; localTop?: number; room?: [number, number, number] }> = [];
+                const readALayout = async (): Promise<{ d: string; t: number; a: [number, number, number, number]; b: [number, number, number, number] | null }> =>
+                  g.pillEval(`(function(){ var a = document.getElementById('pillA');
+                      var bb = document.getElementById('pillB');
+                      var ra = a.getBoundingClientRect();
+                      var rb = bb ? bb.getBoundingClientRect() : null;
+                      var r = document.getElementById('btn-local-a').getBoundingClientRect();
+                      return JSON.stringify({ d: getComputedStyle(a).display, t: +r.top.toFixed(1),
+                        a: [+ra.left.toFixed(1), +ra.top.toFixed(1), +ra.width.toFixed(1), +ra.height.toFixed(1)],
+                        b: rb ? [+rb.left.toFixed(1), +rb.top.toFixed(1), +rb.width.toFixed(1), +rb.height.toFixed(1)] : null }); })()`)
+                    .then((s) => JSON.parse(s as string) as { d: string; t: number; a: [number, number, number, number]; b: [number, number, number, number] | null });
+                const geoLeg = async (tag: string, w: number, h: number, fullscreen: boolean): Promise<void> => {
+                  if (fullscreen) win.setFullScreen(true);
+                  else win.setSize(w, h);
+                  await sleep(1600); // watchdog + deferred re-apply budget
+                  const b = win.getContentBounds();
+                  const site = await g.siteProbe();
+                  const pill = await g.pillProbe();
+                  // PAC-5 — the two PERMANENT rooms (constants per style; the y-offset is BACK
+                  // for B, permanently, and that is correct now — the bloom never moves).
+                  const isA = pill.style === 'A';
+                  const wantW = isA ? PILL_W + PILL_A_ROOM_PAD_X * 2 : PILL_W + PILL_BLOOM_PAD_X * 2;
+                  const wantH = isA ? PILL_H : PILL_H + PILL_BLOOM_PAD_Y * 2;
+                  const wantY = isA ? PILL_TOP : PILL_TOP - PILL_BLOOM_PAD_Y;
+                  let disp: string | undefined;
+                  let localTop: number | undefined;
+                  let paintOk = true; // painted-footprint truth inside the permanent room
+                  if (isA) {
+                    const al = await readALayout();
+                    disp = al.d;
+                    localTop = al.t;
+                    // NOTE (hotfix-3): #pillA is position:absolute, so its COMPUTED display is
+                    // BLOCKIFIED — specified `inline-flex` resolves to `flex` ('block' leaked
+                    // through when the broken cascade won). Accept the pair as row-proof.
+                    paintOk = (al.d === 'inline-flex' || al.d === 'flex') && Math.abs(al.t - 2) <= 0.5
+                      && Math.abs(al.a[0] - PILL_A_ROOM_PAD_X) <= 1 && Math.abs(al.a[1]) <= 1
+                      && Math.abs(al.a[2] - PILL_W) <= 0.5 && Math.abs(al.a[3] - PILL_H) <= 0.5;
+                  } else {
+                    // B at rest: the painted circle at [52,8,28,28] in the permanent room.
+                    const bl = await readALayout();
+                    paintOk = !!bl.b && Math.abs(bl.b[0] - 52) <= 1
+                      && Math.abs(bl.b[1] - 8) <= 1
+                      && Math.abs(bl.b[2] - PILL_B_REST_W) <= 0.5 && Math.abs(bl.b[3] - PILL_H) <= 0.5;
+                  }
+                  geoLegs.push({
+                    tag,
+                    ok: site.visible
+                      && site.bounds.x === 0 && site.bounds.y === 0
+                      && site.bounds.width === b.width && site.bounds.height === b.height
+                      && Math.abs(pill.bounds.x - Math.round((b.width - wantW) / 2)) <= 1
+                      && pill.bounds.y === wantY
+                      && pill.bounds.width === wantW && pill.bounds.height === wantH
+                      && paintOk,
+                    disp,
+                    localTop,
+                    room: [wantW, wantH, wantY],
+                  });
+                };
+                await geoLeg('geo-1600x1000', 1600, 1000, false);
+                await geoLeg('geo-1150x760', 1150, 760, false);
+                await geoLeg('geo-fullscreen', 0, 0, true);
+                win.setFullScreen(false);
+
+                // f_c2g_stylesToggle — REAL right-click toggles A⇄B; disk store updates; choice
+                // survives a pill-layer relaunch (disk → query param → first frame).
+                await g.pillDrive('contextmenu'); // A → B
+                await sleep(400);
+                const stB = await pillState();
+                const fileAfterB = fileStyle() === 'B';
+                const probeStyleB = (await g.pillProbe()).style === 'B';
+                const restB = await g.pillProbe(); // B at rest = tight 28 × 28, centered
+                await g.reloadPillLayer(); // "relaunch": persisted B must survive
+                await sleep(900);
+                const survivedB = await pollStyle('B');
+                await g.pillDrive('contextmenu'); // B → A
+                await sleep(400);
+                const stA = await pillState();
+                const fileAfterA = fileStyle() === 'A';
+                await g.reloadPillLayer();
+                await sleep(900);
+                const survivedA = await pollStyle('A');
+
+                // f_c2g_bloomBounds — Style B PERMANENT STAGE truth (PAC-5): the room is the
+                // SAME constant 132 × 44 @y2 in rest AND bloom (it never changes), the painted
+                // circle rests at [52,8,28,28], the bloomed pill lands DEAD CENTERED at
+                // [10,8,112,28] — window center±56, the SAME height band as the circle (no
+                // down-settle); rapid hover storms settle with no stuck size.
+                await g.pillDrive('contextmenu'); // → B again for the bloom legs
+                await sleep(400);
+                // The two PERMANENT stage rects (PAC-5) — A 140 × 28 @y10, B 132 × 44 @y2.
+                const A_ROOM_W = PILL_W + PILL_A_ROOM_PAD_X * 2; // 140
+                const B_ROOM_W = PILL_W + PILL_BLOOM_PAD_X * 2; // 132
+                const B_ROOM_H = PILL_H + PILL_BLOOM_PAD_Y * 2; // 44
+                const B_ROOM_Y = PILL_TOP - PILL_BLOOM_PAD_Y; // 2
+                const B_CIRCLE_LEFT = (B_ROOM_W - PILL_B_REST_W) / 2; // 52
+                const B_BLOOM_LEFT = (B_ROOM_W - PILL_W) / 2; // 10 — dead-centered pill
+                const bStageOk = (r: Electron.Rectangle, cw: number): boolean =>
+                  Math.abs(r.x - Math.round((cw - B_ROOM_W) / 2)) <= 1 && r.y === B_ROOM_Y
+                  && r.width === B_ROOM_W && r.height === B_ROOM_H;
+                const restOk = bStageOk(restB.bounds, win.getContentBounds().width);
+                // ZERO-MISS at rest, page-level too: the painted circle IS the whole 28 × 28
+                // hover/click target at [52,8,28,28] — the permanent room's transparent margin
+                // is dead space by the owner-approved §3.2 decision (the page anchors prove
+                // the painted footprint sits exactly where every older layout put it).
+                const restPage = await g.pillEval(`(function(){
+                    var r = document.getElementById('root').getBoundingClientRect();
+                    var p = document.getElementById('pillB').getBoundingClientRect();
+                    return JSON.stringify({ rw: [+r.width.toFixed(1), +r.height.toFixed(1)],
+                      pl: [+p.left.toFixed(1), +p.top.toFixed(1), +p.width.toFixed(1), +p.height.toFixed(1)] }); })()`)
+                  .then((s) => JSON.parse(s as string) as { rw: [number, number]; pl: [number, number, number, number] });
+                const restFlush = Math.abs(restPage.rw[0] - B_ROOM_W) <= 0.5
+                  && Math.abs(restPage.rw[1] - B_ROOM_H) <= 0.5
+                  && Math.abs(restPage.pl[0] - B_CIRCLE_LEFT) <= 0.5 && Math.abs(restPage.pl[1] - PILL_BLOOM_PAD_Y) <= 0.5
+                  && restPage.pl[2] === PILL_B_REST_W && restPage.pl[3] === PILL_H;
+                // PAC-5 — the room NEVER changes, so the old waitBloomRoom (a main-side room
+                // poll) is replaced by the PAINTED bloom truth: #pillB settled at the centered
+                // [10,8,112,28] with the class on.
+                const readBRect = async (): Promise<[number, number, number, number, boolean]> =>
+                  g.pillEval(`(function(){ var p = document.getElementById('pillB');
+                      var r = p.getBoundingClientRect();
+                      return JSON.stringify([+r.left.toFixed(1), +r.top.toFixed(1),
+                        +r.width.toFixed(1), +r.height.toFixed(1), p.classList.contains('bloomed')]); })()`)
+                    .then((x) => JSON.parse(x as string) as [number, number, number, number, boolean]);
+                const waitBloomPainted = async (): Promise<boolean> => {
+                  for (let i = 0; i < 12; i++) { // ≤6s: elastic settle budget
+                    await sleep(500);
+                    const s = await readBRect();
+                    if (s[4] && Math.abs(s[0] - B_BLOOM_LEFT) <= 1 && Math.abs(s[1] - PILL_BLOOM_PAD_Y) <= 1
+                      && Math.abs(s[2] - PILL_W) <= 0.5 && Math.abs(s[3] - PILL_H) <= 0.5) return true;
+                  }
+                  return false;
+                };
+                const waitRestPainted = async (): Promise<boolean> => {
+                  for (let i = 0; i < 12; i++) { // ≤6s: hysteresis 90 + elastic 550 settle
+                    await sleep(500);
+                    const s = await readBRect();
+                    if (!s[4] && Math.abs(s[0] - B_CIRCLE_LEFT) <= 1 && Math.abs(s[1] - PILL_BLOOM_PAD_Y) <= 1
+                      && Math.abs(s[2] - PILL_B_REST_W) <= 0.5 && Math.abs(s[3] - PILL_H) <= 0.5) return true;
+                  }
+                  return false;
+                };
+                await g.pillDrive('mouseenter');
+                // ENTRY truth (PAC-5): no reveal poll exists anymore — the class lands on the
+                // same tick as the hover and the room is already the final 132 viewport. The
+                // pill must be VISIBLE, bloomed-classed, in the PERMANENT viewport; the settled
+                // left position is bloomOk's job (left ANIMATES now — middle-out).
+                const entryReveal = await (async (): Promise<boolean> => {
+                  for (let i = 0; i < 10; i++) {
+                    await sleep(100);
+                    const s = await g.pillEval(`(function(){
+                        var p = document.getElementById('pillB');
+                        if (!p) return JSON.stringify({ v:'none', w:-1, c:false });
+                        var cs = getComputedStyle(p);
+                        return JSON.stringify({ v: cs.visibility, w: window.innerWidth,
+                          c: p.classList.contains('bloomed') }); })()`)
+                      .then((x) => JSON.parse(x as string) as { v: string; w: number; c: boolean });
+                    if (s.v === 'visible' && s.c && s.w === B_ROOM_W) return true;
+                  }
+                  return false;
+                })();
+                const bloomOk = await waitBloomPainted();
+                const bloomFlag = (await pillState()).bloomed;
+                // C2g-hotfix-3 §5 B-side asserts, read with the bloom settled: inner knob must be
+                // ≈54 × 24 (measured 0×0 before the shared .mode-pill sizing), words 10.5px.
+                // C2l FIX 3 — the button padding pin followed the ordered CSS change: the demo's
+                // content-sizing `14px 7.5px` became `7.5px 0` + flex halves (word centering is
+                // now proven geometrically by f_c2l_pillWordsCentered, not by side padding).
+                await sleep(400);
+                const bStyle = await g.pillEval(`(function(){
+                    var ks = getComputedStyle(document.querySelector('#pillB .inner .knob'));
+                    var bs = getComputedStyle(document.querySelector('#pillB .inner button'));
+                    return JSON.stringify({ kw: parseFloat(ks.width), kh: parseFloat(ks.height),
+                      fs: bs.fontSize, pad: bs.paddingLeft + ' ' + bs.paddingTop }); })()`)
+                  .then((s) => JSON.parse(s as string) as { kw: number; kh: number; fs: string; pad: string });
+                const bStyled = Math.abs(bStyle.kw - 54) <= 1 && Math.abs(bStyle.kh - 24) <= 1
+                  && bStyle.fs === '10.5px' && bStyle.pad === '0px 7.5px';
+                // HOTFIX-4 painted-pill truth, PAC-5 — the bloomed pill DEAD CENTERED in the
+                // permanent room: rect ≈ [10, 8, 112, 28] (window center±56), the SAME height
+                // band as the rest circle (the 8 px down-settle is deleted — the bloom grows
+                // symmetrically around its own center, ending exactly on the window midline).
+                const paint = await g.pillEval(`(function(){
+                    var p = document.getElementById('pillB').getBoundingClientRect();
+                    return JSON.stringify([+p.left.toFixed(1), +p.top.toFixed(1),
+                      +p.width.toFixed(1), +p.height.toFixed(1)]); })()`)
+                  .then((s) => JSON.parse(s as string) as [number, number, number, number]);
+                const paintCentered = Math.abs(paint[0] - B_BLOOM_LEFT) <= 1
+                  && Math.abs(paint[1] - PILL_BLOOM_PAD_Y) <= 1
+                  && Math.abs(paint[2] - PILL_W) <= 0.5 && Math.abs(paint[3] - PILL_H) <= 0.5;
+                for (const ev of ['mouseleave', 'mouseenter', 'mouseleave', 'mouseenter'] as const) {
+                  await g.pillDrive(ev);
+                  await sleep(120); // storm — faster than the .55s transition on purpose
+                }
+                const stormOk = await waitBloomPainted() && (await pillState()).bloomed;
+                await g.pillDrive('mouseleave');
+                // PAC-5 — the COLLAPSE HOLD is gone (no room machinery exists); what must hold
+                // at ~+250 ms is the PERMANENT room itself: exactly the 132 × 44 stage at
+                // B_ROOM_Y through the collapse path (proves collapse does NO bounds work).
+                await sleep(250);
+                const pbHold = (await g.pillProbe()).bounds;
+                const cwHold = win.getContentBounds().width;
+                const holdKept = bStageOk(pbHold, cwHold);
+                // Collapse page truth: the painted circle back at [52,8,28,28], class gone.
+                const collapseOk = await waitRestPainted() && !(await pillState()).bloomed;
+
+                // f_c2g_colors — COLOR RULE in BOTH styles × BOTH modes: word under the knob is
+                // ALWAYS ink #1a1a1a; the other ALWAYS rgba(255,255,255,.55). Knob side rides the
+                // REAL channel (setPillMode — what actual mode flips use).
+                const INK = 'rgb(26, 26, 26)';
+                const FAINT = 'rgba(255, 255, 255, 0.55)';
+                const readColors = async (sel: string): Promise<{ act: string; inact: string }> =>
+                  g.pillEval(`(function(){ var bs = document.querySelector('${sel}').querySelectorAll('button');
+                      return JSON.stringify({ act: getComputedStyle(bs[0]).color, inact: getComputedStyle(bs[1]).color }); })()`)
+                    .then((s) => JSON.parse(s as string) as { act: string; inact: string });
+                const pairOk = (c: { act: string; inact: string }, mode: 'cloud' | 'local'): boolean =>
+                  mode === 'cloud' ? c.act === INK && c.inact === FAINT : c.inact === INK && c.act === FAINT;
+                const colorsOk: Record<string, boolean> = {};
+                for (const mode of ['cloud', 'local'] as const) {
+                  g.setPillMode(mode);
+                  await sleep(800); // knob transition + color .3s ease settled
+                  colorsOk[`a${mode}`] = pairOk(await readColors('#pillA'), mode);
+                  colorsOk[`b${mode}`] = pairOk(await readColors('#pillB .inner'), mode);
+                }
+
+                console.log('[c2g]', JSON.stringify({
+                  f_c2g_geometry: bootedA && geoLegs.every((l) => l.ok),
+                  f_c2g_stylesToggle: bootedA && stB.style === 'B' && fileAfterB && probeStyleB
+                    && bStageOk(restB.bounds, win.getContentBounds().width) && survivedB
+                    && stA.style === 'A' && fileAfterA && survivedA,
+                  f_c2g_bloomBounds: restOk && restFlush && entryReveal && bloomOk && bloomFlag
+                    && paintCentered && holdKept && stormOk && collapseOk && bStyled,
+                  f_c2g_colors: colorsOk.acloud && colorsOk.alocal && colorsOk.bcloud && colorsOk.blocal,
+                  raw: { geoLegs, boot: { bootedA }, toggle: { stB, fileAfterB, probeStyleB, survivedB, stA, fileAfterA, survivedA },
+                    bloom: { restOk, restW: restB.bounds.width, restPage, restFlush, entryReveal, bloomOk, bloomFlag, paint, paintCentered, holdKept, stormOk, collapseOk, bStyle }, colorsOk },
+                }));
+                await g.pillDrive('contextmenu'); // bloom legs left us in B — restore A for c2f legs
+                await sleep(300);
+              }
+
+              // (2b2) f_c2g_realClickFlips — THE PRIME DIRECTIVE robot (C2g-hotfix-1 FIX 4):
+              // REAL element.click() on the pill layer's actual elements → true listener → true
+              // `pill:flip` ipc → true relay → guarded switchMode → applyMode. NO
+              // `pill:flipRequested` shortcuts anywhere. Asserts MAIN-side appMode flipped AND
+              // the layer's rendered side (knob/dot truth via __c2gPill.mode) matches.
+              {
+                const g = cloudCtl;
+                const flipReceiptsBefore = pillFlipRelayCount;
+                const waitMode = async (want: string): Promise<boolean> => {
+                  for (let i = 0; i < 12; i++) { // ≤6s: ipc → relay → guarded switch → echo
+                    if (appMode === want) return true;
+                    await sleep(500);
+                  }
+                  return appMode === want;
+                };
+                const layerTruth = async (): Promise<{ style: string; bloomed: boolean; mode: string }> =>
+                  g.pillEval('JSON.stringify(window.__c2gPill || null)').then((s) => JSON.parse(s as string) as { style: string; bloomed: boolean; mode: string } | null)
+                    .then((p) => p ?? { style: 'missing', bloomed: false, mode: 'missing' });
+                // C2g-hotfix-3 §4 — MANDATORY hit-test gate. Before EVERY synthetic click, prove a
+                // REAL pointer at the target's center would land on it (or a descendant). A blind
+                // el.click() skips hit-testing entirely — exactly how Local shipped invisible
+                // AND unclickable while this robot passed 15/15. Any mismatch fails the key.
+                const hitTest = async (sel: string): Promise<{ ok: boolean; cx: number; cy: number; hit: string }> =>
+                  g.pillEval(`(function(){ var el = document.querySelector('${sel}');
+                      if (!el) return JSON.stringify({ ok:false, cx:-1, cy:-1, hit:'MISSING-TARGET' });
+                      var r = el.getBoundingClientRect();
+                      var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+                      var h = document.elementFromPoint(cx, cy);
+                      return JSON.stringify({ ok: !!h && (h === el || el.contains(h)),
+                        cx:+cx.toFixed(1), cy:+cy.toFixed(1),
+                        hit: h ? (h.id || String(h.className).slice(0,32) || h.tagName) : 'OUTSIDE-VIEWPORT' }); })()`)
+                    .then((s) => JSON.parse(s as string) as { ok: boolean; cx: number; cy: number; hit: string });
+                const hitLog: Array<{ sel: string; cx: number; cy: number; hit: string; ok: boolean }> = [];
+                const realClick = async (sel: string): Promise<boolean> => {
+                  const ht = await hitTest(sel);
+                  hitLog.push({ sel, cx: ht.cx, cy: ht.cy, hit: ht.hit, ok: ht.ok });
+                  if (!ht.ok) return false; // gated — never fire a click a human could not make
+                  return g.pillEval(`(function(){ var el = document.querySelector('${sel}'); if (!el) return false; el.click(); return true; })()`) as Promise<boolean>;
+                };
+                const drive = (ev: 'mouseenter' | 'mouseleave' | 'contextmenu'): Promise<void> => g.pillDrive(ev);
+
+                // Leg 1 — Style A word click flips. Battery left us in Cloud + Style A.
+                let startA = (await layerTruth()).style === 'A';
+                if (!startA) {
+                  await drive('contextmenu');
+                  await sleep(300);
+                  startA = (await layerTruth()).style === 'A';
+                }
+                // §4's own coordinates, captured FIRST (Style A is up): GREEN must show
+                // elementFromPoint(80,14) = btn-local-a and Local's center hitting itself inside
+                // the viewport. RED (toggler reverted to block): point lands on the bare #pillA
+                // trough and Local's wrapped center falls OUTSIDE-VIEWPORT.
+                const redProof = await g.pillEval(`(function(){
+                    function tg(el){ if(!el) return 'OUTSIDE-VIEWPORT'; return el.id || String(el.className).slice(0,40) || el.tagName; }
+                    var la = document.getElementById('btn-local-a');
+                    if (!la) return JSON.stringify({ point80_14:'MISSING', center:[-1,-1], centerHits:'MISSING' });
+                    var r = la.getBoundingClientRect();
+                    return JSON.stringify({ point80_14: tg(document.elementFromPoint(80, 14)),
+                      center:[+(r.left+r.width/2).toFixed(1), +(r.top+r.height/2).toFixed(1)],
+                      centerHits: tg(document.elementFromPoint(r.left+r.width/2, r.top+r.height/2)) }); })()`)
+                  .then((s) => JSON.parse(s as string) as { point80_14: string; center: [number, number]; centerHits: string });
+                const greenProofOk = redProof.point80_14 === 'btn-local-a' && redProof.centerHits === 'btn-local-a'
+                  && redProof.center[1] >= 0 && redProof.center[1] < 28;
+                await realClick('#btn-local-a'); // Leg 1 — arms main's Style A flip room AT THE RELAY
+                // f_c2g_knobRoom (C2g-hotfix-6 FIX 3, PAC-5) — Style A PERMANENT STAGE truth on
+                // the REAL path. The click arms nothing anymore: the native room IS the constant
+                // 140 × 28 stage (center−70..+70) before, during, and after the flip — so it
+                // must read exactly that within ~250 ms of the click (and never change), and the
+                // PAINTED #pillA must sit at [14, 0, 112, 28] ±1 (window center−56..+56,
+                // pixel-identical rest position) with BOTH end pads free for the overshoot.
+                const knobT0 = Date.now();
+                let knobRoomWideAt = -1;
+                for (let i = 0; i < 12; i++) {
+                  await sleep(50);
+                  const pb = (await g.pillProbe()).bounds;
+                  const cw = win.getContentBounds().width;
+                  if (Math.abs(pb.x - Math.round((cw - (PILL_W + PILL_A_ROOM_PAD_X * 2)) / 2)) <= 1
+                    && pb.y === PILL_TOP && pb.width === PILL_W + PILL_A_ROOM_PAD_X * 2
+                    && pb.height === PILL_H) {
+                    knobRoomWideAt = Date.now() - knobT0;
+                    break;
+                  }
+                }
+                const paintA = await g.pillEval(`(function(){ var r = document.getElementById('pillA').getBoundingClientRect();
+                    return JSON.stringify([+r.left.toFixed(1), +r.top.toFixed(1),
+                      +r.width.toFixed(1), +r.height.toFixed(1)]); })()`)
+                  .then((s) => JSON.parse(s as string) as [number, number, number, number]);
+                const paintStable = Math.abs(paintA[0] - PILL_A_ROOM_PAD_X) <= 1 && Math.abs(paintA[1]) <= 1
+                  && Math.abs(paintA[2] - PILL_W) <= 1 && Math.abs(paintA[3] - PILL_H) <= 1;
+                // PAC-5 — the old "settles back to 112 × 28" snap is GONE with the hold timers.
+                // "Settled" now means the room HOLDS the exact permanent stage across the whole
+                // post-flip window (every sample, no drift).
+                let knobRoomSettled = true;
+                for (let i = 0; i < 6; i++) { // ~1.5 s ≫ the knob's 0.6 s contract
+                  await sleep(250);
+                  const pb = (await g.pillProbe()).bounds;
+                  const cw = win.getContentBounds().width;
+                  if (!(Math.abs(pb.x - Math.round((cw - (PILL_W + PILL_A_ROOM_PAD_X * 2)) / 2)) <= 1
+                    && pb.y === PILL_TOP && pb.width === PILL_W + PILL_A_ROOM_PAD_X * 2
+                    && pb.height === PILL_H)) {
+                    knobRoomSettled = false;
+                    break;
+                  }
+                }
+                const aWordFlip = await waitMode('local') && (await layerTruth()).mode === 'local';
+
+                // Leg 2 — Style B AT-REST circle click flips (FIX 1: the whole circle is the button).
+                await drive('contextmenu'); // → B
+                await sleep(400);
+                await realClick('#pillB'); // at rest, mode 'local' → flips to the OTHER side
+                const circleFlip = await waitMode('cloud') && (await layerTruth()).mode === 'cloud';
+
+                // Leg 3 — Style B BLOOMED word click flips, clicked MID-TRANSITION (edge case:
+                // honored, no double-flip). Hover then click within the .55s bloom window.
+                await drive('mouseenter');
+                await sleep(150);
+                await realClick('#btn-local-b');
+                const bloomedWordFlip = await waitMode('local') && (await layerTruth()).mode === 'local';
+
+                // Leg 4 — same-mode click is a SAFE no-op (FIX 2: always-send; main dedupes).
+                await realClick('#btn-local-b');
+                await sleep(1200);
+                const sameModeNoop = appMode === 'local' && (await layerTruth()).mode === 'local';
+                await drive('mouseleave');
+                await sleep(800);
+
+                // Leg 5 — rapid ×10 storm: EVERY click honored or safely deduped; final mode =
+                // last click's word; no stuck knob. Back to Style A first (real right-click).
+                await drive('contextmenu'); // → A
+                await sleep(400);
+                for (let i = 0; i < 10; i++) {
+                  await realClick(i % 2 === 0 ? '#btn-cloud-a' : '#btn-local-a');
+                  await sleep(350);
+                }
+                const stormFinal = 'local'; // i=0..9 → last click (i=9) is Local
+                const stormOk = await waitMode(stormFinal) && (await layerTruth()).mode === stormFinal;
+                // End where the c2f legs need us: one more REAL click → Cloud.
+                await realClick('#btn-cloud-a');
+                const backToCloud = await waitMode('cloud');
+
+                // §5 suspects — bridge presence, layer console cleanliness, relay receipts.
+                const bridgeType = await g.pillEval('typeof window.dropsyncPill');
+                const consoleTail = g.pillConsoleTail();
+                const consoleErrors = consoleTail.filter((l) => l.includes('ERROR') || l.includes('Uncaught') || l.includes('bridge missing'));
+                const styleStillToggles = (await (async () => { await drive('contextmenu'); await sleep(300); const b = (await layerTruth()).style === 'B'; await drive('contextmenu'); await sleep(300); return b && (await layerTruth()).style === 'A'; })());
+
+                const everyHitOk = hitLog.length > 0 && hitLog.every((h) => h.ok);
+                const knobRoomOk = knobRoomWideAt >= 0 && knobRoomWideAt <= 500 && paintStable && knobRoomSettled;
+                console.log('[c2g2]', JSON.stringify({
+                  f_c2g_realClickFlips: startA && greenProofOk && everyHitOk && knobRoomOk && aWordFlip
+                    && circleFlip && bloomedWordFlip && sameModeNoop && stormOk && backToCloud
+                    && styleStillToggles && bridgeType === 'object' && consoleErrors.length === 0
+                    && pillFlipRelayCount - flipReceiptsBefore >= 15, // 15 real clicks, 15 receipts
+                  matrix: { aWordFlip, circleFlip, bloomedWordFlip, sameModeNoop, stormOk, backToCloud, styleStillToggles, greenProofOk, everyHitOk, knobRoomOk },
+                  redProof,
+                  suspects: { bridgeType, consoleErrors, flipReceipts: pillFlipRelayCount - flipReceiptsBefore },
+                  raw: { hitLog, knobRoom: { knobRoomWideAt, paintA, paintStable, knobRoomSettled } },
+                }));
+              }
+              // (2b3) C2l FIX 3 — f_c2l_pillWordsCentered: each word must center DEAD under its
+              // knob half. The old content-sized buttons (padding 7.5px 14px) overflowed the
+              // 108px content box and drifted the word pair ~4px right ("Local" text center
+              // ≈ 87.6 vs knob-half center 83; 20px whitespace left vs 8px right). Reuses the
+              // robot's seams ONLY (pillEval / pillDrive / hit-test-gated click / appMode poll)
+              // — no new channels. All geometry derives from LIVE rects (trough content box,
+              // buttons, text ranges, knob); thresholds are the order's: boundary ≤1px off the
+              // midline, widths ≤0.5px apart, word-vs-button and word-vs-knob-half ≤1.5px.
+              {
+                const g = cloudCtl;
+                const waitMode = async (want: string): Promise<boolean> => {
+                  for (let i = 0; i < 12; i++) { if (appMode === want) return true; await sleep(500); }
+                  return appMode === want;
+                };
+                const drive = (ev: 'mouseenter' | 'mouseleave' | 'contextmenu'): Promise<void> => g.pillDrive(ev);
+                const realClick = async (sel: string): Promise<boolean> => {
+                  // same MANDATORY hit-test gate as the (2b2) robot — never a blind click
+                  const ht = await g.pillEval(`(function(){ var el = document.querySelector('${sel}');
+                      if (!el) return JSON.stringify({ ok:false });
+                      var r = el.getBoundingClientRect();
+                      var h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+                      return JSON.stringify({ ok: !!h && (h === el || el.contains(h)) }); })()`)
+                    .then((s) => JSON.parse(s as string) as { ok: boolean });
+                  if (!ht.ok) return false;
+                  return g.pillEval(`(function(){ var el = document.querySelector('${sel}'); if (!el) return false; el.click(); return true; })()`) as Promise<boolean>;
+                };
+                const restRoom = async (): Promise<boolean> => {
+                  for (let i = 0; i < 22; i++) { // ≤5.5 s ≫ the 620 ms contract-coupled skirt hold
+                    const pb = (await g.pillProbe()).bounds;
+                    if (pb.width === PILL_W && pb.height === PILL_H) return true;
+                    await sleep(250);
+                  }
+                  return false;
+                };
+                const knobSettled = async (knobSel: string): Promise<void> => {
+                  let last = -1; // the .6s elastic knob may still be overshooting after a flip
+                  for (let i = 0; i < 12; i++) {
+                    const c = await g.pillEval(`(function(){ var k = document.querySelector('${knobSel}'); if (!k) return -1; var r = k.getBoundingClientRect(); return +(r.left + r.width / 2).toFixed(2); })()`).then(Number);
+                    if (last >= 0 && Math.abs(c - last) <= 0.3) return;
+                    last = c;
+                    await sleep(250);
+                  }
+                };
+                interface C2lGeom {
+                  missing?: boolean; boundary: number; mid: number; boundaryOff: number;
+                  midAtRoomCenter: number | null; widthDelta: number; cloudWordOff: number; localWordOff: number;
+                  cloudHalfOff: number; localHalfOff: number; tCloudCx: number; tLocalCx: number;
+                  cloudHalf: number; localHalf: number; knobCx: number;
+                }
+                const measure = async (style: 'A' | 'B'): Promise<C2lGeom> => JSON.parse(await g.pillEval(`(function(){
+                    function box(el){ if (!el) return null; var r = el.getBoundingClientRect();
+                      return { r:+r.right.toFixed(2), w:+r.width.toFixed(2), cx:+(r.left + r.width/2).toFixed(2) }; }
+                    function txt(el){ if (!el) return null; var t = document.createRange(); t.selectNodeContents(el);
+                      var r = t.getBoundingClientRect(); return { cx:+(r.left + r.width/2).toFixed(2) }; }
+                    var isA = ${style === 'A'};
+                    var trough = document.querySelector(isA ? '#pillA' : '#pillB .inner .pill');
+                    var bc = document.getElementById(isA ? 'btn-cloud-a' : 'btn-cloud-b');
+                    var bl = document.getElementById(isA ? 'btn-local-a' : 'btn-local-b');
+                    if (!trough || !bc || !bl) return JSON.stringify({ missing: true });
+                    var tr = trough.getBoundingClientRect();
+                    var cL = tr.left + 2, cR = tr.right - 2, mid = (cL + cR) / 2;
+                    var kC = box(bc), kL = box(bl), tC = txt(bc), tL = txt(bl);
+                    var knob = box(document.querySelector(isA ? '#pillA .knob' : '#pillB .inner .knob'));
+                    return JSON.stringify({
+                      boundary: +kC.r.toFixed(2), mid: +mid.toFixed(2),
+                      boundaryOff: +Math.abs(kC.r - mid).toFixed(2),
+                      midAtRoomCenter: isA ? +Math.abs(mid - window.innerWidth / 2).toFixed(2) : null,
+                      widthDelta: +Math.abs(kC.w - kL.w).toFixed(2),
+                      cloudWordOff: +Math.abs(tC.cx - kC.cx).toFixed(2),
+                      localWordOff: +Math.abs(tL.cx - kL.cx).toFixed(2),
+                      cloudHalfOff: +Math.abs(tC.cx - (cL + mid) / 2).toFixed(2),
+                      localHalfOff: +Math.abs(tL.cx - (mid + cR) / 2).toFixed(2),
+                      tCloudCx: tC.cx, tLocalCx: tL.cx,
+                      cloudHalf: +((cL + mid) / 2).toFixed(2), localHalf: +((mid + cR) / 2).toFixed(2),
+                      knobCx: knob ? knob.cx : -1
+                    });
+                  })()`));
+                const sideOk = (m: C2lGeom, pinMid: boolean): boolean => !m.missing
+                  && m.boundaryOff <= 1 && (!pinMid || (m.midAtRoomCenter !== null && m.midAtRoomCenter <= 1))
+                  && m.widthDelta <= 0.5
+                  && m.cloudWordOff <= 1.5 && m.localWordOff <= 1.5
+                  && m.cloudHalfOff <= 1.5 && m.localHalfOff <= 1.5;
+                const originalMode = appMode; // the (2b2) robot handed us Cloud + Style A
+                const c2lLegs: Array<{ tag: string; ok: boolean; geom: C2lGeom }> = [];
+                // Leg 1 — Style A, Local active (real click through the hit-test gate).
+                await realClick('#btn-local-a');
+                const localFlipped = await waitMode('local');
+                await restRoom(); await knobSettled('#pillA .knob');
+                const mLocal = await measure('A');
+                c2lLegs.push({ tag: 'A-local', ok: localFlipped && sideOk(mLocal, true), geom: mLocal });
+                // Leg 2 — flip to Cloud: words must stay centered regardless of knob side.
+                await realClick('#btn-cloud-a');
+                const cloudFlipped = await waitMode('cloud');
+                await restRoom(); await knobSettled('#pillA .knob');
+                const mCloud = await measure('A');
+                c2lLegs.push({ tag: 'A-cloud', ok: cloudFlipped && sideOk(mCloud, true), geom: mCloud });
+                // Leg 3 — Style B BLOOMED: the inner pill shares .mode-pill, so its words must
+                // center automatically — asserted, not assumed.
+                await drive('contextmenu'); // → B
+                await sleep(400);
+                await drive('mouseenter'); // bloom (room widens to 132 × 44; client coords live)
+                await sleep(900); // .55s elastic + .25s reveal (.12s delay)
+                await knobSettled('#pillB .inner .knob');
+                const mB = await measure('B');
+                c2lLegs.push({ tag: 'B-bloom', ok: sideOk(mB, false), geom: mB });
+                // Collapse, back to Style A + the original mode.
+                await drive('mouseleave');
+                await sleep(800);
+                await drive('contextmenu'); // → A
+                await sleep(400);
+                if (originalMode === 'local') { await realClick('#btn-local-a'); await waitMode('local'); }
+                const restoredStyleA = (await g.pillEval('JSON.stringify(window.__c2gPill || null)')
+                  .then((s) => (JSON.parse(s as string) as { style: string } | null)?.style)) === 'A';
+                const f_c2l_pillWordsCentered = c2lLegs.every((l) => l.ok) && restoredStyleA && appMode === originalMode;
+                console.log('[c2l-pill]', JSON.stringify({
+                  f_c2l_pillWordsCentered,
+                  matrix: { originalMode, restoredStyleA, legs: c2lLegs.map((l) => ({ tag: l.tag, ok: l.ok })) },
+                  raw: { legs: c2lLegs },
+                }));
+              }
+              // (3) f_c2f_boundsFull — resize to two sizes + fullscreen; the site view must equal
+              // {0,0,w,h} within ~2s AND the pill must stay glued top-center. This leg ABSORBS
+              // the owed f_c2d_boundsFollow debt at the NEW geometry (full window, no notch).
+              const origBounds = win.getBounds();
+              const ctl = cloudCtl; // narrowed alias — TS can't keep the null-check inside nested arrows
+              const boundsLegs: Array<{ tag: string; siteOk: boolean; pillOk: boolean; site: Electron.Rectangle; pill: Electron.Rectangle }> = [];
+              const assertLeg = async (tag: string, w: number, h: number, fullscreen: boolean): Promise<void> => {
+                if (fullscreen) win.setFullScreen(true);
+                else win.setSize(w, h);
+                await sleep(1600); // well within the ~1s watchdog + deferred re-apply budget
+                const b = win.getContentBounds();
+                const site = await ctl.siteProbe();
+                const pill = await ctl.pillProbe();
+                const siteOk = site.visible
+                  && site.bounds.x === 0 && site.bounds.y === 0
+                  && site.bounds.width === b.width && site.bounds.height === b.height;
+                // C2g contract, PAC-5: the pill's PERMANENT stage is 140 × 28 @y10 (the
+                // 112 × 28 painted pill centered inside it), top-CENTER, ±1px on the centered x.
+                const pillOk = Math.abs(pill.bounds.x - Math.round((b.width - (PILL_W + PILL_A_ROOM_PAD_X * 2)) / 2)) <= 1
+                  && pill.bounds.y === PILL_TOP
+                  && pill.bounds.width === PILL_W + PILL_A_ROOM_PAD_X * 2 && pill.bounds.height === PILL_H;
+                boundsLegs.push({ tag, siteOk, pillOk, site: site.bounds, pill: pill.bounds });
+              };
+              await assertLeg('size-1600x1000', 1600, 1000, false);
+              await assertLeg('size-1150x760', 1150, 760, false);
+              await assertLeg('fullscreen', 0, 0, true);
+              win.setFullScreen(false);
+              win.setSize(origBounds.width, origBounds.height);
+              await sleep(600);
+              console.log('[c2f-bounds]', JSON.stringify({
+                f_c2f_boundsFull: boundsLegs.every((l) => l.siteOk && l.pillOk),
+                f_c2d_boundsFollow_absorbed: boundsLegs.every((l) => l.siteOk && l.pillOk),
+                legs: boundsLegs,
+              }));
+
+              // (4) f_c2f_pillPersistent — rapid flip storm (×10) with NO settling: exactly one
+              // site view + one pill view reused, pill z-order ALWAYS on top (last child),
+              // corner bounds intact. The storm drives MAIN-side applyCloudMode directly (view
+              // reuse under churn); the renderer is re-synced through mode:set right after,
+              // because ALL real user paths flow through the renderer (the desync the storm
+              // leaves behind is a battery-only artifact and must not leak into the flip leg).
+              const modes: string[] = [];
+              for (let i = 0; i < 10; i++) {
+                modes.push(await applyCloudMode(i % 2 === 0 ? 'local' : 'cloud'));
+              }
+              const childViews = win.contentView.children.length;
+              const stormPill = await cloudCtl.pillProbe();
+              // C2m — childViews became 4: site + fader + card + pill. C3 — childViews is now
+              // 5: the STATUS layer joins (site + fader + card + status + pill), a PERMANENT
+              // fifth native view added between the card and the pill per the C3 z-law,
+              // collapsed 0×0 + hidden at rest. The intent of this assert is unchanged — the
+              // flip storm must not leak/duplicate views (a leaked site would read 6+); the
+              // +1 is the status layer's accounted-for membership (same accounting-for bump
+              // the C2j card and C2m fader additions used).
+              const expectedChildViews = 5;
+              // PAC-5 — the room-hold awareness is GONE (no holds exist): the stage is the
+              // PERMANENT A room (140 × 28 @y10) at EVERY instant, so geometry is asserted
+              // directly on the instant storm probe — no settle loop, no snap-back to wait for.
+              const settlePill = stormPill;
+              const cw2 = win.getContentBounds().width;
+              const stormSite = await cloudCtl.siteProbe();
+              console.log('[c2f-pill]', JSON.stringify({
+                f_c2f_pillPersistent: childViews === expectedChildViews && stormPill.visible && stormPill.loaded
+                  && cloudCtl.pillIsTopChild()
+                  && Math.abs(settlePill.bounds.x - Math.round((cw2 - (PILL_W + PILL_A_ROOM_PAD_X * 2)) / 2)) <= 1
+                  && settlePill.bounds.y === PILL_TOP
+                  && settlePill.bounds.width === PILL_W + PILL_A_ROOM_PAD_X * 2
+                  && settlePill.bounds.height === PILL_H
+                  && stormPill.bodyBackgroundColor === 'rgba(0, 0, 0, 0)',
+                toggles: modes.length,
+                finalMode: appMode,
+                childViews,
+                pillIsTopChild: cloudCtl.pillIsTopChild(),
+                pillRaw: stormPill,
+                siteVisible: stormSite.visible,
+              }));
+              // Re-sync renderer ⇄ main through the REAL path after the storm (the storm above
+              // is main-side by design; this relay flip restores the renderer's screen state).
+              win.webContents.send('pill:flipRequested', 'cloud');
+              await sleep(1500);
+              // (The old f_c2f_flipGuard relay leg was folded into f_c2f_flipGuardFull — its
+              // clean-path assertion is emitted from the guard matrix as f_c2f_flipGuard.)
+              // Kept [c1]/[c1b] evidence, re-run after all the churn (adapted honestly: badgeDom
+              // is GONE — the bottom strip no longer exists; the pill probe replaces it).
+              await sleep(1500);
+              const iso = await cloudCtl.probeIsolation();
+              const auth = await cloudCtl.probeAuthSeen();
+              const proof = await cloudCtl.probePersistProof();
+              console.log('[c1]', JSON.stringify({
+                f_c1_cloudReady: cloudCtl.probeState().readyMs !== null,
+                readyMs: cloudCtl.probeState().readyMs,
+                f_c1_isolationGuard: iso.dropsyncType === 'undefined'
+                  && iso.pillDropsyncType === 'undefined' && iso.pillBridgeType === 'object'
+                  // C2j — the card bridge exists ONLY on the card page (never site, never pill).
+                  && iso.pillCardBridgeType === 'undefined'
+                  && iso.cardDropsyncType === 'undefined' && iso.cardBridgeType === 'object'
+                  // C2m — the fader bridge exists ONLY on the fader page (never site/pill/card).
+                  && iso.faderDropsyncType === 'undefined' && iso.faderBridgeType === 'object'
+                  && iso.faderCardBridgeType === 'undefined'
+                  && iso.pillFaderBridgeType === 'undefined' && iso.cardFaderBridgeType === 'undefined'
+                  // C3 — the status bridge exists ONLY on the status page (never site/pill/card/fader).
+                  && iso.statusDropsyncType === 'undefined' && iso.statusBridgeType === 'object'
+                  && iso.statusCardBridgeType === 'undefined' && iso.statusFaderBridgeType === 'undefined'
+                  && iso.pillStatusBridgeType === 'undefined' && iso.cardStatusBridgeType === 'undefined'
+                  && iso.faderStatusBridgeType === 'undefined',
+                isolationRaw: iso,
+                f_c1_authSeen: auth.firebaseAuthKeys > 0 || auth.accountChip,
+                authSeenRaw: auth,
+                persistProof: proof,
+                f_c1_switchStorm: { toggles: modes.length, finalMode: appMode, childViews },
+              }));
+              // C1b FIX D — synthetic auth-handler popup through OUR allowlist, end-to-end.
+              const c1b = await cloudCtl!.probeSyntheticAuthPopup();
+              console.log('[c1b]', JSON.stringify(c1b));
+
+              // (5) C2h FIX 5 — f_c2h_switchKeepsVaultOpen: switching flips the VIEW only, so a
+              // full human-style round trip must keep the vault OPEN and end on the LIVE list.
+              // Runs LAST among this stage's cloud-related keys (FIX 6 below runs dead-last).
+              {
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                if ((await readModeSafe()) !== 'local') { // desync insurance: force both sides local
+                  await applyCloudMode('local');
+                  win.webContents.send('pill:flipRequested', 'local');
+                  await sleep(1200);
+                }
+                // Preconditions: the battery's own fixtures (GuardFixture etc.) live in
+                // /tmp/ds-c2f-vault and are unlocked since (1c)'s restore — main-side guard only,
+                // NEVER an unconditional unlock (on an open vault that would lock-then-reopen).
+                if (manager.status().state !== 'unlocked') {
+                  await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
+                }
+                const preStatus = manager.status();
+                const localCards = await countDropCards(); // reuses the FIX-4 counter
+                win.webContents.send('pill:flipRequested', 'cloud'); // real relay path out…
+                await sleep(1500);
+                const cloudMode = appMode;
+                const cloudStatusMain = manager.status().state;
+                const cloudStatusRenderer = String(await win.webContents.executeJavaScript(
+                  `(window.dropsync ? window.dropsync.vault.status().then((s) => s.state) : Promise.resolve('noBridge'))`
+                ));
+                win.webContents.send('pill:flipRequested', 'local'); // …and home again
+                await sleep(1500);
+                const backMode = appMode;
+                const backStatusMain = manager.status().state;
+                const backPasswordScreen = await win.webContents.executeJavaScript(
+                  `!!document.querySelector('input[placeholder="Vault password"]')`
+                ) as boolean;
+                const backCards = await countDropCards();
+                const f_c2h_switchKeepsVaultOpen = preStatus.state === 'unlocked' && localCards > 0
+                  && cloudMode === 'cloud' && cloudStatusMain === 'unlocked' && cloudStatusRenderer === 'unlocked'
+                  && backMode === 'local' && backStatusMain === 'unlocked'
+                  && backPasswordScreen === false && backCards > 0;
+                console.log('[c2h-switch]', JSON.stringify({
+                  f_c2h_switchKeepsVaultOpen,
+                  matrix: { unlockedBefore: preStatus.state === 'unlocked', localCards: localCards > 0, cloudTripUnlocked: cloudStatusMain === 'unlocked' && cloudStatusRenderer === 'unlocked', homeUnlocked: backStatusMain === 'unlocked', noPasswordScreen: backPasswordScreen === false, homeListRendered: backCards > 0 },
+                  raw: { preStatus, localCards, cloudMode, cloudStatusMain, cloudStatusRenderer, backMode, backStatusMain, backPasswordScreen, backCards },
+                }));
+              }
+
+              // (5b) C2i FIX D — f_c2i_warmHomecomingNoRefetch — placed between the non-destructive
+              // C2h switch-trip above and the destructive idle-lock stage below. ALL trips run
+              // through the REAL relay path (pill:flipRequested ≡ pill click). Warm trip proves
+              // REMOUNT-lessness (dataset sentinel survives React reconciliation only while the
+              // underlying DOM node survives) and ZERO refetch (the drop-list call counter the
+              // S2 close-Settings zero-refetch leg consumes — index.ts dev:testOnly actions
+              // 'resetListCallCount'/'listCallStats', rendered-counter increment at
+              // handle('drop:list')'s dropListCallCount += 1). Lock-behind trip proves the
+              // whisper-check catches the idle-lock AT ARRIVAL with zero list traffic.
+              {
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                if ((await readModeSafe()) !== 'local') {
+                  await applyCloudMode('local');
+                  await sleep(1200);
+                }
+                if (manager.status().state !== 'unlocked') { // defensive only (neighbors leave it open)
+                  await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
+                  await sleep(400);
+                }
+                const cardsWarmBefore = await countDropCards();
+                const tokenSent = `c2i-warm-${Date.now()}`;
+                // Stamp the token AND capture node-object references: a React remount produces
+                // NEW DOM nodes by definition, so same-reference-after-the-trip is the strongest
+                // possible no-remount evidence (belt-and-braces beside the ordered token check).
+                const stampRes = JSON.parse(await win.webContents.executeJavaScript(
+                  `(function(){ var sh = document.querySelector('[data-shell]');
+                     var c = document.querySelector('div.select-none.cursor-pointer.group.overflow-hidden');
+                     if (!c || !sh) return JSON.stringify({ ok: false });
+                     c.dataset.c2iWarm = ${JSON.stringify(tokenSent)};
+                     window.__c2iCardRef = c; window.__c2iShellRef = sh;
+                     return JSON.stringify({ ok: true }); })()`
+                )) as { ok: boolean };
+                await win.webContents.executeJavaScript(
+                  `window.dropsync.dev.testOnly('resetListCallCount', '')`
+                );
+                let sawCloudLeg = false;
+                win.webContents.send('pill:flipRequested', 'cloud'); // out…
+                await sleep(1500);
+                sawCloudLeg = appMode === 'cloud';
+                // C2i-hotfix-1 FIX 2 — REGRESSION-KILLER sample taken WHILE Cloud is up: the
+                // inner container must ALREADY be fixed/visible/cream here (under the buggy C2i
+                // shape this reported static/hidden/rgba(0,0,0,0), and the reveal gap painted
+                // the white flash on the way home). data-shell still flips attr-level only.
+                const cloudSample = JSON.parse(await win.webContents.executeJavaScript(
+                  `(function(){ var el = document.querySelector('[data-shell] > div');
+                     var cs = getComputedStyle(el);
+                     return JSON.stringify({ pos: cs.position, vis: cs.visibility,
+                       bg: cs.backgroundColor, shell: document.querySelector('[data-shell]').getAttribute('data-shell') }); })()`
+                )) as { pos: string; vis: string; bg: string; shell: string };
+                const styleInvariantCloud = cloudSample.pos === 'fixed' && cloudSample.vis === 'visible'
+                  && cloudSample.bg === 'rgb(250, 247, 242)';
+                win.webContents.send('pill:flipRequested', 'local'); // …and home (WARM)
+                await sleep(1500);
+                const sentinelState = JSON.parse(await win.webContents.executeJavaScript(
+                  `(function(){ var c = document.querySelector('div.select-none.cursor-pointer.group.overflow-hidden');
+                     var sh = document.querySelector('[data-shell]');
+                     var el = document.querySelector('[data-shell] > div'); var cs = getComputedStyle(el);
+                     return JSON.stringify({ tokenNow: c ? (c.getAttribute('data-c2iWarm') || '') : '',
+                       sameCardRef: !!window.__c2iCardRef && c === window.__c2iCardRef,
+                       sameShellRef: !!window.__c2iShellRef && sh === window.__c2iShellRef,
+                       shell: sh ? sh.getAttribute('data-shell') : null,
+                       anyVisiblePwd: !!document.querySelector('input[placeholder="Vault password"]'),
+                       localStyle: { pos: cs.position, vis: cs.visibility, bg: cs.backgroundColor } }); })()`
+                )) as { tokenNow: string; sameCardRef: boolean; sameShellRef: boolean; shell: string | null; anyVisiblePwd: boolean; localStyle: { pos: string; vis: string; bg: string } };
+                const styleInvariantLocal = sentinelState.localStyle.pos === 'fixed'
+                  && sentinelState.localStyle.vis === 'visible'
+                  && sentinelState.localStyle.bg === 'rgb(250, 247, 242)';
+                const shellFlippedBothWays = cloudSample.shell === 'cloud' && sentinelState.shell === 'local';
+                const cardsWarmAfter = await countDropCards();
+                const listCallsWarm = Number((await win.webContents.executeJavaScript(
+                  `window.dropsync.dev.testOnly('listCallStats', '').then((r) => r.count)`
+                )) as number);
+                const warmTripOk = stampRes.ok && (sentinelState.tokenNow === tokenSent || sentinelState.sameCardRef)
+                  && sentinelState.sameCardRef && sentinelState.sameShellRef
+                  && cardsWarmAfter === cardsWarmBefore && cardsWarmAfter > 0
+                  && listCallsWarm === 0 && !sentinelState.anyVisiblePwd && sawCloudLeg
+                  // C2i-hotfix-1 — the pinned invariant: permanent+visible container in BOTH worlds.
+                  && styleInvariantCloud && styleInvariantLocal && shellFlippedBothWays;
+
+                // LOCK-BEHIND leg: seal MAIN-SIDE while home (renderer still believes unlocked),
+                // then a Cloud round trip must land INSTANTLY on the password screen with ZERO
+                // drop-list traffic — the whisper reconciling, exactly its reason to exist.
+                await manager.lock();
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(1200);
+                await win.webContents.executeJavaScript(
+                  `window.dropsync.dev.testOnly('resetListCallCount', '')` // isolate the RETURN leg's delta
+                );
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                const pwdDetectedOnArrival = await win.webContents.executeJavaScript(
+                  `!!document.querySelector('input[placeholder="Vault password"]')`
+                ) as boolean;
+                const listCallsReturn = Number((await win.webContents.executeJavaScript(
+                  `window.dropsync.dev.testOnly('listCallStats', '').then((r) => r.count)`
+                )) as number);
+                const lockBehindOk = pwdDetectedOnArrival && listCallsReturn === 0;
+
+                const f_c2i_warmHomecomingNoRefetch = warmTripOk && lockBehindOk;
+                console.log('[c2i]', JSON.stringify({
+                  f_c2i_warmHomecomingNoRefetch,
+                  matrix: { stamped: stampRes.ok, tokenSurvived: sentinelState.tokenNow === tokenSent, sameCardRef: sentinelState.sameCardRef, sameShellRef: sentinelState.sameShellRef, cardsUnchanged: cardsWarmAfter === cardsWarmBefore && cardsWarmAfter > 0, zeroRefetchTrip: listCallsWarm === 0, noPasswordAfterTrip: !sentinelState.anyVisiblePwd, sawCloudLeg, instantPasswordOnLockBehind: pwdDetectedOnArrival, zeroRefetchReturn: listCallsReturn === 0, styleInvariantCloud, styleInvariantLocal, shellFlippedBothWays },
+                  raw: { sentinelBefore: stampRes.ok ? tokenSent : null, sentinelAfter: sentinelState, cloudStyleSample: cloudSample, cardsWarmBefore, cardsWarmAfter, listCallsWarm, listCallsReturn, pwdDetectedOnArrival },
+                }));
+                // CLEANUP: the lock-behind leg genuinely sealed the vault — restore the same sane
+                // unlocked Local stage later work expects (same dance as the C2h cleanup below).
+                try { await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch { /* already */ }
+                win.webContents.reload();
+                await sleep(4000);
+              }
+
+              // (5c) C2j — f_c2j_cardOverBothWorlds — placed per order: immediately AFTER the C2i
+              // key (its lock-behind leg + cleanup reload re-establish the sane unlocked Local
+              // stage — build on that clean point) and BEFORE the dead-last C2h idle stage. The
+              // card is a THIRD NATIVE VIEW: no C2i renderer/DOM assertions are touched. All
+              // synthetic fires go through the EXACT engine notifier seam (`engineNotifier`,
+              // assigned at the manager.setNotifier site — no second engine invented).
+              {
+                if (manager.status().state !== 'unlocked') { // defensive only (cleanup leaves it open)
+                  await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
+                  await sleep(400);
+                }
+                await cloudCtl!.cardTestReset(); // hermetic start: no stale queues/timers
+                const delivered0 = (await cloudCtl!.cardProbe()).delivered;
+                const winFocused = win.isFocused(); // diagnostic: LEG 3 only fires when UNfocused
+
+                // LEG A — single fire while LOCAL is shown.
+                engineNotifier?.('C2j reminder', 'warm local fire');
+                await sleep(600);
+                const probeLocal = await cloudCtl!.cardProbe();
+                // LEG B — the SAME card must stay glued over the CLOUD world (watchdog ≤1 s
+                // re-asserts bounds after the flip's resize/move churn; sleep 1500 covers it).
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(1500);
+                const probeCloud = await cloudCtl!.cardProbe();
+                // LEG C — home again; then auto-dismiss must collapse the footprint to 0×0.
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                const probeHome = await cloudCtl!.cardProbe();
+                await sleep(7500); // AUTO_DISMISS 5500 + hide-hold 200 + watchdog 1000 + slop
+                const probeDismissed = await cloudCtl!.cardProbe();
+
+                // LEG D — rapid fire ≤200 ms apart: serial display (ONE visible at a time), all
+                // three delivered across ~3×(AUTO_DISMISS)+gaps, no stuck layer afterwards.
+                await cloudCtl!.cardTestReset(); // isolate the storm from any stray queue state
+                const deliveredBeforeStorm = (await cloudCtl!.cardProbe()).delivered;
+                engineNotifier?.('C2j storm 1', 'rapid 1');
+                await sleep(120);
+                engineNotifier?.('C2j storm 2', 'rapid 2');
+                await sleep(120);
+                engineNotifier?.('C2j storm 3', 'rapid 3');
+                await sleep(600);
+                const stormMid = await cloudCtl!.cardProbe(); // 1 visible, 2 still queued
+                await sleep(18500); // 2 remaining × (5500 dismiss + 200 hold + 400 gap) + slop
+                const stormEnd = await cloudCtl!.cardProbe();
+
+                // LEG E (logic-level ONLY, per order — no UI assertions) — missed-queue data
+                // structure: cap 20, overflow drops the OLDEST (2 dropped), drain order
+                // oldest-first (the first display-queue title must be item 3). Reset purges.
+                await cloudCtl!.cardTestReset();
+                for (let i = 1; i <= 22; i++) cloudCtl!.enqueueMissed(`C2j missed ${i}`, `unit ${i}`);
+                const missedCapped = await cloudCtl!.cardProbe();
+                cloudCtl!.drainMissed();
+                const drainedProbe = await cloudCtl!.cardProbe();
+                await cloudCtl!.cardTestReset();
+                const purged = await cloudCtl!.cardProbe();
+
+                // LEG F — C2j-hotfix-1 — f_c2j_rearmFiresAgain: a RE-ARMED reminder must erase
+                // the stale fired stamp (dropOps.ts re-arm branch) so the engine announces it
+                // AGAIN. Temp drop via the REAL renderer bridge (seed idiom index.ts:529/:976);
+                // engine ticks every 30 s ⇒ a due-at-+1.5 s reminder lands on the next tick
+                // within ≤31.5 s, so 18 × 2 s polls cover each leg. RED-PROOF: comment the
+                // journalPatch.reminderFiredAt = null line in dropOps.ts ⇒ leg 2 stays flat.
+                await cloudCtl!.cardTestReset();
+                const rearm0 = (await cloudCtl!.cardProbe()).delivered;
+                const tempDrop = await win.webContents.executeJavaScript(
+                  `window.dropsync.drop.createText({ spaceId: 'personal', name: 'C2j Rearm', content: 'rearm proof', categories: [], expirationOption: '24h', locked: false, reminderAt: new Date(Date.now() + 1500).toISOString() })`
+                ) as { id: string } | null;
+                let fire1 = false;
+                for (let i = 0; i < 18 && !fire1; i++) {
+                  await sleep(2000);
+                  fire1 = (await cloudCtl!.cardProbe()).delivered > rearm0;
+                }
+                const afterFirst = (await cloudCtl!.cardProbe()).delivered;
+                await win.webContents.executeJavaScript(
+                  `window.dropsync.drop.updateMeta(${JSON.stringify(tempDrop?.id)}, { reminderAt: new Date(Date.now() + 1500).toISOString() })`
+                );
+                let fire2 = false;
+                for (let i = 0; i < 18 && !fire2; i++) {
+                  await sleep(2000);
+                  fire2 = (await cloudCtl!.cardProbe()).delivered > afterFirst;
+                }
+                const afterSecond = (await cloudCtl!.cardProbe()).delivered;
+                // Cleanup: temp drop gone + layer inert so later stages stay sane.
+                if (tempDrop?.id) {
+                  await win.webContents.executeJavaScript(
+                    `window.dropsync.drop.deleteDrop(${JSON.stringify(tempDrop.id)})`
+                  ).catch(() => {});
+                }
+                await cloudCtl!.cardTestReset();
+                const rearmPurged = await cloudCtl!.cardProbe();
+                const f_c2j_rearmFiresAgain = !!tempDrop && fire1 && fire2
+                  && afterSecond - rearm0 === 2
+                  && !rearmPurged.showing && rearmPurged.queueLen === 0;
+
+                // LEG G — C2k — f_c2j_cardFollowsTheme: the card wears the app's CURRENT theme
+                // at DISPLAY time (owner pick Row B ink bar). Fired through the EXACT engine
+                // seam (engineNotifier → engineNotify → reminderShow(title, body, currentTheme())
+                // → card:show → page vars) so the whole route is proven, asserted on the probe's
+                // live pageTheme attr AND the painted computed truth (bar bg, 8px radius, 1px
+                // hairline). Hermetic between legs via cardTestReset (skips the 5.5 s dismiss).
+                type C2kProbe = Awaited<ReturnType<CloudController['cardProbe']>>;
+                await cloudCtl!.cardTestReset();
+                const prevTheme = manager.getSettings().theme;
+                await manager.setSettings({ theme: 'dark' });
+                engineNotifier?.('C2j theme dark', 'row b ink');
+                let themeDark: C2kProbe | null = null;
+                for (let i = 0; i < 20 && !themeDark; i++) {
+                  await sleep(250);
+                  const p = await cloudCtl!.cardProbe();
+                  if (p.pageTheme === 'dark' && p.painted && p.painted.barBg === 'rgb(255, 255, 255)'
+                    && p.painted.cardRadius === '8px' && p.painted.cardBorderWidth === '1px') themeDark = p;
+                }
+                await cloudCtl!.cardTestReset();
+                await manager.setSettings({ theme: 'light' });
+                engineNotifier?.('C2j theme light', 'row b ink');
+                let themeLight: C2kProbe | null = null;
+                for (let i = 0; i < 20 && !themeLight; i++) {
+                  await sleep(250);
+                  const p = await cloudCtl!.cardProbe();
+                  if (p.pageTheme === 'light' && p.painted && p.painted.barBg === 'rgb(26, 26, 26)'
+                    && p.painted.cardRadius === '8px' && p.painted.cardBorderWidth === '1px') themeLight = p;
+                }
+                await manager.setSettings({ theme: prevTheme }); // restore the battery vault's theme
+                await cloudCtl!.cardTestReset();
+                const themePurged = await cloudCtl!.cardProbe();
+                const f_c2j_cardFollowsTheme = !!themeDark && !!themeLight
+                  && themeDark.pageTheme === 'dark' && themeLight.pageTheme === 'light'
+                  && !themePurged.showing && themePurged.queueLen === 0;
+
+                const rectEq = (a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }): boolean =>
+                  a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+                const f_c2j_cardOverBothWorlds = probeLocal.showing && probeLocal.visible && probeLocal.loaded
+                  && probeLocal.pageCardVisible === true && probeLocal.pillIsTop
+                  && rectEq(probeLocal.bounds, probeLocal.expected)
+                  && probeCloud.showing && probeCloud.pillIsTop && rectEq(probeCloud.bounds, probeCloud.expected)
+                  && probeHome.showing
+                  && !probeDismissed.showing && probeDismissed.bounds.width === 0 && probeDismissed.bounds.height === 0
+                  && stormMid.showing && stormMid.queueLen === 2
+                  && !stormEnd.showing && stormEnd.queueLen === 0 && stormEnd.bounds.width === 0 && stormEnd.bounds.height === 0
+                  && stormEnd.delivered - deliveredBeforeStorm === 3
+                  && missedCapped.missedLen === 20 && missedCapped.missedDropped === 2
+                  && drainedProbe.missedLen === 0 && drainedProbe.currentTitle === 'C2j missed 3'
+                  && drainedProbe.queueLen === 19
+                  && !purged.showing && purged.queueLen === 0 && purged.missedLen === 0;
+                console.log('[c2j]', JSON.stringify({
+                  f_c2j_cardOverBothWorlds,
+                  f_c2j_rearmFiresAgain,
+                  f_c2j_cardFollowsTheme,
+                  rearmMatrix: {
+                    tempDropCreated: !!tempDrop, firstFire: fire1, rearmSecondFire: fire2,
+                    firstDelta: afterFirst - rearm0, secondDelta: afterSecond - afterFirst,
+                    purgedClean: !rearmPurged.showing && rearmPurged.queueLen === 0,
+                  },
+                  themeMatrix: {
+                    prevTheme, restored: manager.getSettings().theme === prevTheme,
+                    darkLeg: themeDark ? { pageTheme: themeDark.pageTheme, barBg: themeDark.painted?.barBg, radius: themeDark.painted?.cardRadius, edge: themeDark.painted?.cardBorderWidth } : null,
+                    lightLeg: themeLight ? { pageTheme: themeLight.pageTheme, barBg: themeLight.painted?.barBg, radius: themeLight.painted?.cardRadius, edge: themeLight.painted?.cardBorderWidth } : null,
+                    purgedClean: !themePurged.showing && themePurged.queueLen === 0,
+                  },
+                  matrix: {
+                    localShown: probeLocal.showing && probeLocal.pageCardVisible === true,
+                    localBoundsExact: rectEq(probeLocal.bounds, probeLocal.expected),
+                    cloudStillShown: probeCloud.showing && probeCloud.pageCardVisible === true,
+                    cloudBoundsExact: rectEq(probeCloud.bounds, probeCloud.expected),
+                    pillTopLocal: probeLocal.pillIsTop, pillTopCloud: probeCloud.pillIsTop,
+                    autoDismissCollapsed: !probeDismissed.showing && probeDismissed.bounds.width === 0,
+                    stormSerialized: stormMid.showing && stormMid.queueLen === 2,
+                    stormAllDelivered: stormEnd.delivered - deliveredBeforeStorm === 3,
+                    stormCleanEnd: !stormEnd.showing && stormEnd.queueLen === 0 && stormEnd.bounds.width === 0,
+                    missedCap: missedCapped.missedLen === 20 && missedCapped.missedDropped === 2,
+                    missedDrainOrderOldestFirst: drainedProbe.currentTitle === 'C2j missed 3' && drainedProbe.queueLen === 19,
+                    purgedClean: !purged.showing && purged.queueLen === 0 && purged.missedLen === 0,
+                  },
+                  raw: {
+                    winFocused, delivered0, deliveredBeforeStorm,
+                    probeLocal, probeCloud, probeHome, probeDismissed, stormMid, stormEnd, missedCapped, drainedProbe, purged,
+                    themeDark, themeLight, themePurged,
+                  },
+                }));
+                // No cleanup needed: LEG E + LEG F + LEG G ended with cardTestReset (collapsed +
+                // empty queues, temp drop deleted, theme restored) — the card layer is inert and
+                // the vault theme is back for the dead-last C2h idle stage that follows.
+              }
+
+              // (5d) C2m — f_c2m_flipDissolve — THE FLIP DISSOLVE battery. Placed per order:
+              // immediately AFTER the C2j stage (Local + unlocked + card inert) and BEFORE the
+              // dead-last C2h idle stage. User flips are driven through the REAL relay
+              // (`pill:flipRequested`, as the existing robot legs do) with the ARM step a real
+              // click performs: the `pill:flip` ipc handler stamps transitionArmedAt, so each
+              // armed leg stamps it here directly (the identical write, same module variable)
+              // before the relay — FIX 3's gate in applyMode reads exactly this. STEP 0.5
+              // outcome B: no click pass-through API exists on this Electron build (spike,
+              // 2026-08-28), so leg 2's PROMPT 0×0 collapse IS the zero-miss-click guarantee.
+              // C2m-hotfix-1 (THE COVERED SWAP): meltLeg now also asserts the curtain comes up
+              // BEFORE the world swap (in-flight + full-ish bounds while appMode is STILL the
+              // outgoing mode — sampled at 25 ms; decode ≈ tens of ms) — one continuous
+              // dissolve, no new-world peek-through.
+              {
+                const faderSnap = (): Promise<{ attached: boolean; inFlight: boolean; bounds: Electron.Rectangle | null; collapsed: boolean }> =>
+                  cloudCtl!.faderProbe();
+                type FaderSnap = Awaited<ReturnType<typeof faderSnap>>;
+                const fullish = (b: FaderSnap['bounds']): boolean => {
+                  const cb = win.getContentBounds();
+                  return !!b && b.x === 0 && b.y === 0
+                    && Math.abs(b.width - cb.width) <= 2 && Math.abs(b.height - cb.height) <= 2;
+                };
+                const flat = (b: FaderSnap['bounds']): boolean => !!b && b.width === 0 && b.height === 0;
+                /** One melt round-trip: ARM + relay, poll for the in-flight window (bounds ≈
+                 * content) at 25 ms cadence — the FIRST observable fact must be the curtain up
+                 * while appMode is STILL the outgoing mode (covered swap) — then poll settle
+                 * to collapsed 0×0. */
+                const meltLeg = async (next: 'cloud' | 'local') => {
+                  const outgoing = appMode; // the world on screen BEFORE the relay lands
+                  transitionArmedAt = Date.now(); // the pill:flip handler's exact arm write
+                  win.webContents.send('pill:flipRequested', next);
+                  let inFlightSnap: FaderSnap | null = null;
+                  let coveredSwap = false;
+                  let curtainUpAt = -1; // first in-flight (full-ish bounds) observation, ms clock
+                  const t0 = Date.now();
+                  while (Date.now() - t0 < 1000) { // melt window ≈ decode + pad + fade + delay
+                    const p = await faderSnap();
+                    if (p.inFlight && p.attached && fullish(p.bounds)) {
+                      inFlightSnap = p;
+                      curtainUpAt = Date.now();
+                      coveredSwap = appMode === outgoing; // curtain BEFORE the swap ⇒ no peek
+                      break;
+                    }
+                    if (!p.inFlight && flat(p.bounds) && Date.now() - t0 > 700) break; // already over
+                    await sleep(25);
+                  }
+                  // C2m-hotfix-1 — the mode applies only AFTER the ready handshake (the swap
+                  // waits for the painted curtain), so "later" is sampled explicitly: poll
+                  // until the flip lands, THEN read modeAfterArm (in C2m the swap preceded the
+                  // observable in-flight, so the old single-sample read the applied mode).
+                  const tMode = Date.now();
+                  while (Date.now() - tMode < 800 && appMode !== next) await sleep(20);
+                  const modeAfterArm = appMode;
+                  // C2m-hotfix-2 — observed span from curtain-up to the flip landing: the
+                  // MELT_SWAP_PAD_MS headroom + decode tail + poll resolution. The battery
+                  // cannot observe `fader:ready` directly (main-internal), so this is the
+                  // honest observable proxy — printed raw per leg.
+                  const swapPadMs = curtainUpAt >= 0 ? Date.now() - curtainUpAt : -1;
+                  let settledSnap: FaderSnap | null = null;
+                  const t1 = Date.now();
+                  while (Date.now() - t1 < 1200) { // settle: inFlight clears, footprint 0×0
+                    const p = await faderSnap();
+                    if (!p.inFlight && flat(p.bounds) && p.attached) { settledSnap = p; break; }
+                    await sleep(25);
+                  }
+                  return { inFlightSnap, settledSnap, modeAfterArm, coveredSwap, swapPadMs, next };
+                };
+
+                // Start Local through the REAL relay (renderer re-synced, c2f-storm discipline).
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+
+                // LEG 1+2 — Local→Cloud: melt observed in-flight (≈ full-window fader), then a
+                // prompt settle to 0×0; the mode applied REGARDLESS of the effect.
+                const legOut = await meltLeg('cloud');
+                // LEG 3+4 — Cloud→Local: same two legs, both directions dissolve.
+                await sleep(400);
+                const legHome = await meltLeg('local');
+
+                // LEG 5 — RAPID STORM: three armed flips ~150 ms apart — melts cancel serially
+                // (owner decision 4), nothing stacks, no leaked/duplicated views (children 4).
+                transitionArmedAt = Date.now();
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(150);
+                transitionArmedAt = Date.now();
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(150);
+                transitionArmedAt = Date.now();
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(1500);
+                const stormProbe = await faderSnap();
+                const stormChildViews = win.contentView.children.length;
+                const stormFinalMode = appMode;
+
+                // LEG 6 — SYSTEM flips don't dissolve: drive applyCloudMode DIRECTLY (the storm
+                // path). No arm ⇒ NO in-flight window observable (sampled immediately + a few
+                // beats); the mode still flips.
+                // C2m-hotfix-2 — clear any STALE USER ARM first: a storm flip the RENDERER
+                // dropped (its in-flight switch guard eats a relay that lands mid-switch —
+                // more likely since the hotfix pads widened the apply window) leaves a warm
+                // transitionArmedAt that would LEGITIMATELY melt this programmatic flip inside
+                // FIX 3's 10 s expiry. Leg 6's premise is "a system flip carries no user arm"
+                // — make the premise literal instead of timing-dependent.
+                transitionArmedAt = 0;
+                const sysSamples: FaderSnap[] = [];
+                await applyCloudMode('local');
+                sysSamples.push(await faderSnap());
+                await sleep(80);
+                sysSamples.push(await faderSnap());
+                await sleep(200);
+                sysSamples.push(await faderSnap());
+                const sysMode = appMode;
+
+                const meltOk = (leg: Awaited<ReturnType<typeof meltLeg>>): boolean =>
+                  !!leg.inFlightSnap && leg.inFlightSnap.inFlight && leg.inFlightSnap.attached
+                  && fullish(leg.inFlightSnap.bounds)
+                  && leg.coveredSwap // C2m-hotfix-1 — curtain BEFORE the swap, both directions
+                  && !!leg.settledSnap && !leg.settledSnap.inFlight && flat(leg.settledSnap.bounds)
+                  && leg.modeAfterArm === leg.next;
+                // C3 — the storm's child count is now 5 (status layer membership, accounted
+                // for above); the zero-leak intent is unchanged.
+                const stormExpectedChildViews = 5;
+                const f_c2m_flipDissolve = meltOk(legOut) && meltOk(legHome)
+                  && !stormProbe.inFlight && flat(stormProbe.bounds) && stormProbe.attached
+                  && stormChildViews === stormExpectedChildViews && stormFinalMode === 'cloud'
+                  && sysSamples.every((p) => !p.inFlight) && sysMode === 'local';
+
+                console.log('[c2m]', JSON.stringify({
+                  f_c2m_flipDissolve,
+                  matrix: {
+                    outInFlight: !!legOut.inFlightSnap && legOut.inFlightSnap.inFlight && fullish(legOut.inFlightSnap.bounds),
+                    outCoveredSwap: legOut.coveredSwap,
+                    outSwapPadMs: legOut.swapPadMs,
+                    outSettledFlat: !!legOut.settledSnap && flat(legOut.settledSnap.bounds),
+                    homeInFlight: !!legHome.inFlightSnap && legHome.inFlightSnap.inFlight && fullish(legHome.inFlightSnap.bounds),
+                    homeCoveredSwap: legHome.coveredSwap,
+                    homeSwapPadMs: legHome.swapPadMs,
+                    homeSettledFlat: !!legHome.settledSnap && flat(legHome.settledSnap.bounds),
+                    stormCleanEnd: !stormProbe.inFlight && flat(stormProbe.bounds) && stormProbe.attached && stormChildViews === stormExpectedChildViews,
+                    systemFlipNeverMelts: sysSamples.every((p) => !p.inFlight && flat(p.bounds)) && sysMode === 'local',
+                  },
+                  raw: { legOut, legHome, stormProbe, stormChildViews, stormFinalMode, sysSamples, sysMode },
+                }));
+                // Re-sync renderer ⇄ main through the REAL relay after leg 6's main-side flip
+                // (the c2f-storm discipline): leg 6 leaves main LOCAL but the renderer still on
+                // 'cloud' — a battery-only desync that MUST NOT leak into the dead-last C2h
+                // idle stage (its own relay flip to 'cloud' would no-op against a cloud
+                // renderer). A relay flip to main's current mode re-aligns both sides.
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                // Leave Local — the dead-last C2h idle stage takes it from here.
+              }
+
+              // (5e) C3 — PLUMBING & OFFLINE battery. Placed per order: immediately AFTER the
+              // C2m stage and BEFORE the dead-last C2h idle stage. All controller probes here
+              // are DEV-gated (DROPSYNC_CLOUD_DEV=1 — this battery's own boot gate). The
+              // download seam arms under the same dev gate (see cloud.ts e2eSeamArmed).
+              {
+                type StatusSnap = Awaited<ReturnType<typeof cloudCtl.statusProbe>>;
+                const statusSnap = (): Promise<StatusSnap> => cloudCtl!.statusProbe();
+                /** Poll until cond() holds (or timeout) — the standard leg cadence. */
+                const waitFor = async (cond: () => Promise<boolean>, timeoutMs: number, step = 50): Promise<boolean> => {
+                  const t0 = Date.now();
+                  for (;;) {
+                    if (await cond()) return true;
+                    if (Date.now() - t0 > timeoutMs) return false;
+                    await sleep(step);
+                  }
+                };
+                const cbW = (): number => win.getContentBounds().width;
+
+                // ---- f_c3_doorman (STEP 3) — direct invocation of the registered handlers ----
+                // PAC-2 FIX C — checkNotifications flipped to TRUE by the order (the
+                // notifications gate opens, origin-gated like media); the media/geo truth is
+                // byte-identical and still asserted. The full four-direction notifications
+                // truth lives in f_pac2_notificationsAllowed.
+                const door = await cloudCtl!.doormanProbe();
+                const f_c3_doorman = door.mediaSite === true && door.mediaEvil === false
+                  && door.geoSite === false
+                  && door.checkMediaSite === true && door.checkMediaEvil === false
+                  && door.checkNotifications === true;
+                console.log('[c3-doorman]', JSON.stringify({
+                  f_c3_doorman,
+                  table: { request: { mediaSite: door.mediaSite, mediaEvil: door.mediaEvil, geoSite: door.geoSite }, check: { mediaSite: door.checkMediaSite, mediaEvil: door.checkMediaEvil, notifications: door.checkNotifications } },
+                }));
+
+                // ---- f_c3_chipBoundsZeroMiss (idle half) + f_c3_chipDownloadFlow (STEP 2) ----
+                const idleSnap = await statusSnap();
+                const chipIdleZeroMiss = idleSnap.attached && !idleSnap.showing && idleSnap.collapsed;
+
+                const dlSession = session.fromPartition('persist:cloud'); // the site partition (cloud.ts PARTITION)
+                // Run 1 lesson (2026-08-29): session.downloadURL on a data: URL creates the
+                // DownloadItem but it NEVER progresses (no 'updated', no 'done', no bytes) —
+                // the battery needs a REAL http URL. The dev server serves any project file
+                // via /@fs; typescript.js (9.1 MB) gives real multi-tick progress + a real
+                // completion, without a native dialog (the e2e seam auto-answers).
+                // Main is ESM ("type": "module") — __dirname does not exist at runtime here;
+                // the file's own idiom is fileURLToPath(new URL('.', import.meta.url)).
+                const dlFile = join(fileURLToPath(new URL('.', import.meta.url)), '..', '..', 'node_modules', 'typescript', 'lib', 'typescript.js');
+                const dlUrl = `${String(process.env.ELECTRON_RENDERER_URL ?? '')}/@fs${encodeURI(dlFile)}`;
+                const chipUpExact = async (): Promise<{ up: boolean; snap: StatusSnap | null }> => {
+                  let snap: StatusSnap | null = null;
+                  const appeared = await waitFor(async () => {
+                    const p = await statusSnap();
+                    if (p.showing && !p.veilUp && p.bounds.width > 0 && p.bounds.y === STATUS_TOP) { snap = p; return true; }
+                    return false;
+                  }, 4000);
+                  if (!appeared) return { up: false, snap: null };
+                  // The measured-width room: main snaps to the page's measure within a beat.
+                  let exact: StatusSnap | null = null;
+                  const exactHit = await waitFor(async () => {
+                    const p = await statusSnap();
+                    if (p.lastMeasure > 0 && p.bounds.width === p.lastMeasure
+                      && p.bounds.height === STATUS_H
+                      && Math.abs(p.bounds.x - Math.round((cbW() - p.bounds.width) / 2)) <= 1) { exact = p; return true; }
+                    return false;
+                  }, 2000);
+                  return { up: exactHit, snap: exact ?? snap };
+                };
+
+                // LEG 1 — the flow: chip up (measured footprint) → progress lands → done
+                // flash → collapse to 0×0 → the saved file exists on disk.
+                cloudCtl!.downloadTestArm(false);
+                dlSession.downloadURL(dlUrl);
+                const flow = await chipUpExact();
+                let flowProgressLanded = false;
+                if (flow.up) {
+                  flowProgressLanded = await waitFor(async () => (await statusSnap()).lastProgress !== null, 3000);
+                }
+                const flowSettled = flow.up
+                  ? await waitFor(async () => {
+                    const p = await statusSnap();
+                    return !p.showing && p.collapsed;
+                  }, 12000)
+                  : false;
+                const flowSnap = await statusSnap();
+                const flowFlash = flowSnap.lastHideFlash === '✓ Saved';
+                const flowFileExists = flowSnap.lastSavePath !== null && existsSync(flowSnap.lastSavePath);
+                if (flowSnap.lastSavePath !== null) {
+                  try {
+                    rmSync(flowSnap.lastSavePath, { force: true }); // keep /tmp clean (9 MB/run)
+                  } catch { /* best-effort cleanup */ }
+                }
+
+                // LEG 2 — cancel mid-flight (held download): item cancelled AND the partial
+                // file is ABSENT on disk AND the chip is gone.
+                cloudCtl!.downloadTestArm(true); // hold: the next item pauses right after its save path
+                dlSession.downloadURL(dlUrl);
+                const cancelUp = await chipUpExact();
+                const cancelPath = (await statusSnap()).lastSavePath;
+                let cancelGone = false;
+                if (cancelUp.up) {
+                  await cloudCtl!.statusDrive('cancel'); // the REAL button → status:action ipc
+                  cancelGone = await waitFor(async () => {
+                    const p = await statusSnap();
+                    return !p.showing && p.collapsed;
+                  }, 6000);
+                }
+                cloudCtl!.downloadTestArm(false);
+                const cancelFileAbsent = cancelPath !== null && !existsSync(cancelPath);
+
+                // LEG 3 — a download outlives a mode flip (D2): hold a download, flip the
+                // world BOTH ways (programmatic main-side — melts never fire), chip persists.
+                cloudCtl!.downloadTestArm(true);
+                dlSession.downloadURL(dlUrl);
+                const persistUp = await chipUpExact();
+                let chipPersists = false;
+                if (persistUp.up) {
+                  await applyCloudMode('cloud');
+                  await sleep(200);
+                  const overCloud = await statusSnap();
+                  await applyCloudMode('local');
+                  await sleep(200);
+                  const overLocal = await statusSnap();
+                  chipPersists = overCloud.showing && !overCloud.collapsed && overLocal.showing && !overLocal.collapsed;
+                  await cloudCtl!.statusDrive('cancel'); // clean up the held download
+                  await waitFor(async () => {
+                    const p = await statusSnap();
+                    return !p.showing && p.collapsed;
+                  }, 6000);
+                }
+                cloudCtl!.downloadTestArm(false);
+
+                const f_c3_chipDownloadFlow = flow.up && flowProgressLanded && flowSettled && flowFlash
+                  && cancelUp.up && cancelGone && cancelFileAbsent;
+                const f_c3_chipBoundsZeroMiss = chipIdleZeroMiss && flow.up && chipPersists;
+                console.log('[c3-chip]', JSON.stringify({
+                  f_c3_chipDownloadFlow,
+                  f_c3_chipBoundsZeroMiss,
+                  matrix: {
+                    chipIdleZeroMiss, flowUpMeasured: flow.up, flowProgressLanded, flowSettled,
+                    flowFlash, flowFileExists, cancelUp: cancelUp.up, cancelGone, cancelFileAbsent,
+                    chipPersists,
+                  },
+                  raw: {
+                    flowBounds: flow.snap?.bounds ?? null, flowMeasure: flow.snap?.lastMeasure ?? 0,
+                    flowFractions: flowSnap.lastProgress, flowSavePath: flowSnap.lastSavePath,
+                    cancelPath, idleRaw: idleSnap,
+                  },
+                }));
+
+                // ---- f_c3_offlineStates (STEP 4) — entry / recovery / degraded / mode-clear ----
+                // Align BOTH sides on cloud through the REAL relay (un-armed ⇒ instant).
+                win.webContents.send('pill:flipRequested', 'cloud');
+                await sleep(1500);
+
+                // ENTRY leg — forced main-frame failure while offline ⇒ veil (theme attr set,
+                // full-window room); reconnect ⇒ auto-reload (spy) + veil down.
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const veilUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.showing
+                    && p.bounds.x === 0 && p.bounds.y === 0
+                    && Math.abs(p.bounds.width - win.getContentBounds().width) <= 2
+                    && Math.abs(p.bounds.height - win.getContentBounds().height) <= 2;
+                }, 3000);
+                const veilTheme = await cloudCtl!.statusEval<string>('document.documentElement.dataset.statusTheme || ""');
+                const themeOk = ['light', 'dark', 'minimal'].includes(veilTheme);
+                cloudCtl!.setNetOverride(true);
+                const reloadsBefore = (await statusSnap()).reloadCount;
+                const veilCleared = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.reloadCount > reloadsBefore && !p.veilUp && !p.showing && p.collapsed;
+                }, 8000);
+
+                // DEGRADED leg — net drops WHILE cloud is shown ⇒ pulse chip (no reload, D6);
+                // reconnect ⇒ "✓ Back online" flash, then the chip collapses.
+                cloudCtl!.setNetOverride(false);
+                const degradedUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.showing && !p.veilUp && p.bounds.width > 0
+                    && (p.lastShow as { label?: string } | null)?.label === 'Waiting for internet…'
+                    && (p.lastShow as { pulse?: boolean } | null)?.pulse === true
+                    && (p.lastShow as { action?: string } | null)?.action === 'switch-local';
+                }, 6000);
+                const degradedReloaded = (await statusSnap()).reloadCount; // must NOT change mid-degraded
+                cloudCtl!.setNetOverride(true);
+                const backOnline = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.lastHideFlash === '✓ Back online' && !p.showing && p.collapsed;
+                }, 9000);
+                const degradedNoReload = (await statusSnap()).reloadCount === degradedReloaded;
+
+                // C3-hotfix-1 — f_c3_veilRetrySuccess (THE leg the C3 order lacked): entry-
+                // failed ⇒ the REAL [Try again] button ⇒ reload fires AND the veil LIFTS
+                // (offlineState 'ok'). Driven while the net override is still FALSE so the
+                // 2 s auto-recovery poll (requires `online`) can never race the manual
+                // button — the reload itself succeeds on the real net; FIX A does the lift.
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const rv2Up = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed';
+                }, 3000);
+                const retryReloadsBefore = (await statusSnap()).reloadCount;
+                await cloudCtl!.statusDrive('retry'); // the REAL button → status:action ipc
+                const retryReloaded = await waitFor(async () =>
+                  (await statusSnap()).reloadCount > retryReloadsBefore, 3000);
+                const retryDelta = (await statusSnap()).reloadCount - retryReloadsBefore;
+                // The lift detector is TWO-BRANCH by design: with the net override held
+                // FALSE (blocking the auto-recovery from racing the manual button), the poll
+                // can legitimately fire a degraded chip right after the lift (state ok +
+                // veil gone + shown + flag claims offline). That chip PROVES the lift: with
+                // the override false, the only ok-transition is the retry's own success lift
+                // (entry-failed ⇒ ok is otherwise unreachable). Branch 1 catches the brief
+                // ok+collapsed window; branch 2 catches the chip that follows it.
+                const retryLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  if (!p.showing && p.collapsed && p.siteLoadOk) return true;
+                  if (p.showing && !p.veilUp && p.siteLoadOk
+                    && (p.lastShow as { label?: string } | null)?.label === 'Waiting for internet…') return true;
+                  return false;
+                }, 8000);
+                cloudCtl!.setNetOverride(null); // real net is up ⇒ identical to override true
+                const f_c3_veilRetrySuccess = rv2Up && retryReloaded && retryDelta === 1 && retryLifted;
+                console.log('[c3-veilretry]', JSON.stringify({
+                  f_c3_veilRetrySuccess,
+                  matrix: { rv2Up, retryReloaded, retryDelta, retryLifted },
+                  raw: { retryReloadsBefore },
+                }));
+
+                // C3-hotfix-3 — f_c3_recoveryKeepsCardUntilSuccess (THE OWNER'S MOVE):
+                // entry-failed ⇒ Wi-Fi back on ⇒ the poll tick fires auto-recovery ⇒ the veil
+                // must SWAP to the Connecting presentation (never collapse) and stay up
+                // through the whole reload window; success is the only exit. White-forever
+                // detector: NO card showing while the page has still never succeeded.
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const rkUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed';
+                }, 3000);
+                const rkBefore = (await statusSnap()).reloadCount;
+                cloudCtl!.setNetOverride(true); // the poll tick fires the recovery
+                let rkSwapSeen = false;
+                let rkWhiteForever = false;
+                let rkLifted = false;
+                const rkT0 = Date.now();
+                while (Date.now() - rkT0 < 9000 && !rkLifted) {
+                  const p = await statusSnap();
+                  const rkTitle = (p.lastShow as { title?: string } | null)?.title ?? '';
+                  if (p.reloadCount > rkBefore && p.veilUp && rkTitle === 'Connecting to Cloud…') rkSwapSeen = true;
+                  if (p.reloadCount > rkBefore && !p.showing && p.collapsed && !p.siteLoadOk) rkWhiteForever = true;
+                  if (!p.showing && p.collapsed && p.siteLoadOk && rkSwapSeen) rkLifted = true;
+                  await sleep(100);
+                }
+                cloudCtl!.setNetOverride(null);
+                const f_c3_recoveryKeepsCardUntilSuccess = rkUp && rkSwapSeen && !rkWhiteForever && rkLifted;
+                console.log('[c3-recovery]', JSON.stringify({
+                  f_c3_recoveryKeepsCardUntilSuccess,
+                  matrix: { rkUp, rkSwapSeen, rkWhiteForever, rkLifted },
+                  raw: { rkBefore },
+                }));
+
+                // C3-hotfix-3 — f_c3_flapNeverDowngradesVeil: with the entry-failed veil up, a
+                // net-flag bounce (true→false→true) must never downgrade it — no degraded
+                // chip, no "✓ Back online" flash while the veil lineage is live. (A chip
+                // AFTER a legitimate lift would be a true mid-cloud degraded and is NOT
+                // counted — the assertion is scoped to the veil lineage.)
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const flUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed';
+                }, 3000);
+                const flBefore = (await statusSnap()).reloadCount;
+                cloudCtl!.setNetOverride(true); // recovery fires at the next tick
+                const flSwap = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.reloadCount > flBefore && p.veilUp
+                    && ((p.lastShow as { title?: string } | null)?.title === 'Connecting to Cloud…');
+                }, 4000);
+                cloudCtl!.setNetOverride(false); // FLAP down mid-recovery — must not downgrade
+                let flDegradedSeen = false;
+                const flT0 = Date.now();
+                while (Date.now() - flT0 < 2500) { // ≥1 poll tick guaranteed inside the window
+                  const p = await statusSnap();
+                  const flLabel = (p.lastShow as { label?: string } | null)?.label ?? '';
+                  const veilLineage = p.veilUp || p.connectingUp || p.offlineState === 'entry-failed';
+                  if (veilLineage && flLabel === 'Waiting for internet…') flDegradedSeen = true;
+                  await sleep(100);
+                }
+                cloudCtl!.setNetOverride(true); // flap back up — the reload (real net) completes ⇒ success lift
+                const flLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.showing && p.collapsed && p.siteLoadOk;
+                }, 9000);
+                cloudCtl!.setNetOverride(null);
+                const f_c3_flapNeverDowngradesVeil = flUp && flSwap && !flDegradedSeen && flLifted;
+                console.log('[c3-flap]', JSON.stringify({
+                  f_c3_flapNeverDowngradesVeil,
+                  matrix: { flUp, flSwap, flDegradedSeen, flLifted },
+                  raw: { flBefore },
+                }));
+
+                // MODE-CLEAR leg — veil up ⇒ [Switch to Local] rides the REAL user-flip path
+                // (arm + melt attempt; the D7 deadline keeps a live capture fast) ⇒ mode local
+                // AND every offline state cleared.
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-106, true, CLOUD_URL);
+                const veil2Up = await waitFor(async () => (await statusSnap()).veilUp, 3000);
+                await cloudCtl!.statusDrive('switch-local');
+                const modeCleared = await waitFor(async () => appMode === 'local', 3500, 25);
+                const veilGoneAfterFlip = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.veilUp && !p.showing && p.collapsed;
+                }, 3000);
+                cloudCtl!.setNetOverride(null);
+
+                const f_c3_offlineStates = veilUp && themeOk && veilCleared
+                  && degradedUp && degradedNoReload && backOnline
+                  && veil2Up && modeCleared && veilGoneAfterFlip;
+                console.log('[c3-offline]', JSON.stringify({
+                  f_c3_offlineStates,
+                  matrix: {
+                    veilUp, themeOk, veilTheme, veilCleared,
+                    degradedUp, degradedNoReload, backOnline,
+                    veil2Up, modeCleared, veilGoneAfterFlip,
+                  },
+                  raw: { reloadsBefore },
+                }));
+                transitionArmedAt = 0; // hygiene: the switch-local flip legitimately armed; clear it
+
+                // ---- f_c3_flipFromDeadCloud (STEP 5 / §2.4) — THE OWNER'S BUG, PINNED ----
+                // Back to cloud through the REAL relay — with the (5)-stage DESYNC INSURANCE:
+                // a relay landing while the renderer's previous guarded switch is still
+                // settling can be DROPPED (documented C2m-hotfix-2 artifact — run 3 hit it:
+                // the switch-local flip's melt widened the window), so poll BOTH sides and
+                // re-send. Battery-only harness discipline; the product path is untouched.
+                let cloudReady = false;
+                for (let attempt = 0; attempt < 3 && !cloudReady; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  cloudReady = await waitFor(async () =>
+                    (await readModeSafe()) === 'cloud' && appMode === 'cloud', 2500, 50);
+                }
+
+                // C3-hotfix-2 — f_c3_connectingSurvivesSubframeNoise: during a hanging fresh
+                // load, a SUBFRAME failure (the real site's helper-frame noise — Firebase
+                // auth iframes, analytics) must NOT silence the connecting backstop. The
+                // real shared failure path is invoked with isMainFrame=false ~1 s in; the
+                // Connecting veil MUST still appear at ~3 s (offlineState still 'ok').
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined);
+                await sleep(1000);
+                cloudCtl!.onSiteLoadFailed(-3, false, CLOUD_URL); // sub-frame noise mid-hang
+                const subNoiseVeil = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.connectingUp && p.veilUp && p.showing && p.offlineState === 'ok'
+                    && p.bounds.x === 0 && p.bounds.y === 0
+                    && Math.abs(p.bounds.width - win.getContentBounds().width) <= 2
+                    && Math.abs(p.bounds.height - win.getContentBounds().height) <= 2;
+                }, 3500);
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined);
+                const subNoiseLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.connectingUp && !p.veilUp && !p.showing && p.collapsed && p.offlineState === 'ok';
+                }, 8000);
+                const f_c3_connectingSurvivesSubframeNoise = subNoiseVeil && subNoiseLifted;
+                console.log('[c3-subframe]', JSON.stringify({
+                  f_c3_connectingSurvivesSubframeNoise,
+                  matrix: { subNoiseVeil, subNoiseLifted },
+                  raw: { noiseAtMs: 1000, noiseCode: -3, noiseIsMainFrame: false, timeoutMs: ENTRY_CONNECT_TIMEOUT_MS },
+                }));
+
+                // C3-hotfix-1 — connecting leg (FIX B): a fresh load that hangs (TEST-NET-1,
+                // no fast did-fail-load and the WSL net-flag backstop can't fire) must show
+                // the CONNECTING veil within ~3 s (≤3.5 s assert) instead of 5–6 s of white.
+                // offlineState stays 'ok' beneath it (the net has NOT failed — honest card).
+                // Restore ⇒ did-finish-load ⇒ FIX A lifts. Runs BEFORE the dead-flip leg
+                // (which re-navigates to the same dead URL and is otherwise untouched).
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined);
+                const connUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.connectingUp && p.veilUp && p.showing && p.offlineState === 'ok'
+                    && p.bounds.x === 0 && p.bounds.y === 0
+                    && Math.abs(p.bounds.width - win.getContentBounds().width) <= 2
+                    && Math.abs(p.bounds.height - win.getContentBounds().height) <= 2;
+                }, 3500);
+                const connTheme = await cloudCtl!.statusEval<string>('document.documentElement.dataset.statusTheme || ""');
+                const connThemeOk = ['light', 'dark', 'minimal'].includes(connTheme);
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined);
+                const connLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.connectingUp && !p.veilUp && !p.showing && p.collapsed && p.offlineState === 'ok';
+                }, 8000);
+                const f_c3_connectingVeil = connUp && connThemeOk && connLifted;
+                console.log('[c3-connecting]', JSON.stringify({
+                  f_c3_connectingVeil,
+                  matrix: { connUp, connTheme, connThemeOk, connLifted },
+                  raw: { timeoutMs: ENTRY_CONNECT_TIMEOUT_MS },
+                }));
+
+                // Point the site view at TEST-NET-1 (hangs forever). Battery-only navigation
+                // of the site view — ordered by the C3 order §4 STEP 6 (I1 stays absolute
+                // outside this DEV leg).
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined);
+                await sleep(600); // the view is now a dead page (white void — owner's screenshot)
+                const deadOutgoing = appMode; // 'cloud'
+                transitionArmedAt = Date.now(); // the pill:flip handler's exact arm write
+                const deadT0 = Date.now();
+                win.webContents.send('pill:flipRequested', 'local');
+                const deadApplied = await waitFor(async () => appMode === 'local', 4000, 25);
+                const deadFlipMs = Date.now() - deadT0;
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined); // restore
+                const f_c3_flipFromDeadCloud = deadOutgoing === 'cloud' && deadApplied && deadFlipMs < 1500;
+                console.log('[c3-deadflip]', JSON.stringify({
+                  f_c3_flipFromDeadCloud,
+                  matrix: { firstClickThrough: deadApplied, underDeadline: deadFlipMs < 1500 },
+                  raw: { deadOutgoing, deadFlipMs, captureDeadlineMs: CAPTURE_DEADLINE_MS },
+                }));
+
+                // C3-hotfix-2 — f_c3_deadReentryRetries: THE OWNER'S BRICK. State after the
+                // dead-flip leg: appMode local, the site view a dead TEST-NET-1 page (its
+                // load never succeeded). Flip back to Cloud must RETRY (show() reloads +
+                // re-arms ⇒ Connecting card), not sit white forever. The re-entry reload
+                // targets CLOUD_URL, which the real net would load fine — this leg cannot
+                // turn Wi-Fi off, so a battery-only webRequest redirect (site origin →
+                // TEST-NET-1, registered here and REMOVED before the restore) makes the
+                // re-entry load hang exactly the way a real offline CLOUD_URL load hangs.
+                // Never registered outside this DEV leg.
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined); // re-dead the view (siteLoadOk=false)
+                await sleep(400);
+                const deBefore = (await statusSnap()).siteLoadCount;
+                let deLocal = false; // the Local hop (both sides are already local here — the relay no-ops; kept for flow fidelity)
+                for (let attempt = 0; attempt < 3 && !deLocal; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'local');
+                  deLocal = await waitFor(async () =>
+                    (await readModeSafe()) === 'local' && appMode === 'local', 2500, 50);
+                }
+                const cloudSes = session.fromPartition('persist:cloud');
+                const deadFilter = { urls: [CLOUD_URL + '/*'] };
+                cloudSes.webRequest.onBeforeRequest(deadFilter, (_details, cb) => { cb({ redirectURL: 'https://192.0.2.1/' }); });
+                let deCloud = false;
+                for (let attempt = 0; attempt < 3 && !deCloud; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  deCloud = await waitFor(async () =>
+                    (await readModeSafe()) === 'cloud' && appMode === 'cloud', 2500, 50);
+                }
+                const deRetried = (await statusSnap()).siteLoadCount > deBefore; // show() reloaded
+                const deVeil = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.connectingUp && p.veilUp && p.showing && p.offlineState === 'ok'
+                    && p.bounds.x === 0 && p.bounds.y === 0
+                    && Math.abs(p.bounds.width - win.getContentBounds().width) <= 2
+                    && Math.abs(p.bounds.height - win.getContentBounds().height) <= 2;
+                }, 3500);
+                cloudSes.webRequest.onBeforeRequest(deadFilter, null); // unpoison
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined);
+                const deLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.connectingUp && !p.veilUp && !p.showing && p.collapsed && p.offlineState === 'ok';
+                }, 8000);
+                const f_c3_deadReentryRetries = deLocal && deCloud && deRetried && deVeil && deLifted;
+                console.log('[c3-deadreentry]', JSON.stringify({
+                  f_c3_deadReentryRetries,
+                  matrix: { deLocal, deCloud, deRetried, deVeil, deLifted },
+                  raw: { deBefore },
+                }));
+
+                // C3-hotfix-2 — warm-entry guard: with a HEALTHY site (the restore above just
+                // loaded it — siteLoadOk true), local → cloud must NOT reload (C2i warmth,
+                // preserved by FIX B's !siteLoadOk gate).
+                const warmBefore = (await statusSnap()).siteLoadCount;
+                let warmLocal = false;
+                for (let attempt = 0; attempt < 3 && !warmLocal; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'local');
+                  warmLocal = await waitFor(async () =>
+                    (await readModeSafe()) === 'local' && appMode === 'local', 2500, 50);
+                }
+                let warmCloud = false;
+                for (let attempt = 0; attempt < 3 && !warmCloud; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  warmCloud = await waitFor(async () =>
+                    (await readModeSafe()) === 'cloud' && appMode === 'cloud', 2500, 50);
+                }
+                await sleep(300); // a (wrong) reload would land within this window
+                const warmSnap = await statusSnap();
+                const f_c3_warmEntryNoReload = warmLocal && warmCloud
+                  && warmSnap.siteLoadCount === warmBefore && !warmSnap.connectingUp;
+                console.log('[c3-warmentry]', JSON.stringify({
+                  f_c3_warmEntryNoReload,
+                  matrix: { warmLocal, warmCloud, warmBefore, warmAfter: warmSnap.siteLoadCount, connectingUp: warmSnap.connectingUp },
+                }));
+
+                // C3-hotfix-3 — f_c3_deadPageAlwaysCards: a main-frame failure of a
+                // NEVER-succeeded page gets the card whatever the code or net flag. Fresh
+                // hang ⇒ force an UNLISTED code (-2) with the net flag reading TRUE (the old
+                // condition: silence ⇒ white forever) ⇒ the offline card MUST appear;
+                // restore ⇒ success lifts it.
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined);
+                await sleep(300);
+                cloudCtl!.onSiteLoadFailed(-2, true, CLOUD_URL); // unlisted code + net flag true
+                const dpCard = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed'
+                    && (p.lastShow as { title?: string } | null)?.title === 'No internet — Cloud mode needs it';
+                }, 3000);
+                void cloudCtl!.siteDriveNavigate(CLOUD_URL).catch(() => undefined);
+                const dpLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.showing && p.collapsed && p.siteLoadOk;
+                }, 8000);
+                const f_c3_deadPageAlwaysCards = dpCard && dpLifted;
+                console.log('[c3-deadpage]', JSON.stringify({
+                  f_c3_deadPageAlwaysCards,
+                  matrix: { dpCard, dpLifted },
+                  raw: { forcedCode: -2, forcedIsMainFrame: true },
+                }));
+
+                // C3-hotfix-4 — f_c3_phantomFinishVetoed (THE KILLER). Chromium LIES: after a
+                // failed main-frame load the view holds the internal ERROR document
+                // (chrome-error://chromewebdata/, empty body — the c3autopsy probe) and a
+                // did-finish-load fires FOR IT ~5 ms after the failure (navtruth.js). The
+                // veto: a finish is only a success if NOTHING failed on the way. Fresh dead
+                // attempt ⇒ forced main-frame -105 ⇒ offline card + stamp ⇒ forced success
+                // (the phantom, via the REAL handler seam) ⇒ MUST be vetoed: no siteLoadOk,
+                // state stays entry-failed, veil stays up.
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined); // fresh attempt (resets the stamp)
+                await sleep(300);
+                cloudCtl!.onSiteLoadFailed(-105, true, CLOUD_URL); // main-frame verdict stamps the attempt
+                const phCard = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.veilUp && p.offlineState === 'entry-failed' && p.attemptFailed === true;
+                }, 3000);
+                cloudCtl!.onSiteLoadSucceeded(); // the ERROR document's phantom finish
+                await sleep(120); // any (wrong) lift/settle would land within this window
+                const phSnap = await statusSnap();
+                const f_c3_phantomFinishVetoed = phCard
+                  && phSnap.siteLoadOk === false
+                  && phSnap.offlineState === 'entry-failed'
+                  && phSnap.phantomFinishes === 1
+                  && phSnap.veilUp === true;
+                console.log('[c3-phantom]', JSON.stringify({
+                  f_c3_phantomFinishVetoed,
+                  matrix: { phCard },
+                  raw: {
+                    siteLoadOk: phSnap.siteLoadOk, offlineState: phSnap.offlineState,
+                    phantomFinishes: phSnap.phantomFinishes, veilUp: phSnap.veilUp,
+                    attemptFailed: phSnap.attemptFailed,
+                  },
+                }));
+
+                // C3-hotfix-4 — f_c3_realRecoveryAfterVeto: the veto must never become a NEW
+                // brick. Continue the EXACT phantom state: the real [Try again] button
+                // (statusDrive rides the real ipc path) starts a fresh attempt (resetting the
+                // stamp) and loads the true CLOUD_URL ⇒ a GENUINE finish is BELIEVED ⇒
+                // siteLoadOk true, state 'ok', veil lifted.
+                await cloudCtl!.statusDrive('retry');
+                const rvOk = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.showing && p.collapsed && p.siteLoadOk && !p.attemptFailed
+                    && p.offlineState === 'ok' && p.phantomFinishes === 1;
+                }, 12000);
+                const f_c3_realRecoveryAfterVeto = rvOk;
+                console.log('[c3-vetorecovery]', JSON.stringify({
+                  f_c3_realRecoveryAfterVeto,
+                  matrix: { rvOk },
+                }));
+
+                // C3-hotfix-4 — f_c3_subframeNeverStamps: sub-frame noise NEVER stamps the
+                // attempt (the same !isMainFrame guard that protects the watchdog) and never
+                // poisons a HEALTHY page — the site's next finish is still believed (not
+                // counted as a phantom).
+                cloudCtl!.onSiteLoadFailed(-3, false, CLOUD_URL); // sub-frame noise, healthy site
+                const sfNoiseSnap = await statusSnap();
+                cloudCtl!.onSiteLoadSucceeded(); // the site's genuine finish, after the noise
+                await sleep(120);
+                const sfSnap = await statusSnap();
+                const f_c3_subframeNeverStamps = sfNoiseSnap.attemptFailed === false
+                  && sfSnap.siteLoadOk === true && sfSnap.attemptFailed === false
+                  && sfSnap.phantomFinishes === 1;
+                console.log('[c3-subframe-stamp]', JSON.stringify({
+                  f_c3_subframeNeverStamps,
+                  matrix: { noiseStamped: sfNoiseSnap.attemptFailed },
+                  raw: {
+                    siteLoadOk: sfSnap.siteLoadOk, attemptFailed: sfSnap.attemptFailed,
+                    phantomFinishes: sfSnap.phantomFinishes,
+                  },
+                }));
+
+                // C3-hotfix-4 — f_c3_navResetReArmsSuccess (FIX B): a NEW main-frame
+                // same-origin navigation re-arms success — the error document emits NO
+                // navigation events (navtruth.js), so only a real load attempt (ours, or
+                // Chromium's own connectivity-restore auto-reload) can clear the stamp.
+                // Fired via the DEV seam, which calls the SAME navReArm the listener calls.
+                cloudCtl!.onSiteLoadFailed(-105, true, CLOUD_URL); // stamp a fresh failure
+                const nrStamped = (await statusSnap()).attemptFailed === true;
+                cloudCtl!.siteNavReArm(CLOUD_URL, true); // the FIX B reset (listener logic)
+                const nrReset = (await statusSnap()).attemptFailed === false;
+                cloudCtl!.onSiteLoadSucceeded(); // a following success is BELIEVED again
+                await sleep(120);
+                const nrSnap = await statusSnap();
+                const f_c3_navResetReArmsSuccess = nrStamped && nrReset
+                  && nrSnap.siteLoadOk === true && nrSnap.phantomFinishes === 1
+                  && nrSnap.offlineState === 'ok';
+                console.log('[c3-navreset]', JSON.stringify({
+                  f_c3_navResetReArmsSuccess,
+                  matrix: { nrStamped, nrReset },
+                  raw: {
+                    siteLoadOk: nrSnap.siteLoadOk, offlineState: nrSnap.offlineState,
+                    phantomFinishes: nrSnap.phantomFinishes,
+                  },
+                }));
+
+                // C3-hotfix-5 — THE HIDDEN LEGS (the owner's repro: flip to Local WHILE the
+                // load still hangs ⇒ the -105 fires AFTER the flip, while the site view is
+                // HIDDEN). hf5 FIX A — the STAMP is truth (main-frame ALWAYS, hidden
+                // included); only the VERDICT is UI (cloud-shown). phantomFinishes is a
+                // RUNNING counter across the stage — these legs assert DELTAS. Relay flips
+                // are programmatic (no transitionArmedAt stamp ⇒ instant, no melt —
+                // consistent with systemFlipNeverMelts / f_c2m_flipDissolve).
+                // f_c3_hiddenFailStillStamps (THE NEW KILLER): fresh hanging attempt → flip
+                // to Local → the hidden main-frame -105 → the stamp MUST still land, with
+                // NO verdict and NO card over Local (never veilUp/showing while hidden).
+                void cloudCtl!.siteDriveNavigate('https://192.0.2.1/').catch(() => undefined); // fresh attempt (resets stamp/truth)
+                await sleep(300); // the load hangs silently — flip out mid-flight (the owner's move)
+                let hidLocal = false;
+                for (let attempt = 0; attempt < 3 && !hidLocal; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'local');
+                  hidLocal = await waitFor(async () =>
+                    (await readModeSafe()) === 'local' && appMode === 'local', 2500, 50);
+                }
+                cloudCtl!.onSiteLoadFailed(-105, true, CLOUD_URL); // the HIDDEN -105 (fires after the flip)
+                await sleep(120);
+                const hidSnap = await statusSnap();
+                const f_c3_hiddenFailStillStamps = hidLocal
+                  && hidSnap.attemptFailed === true
+                  && hidSnap.siteLoadOk === false
+                  && hidSnap.offlineState === 'ok'
+                  && hidSnap.veilUp === false && hidSnap.showing === false;
+                console.log('[c3-hiddenfail]', JSON.stringify({
+                  f_c3_hiddenFailStillStamps,
+                  matrix: { hidLocal },
+                  raw: {
+                    attemptFailed: hidSnap.attemptFailed, siteLoadOk: hidSnap.siteLoadOk,
+                    offlineState: hidSnap.offlineState, veilUp: hidSnap.veilUp,
+                    showing: hidSnap.showing,
+                  },
+                }));
+
+                // C3-hotfix-5 — f_c3_hiddenPhantomVetoed (continue the EXACT state): the
+                // error document's phantom finish arrives while STILL hidden ⇒ the veto must
+                // kill it here too (the lie must not be believed any more than while shown).
+                const hpPfBefore = (await statusSnap()).phantomFinishes;
+                cloudCtl!.onSiteLoadSucceeded(); // the phantom finish (hidden)
+                await sleep(120);
+                const hpSnap = await statusSnap();
+                const f_c3_hiddenPhantomVetoed = hpSnap.siteLoadOk === false
+                  && hpSnap.attemptFailed === true
+                  && hpSnap.phantomFinishes === hpPfBefore + 1
+                  && hpSnap.offlineState === 'ok'
+                  && hpSnap.veilUp === false;
+                console.log('[c3-hiddenphantom]', JSON.stringify({
+                  f_c3_hiddenPhantomVetoed,
+                  matrix: { hpPfBefore },
+                  raw: {
+                    siteLoadOk: hpSnap.siteLoadOk, attemptFailed: hpSnap.attemptFailed,
+                    phantomFinishes: hpSnap.phantomFinishes, offlineState: hpSnap.offlineState,
+                    veilUp: hpSnap.veilUp,
+                  },
+                }));
+
+                // C3-hotfix-5 — f_c3_hiddenFailReentryRetries (the full heal, one leg): flip
+                // back to Cloud ⇒ show() sees the HONEST !siteLoadOk and RETRIES (hf2's FIX B
+                // finally firing on truthful bookkeeping — the owner's white-forever brick,
+                // healed) ⇒ the fresh attempt resets the stamp ⇒ the real CLOUD_URL loads ⇒
+                // lifted. Wi-Fi is ON in the dev env, so the retry load succeeds.
+                const hrScBefore = (await statusSnap()).siteLoadCount;
+                let hidCloud = false;
+                for (let attempt = 0; attempt < 3 && !hidCloud; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  hidCloud = await waitFor(async () =>
+                    (await readModeSafe()) === 'cloud' && appMode === 'cloud', 2500, 50);
+                }
+                const hrRetried = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.siteLoadCount > hrScBefore && p.attemptFailed === false;
+                }, 3000);
+                const hrLifted = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.siteLoadOk === true && !p.showing && p.collapsed
+                    && p.offlineState === 'ok';
+                }, 8000);
+                const f_c3_hiddenFailReentryRetries = hidCloud && hrRetried && hrLifted;
+                console.log('[c3-hiddenreentry]', JSON.stringify({
+                  f_c3_hiddenFailReentryRetries,
+                  matrix: { hidCloud, hrRetried, hrLifted },
+                  raw: { hrScBefore },
+                }));
+
+                // PACKAGING-1 — f_pac_frameFollowsTheme: the native shell follows the app
+                // theme. Driven through the REAL settings IPC (renderer bridge →
+                // vault:settingsSet → the FIX A seam), never manager.setSettings, so the exact
+                // production route is proven. nativeTheme.shouldUseDarkColors is the
+                // main-process truth Windows tints the frame from. No WSLg visual assert is
+                // possible — the real title-bar color check is on the owner's Windows list.
+                const pacPrevTheme = manager.getSettings().theme;
+                await win.webContents.executeJavaScript('dropsync.vault.settingsSet({ theme: "dark" })');
+                const pacDark = nativeTheme.shouldUseDarkColors === true && nativeTheme.themeSource === 'dark';
+                await win.webContents.executeJavaScript('dropsync.vault.settingsSet({ theme: "light" })');
+                const pacLight = nativeTheme.shouldUseDarkColors === false && nativeTheme.themeSource === 'light';
+                // Restore through the SAME real IPC (the f_c2j leg's manager-level restore
+                // cannot re-sync the shell) so settings AND themeSource both end at prevTheme.
+                await win.webContents.executeJavaScript(
+                  `dropsync.vault.settingsSet({ theme: ${JSON.stringify(pacPrevTheme)} })`
+                );
+                const f_pac_frameFollowsTheme = pacDark && pacLight;
+                console.log('[pac-frame]', JSON.stringify({
+                  f_pac_frameFollowsTheme,
+                  matrix: { pacPrevTheme, pacDark, pacLight, restoredSource: nativeTheme.themeSource },
+                }));
+
+                // ==== PAC-2 — the four defect-fix leg families ==================================
+
+                // f_pac2_menuRemoved — the default Electron menu is GONE (FIX A). menuNull
+                // rides the battery's DEV probe print (the battery is IN main, so
+                // Menu.getApplicationMenu() IS the probe surface).
+                const menuNull = Menu.getApplicationMenu() === null;
+                const f_pac2_menuRemoved = menuNull;
+                console.log('[pac2-menu]', JSON.stringify({ f_pac2_menuRemoved, menuNull }));
+
+                // f_pac2_notificationsAllowed — the doorman's notifications gate opens, all
+                // four directions (FIX C); the media/geo keys stay asserted (carried doorman
+                // truth must not drift while the allowlist grows).
+                const door2 = await cloudCtl!.doormanProbe();
+                const f_pac2_notificationsAllowed = door2.checkNotifications === true
+                  && door2.notificationsSite === true && door2.notificationsEvil === false
+                  && door2.notificationsEvilReq === false
+                  && door2.mediaSite === true && door2.mediaEvil === false
+                  && door2.geoSite === false && door2.checkMediaSite === true
+                  && door2.checkMediaEvil === false;
+                console.log('[pac2-notif]', JSON.stringify({ f_pac2_notificationsAllowed, door: door2 }));
+
+                // f_pac2_probeKnock — THE KNOCK (FIX D). All four legs drive the state machine
+                // through SEAMS ONLY (netOverride / probe-override / the real forced-fail
+                // handler) so the real WSL network's flaps (-106/-118 seen in run 1) cannot
+                // race the asserts.
+                cloudCtl!.setNetOverride(true);
+                cloudCtl!.setReachProbeOverride(async () => 'dead');
+                const knockScBefore = (await statusSnap()).reloadCount;
+                const knockT0 = Date.now();
+                // (A) THE KILLER: the flag claims online, the knock says dead twice ⇒ the
+                //     EXACT degraded chip, no veil, NO reload — the flag lie is caught.
+                let degradeAt = -1;
+                const knockDegraded = await waitFor(async () => {
+                  const p = await statusSnap();
+                  if (p.offlineState === 'degraded' && degradeAt < 0) degradeAt = Date.now() - knockT0;
+                  return p.offlineState === 'degraded';
+                }, 16000, 100);
+                const knockSnap = await statusSnap();
+                const chipExact = JSON.stringify(knockSnap.lastShow) === JSON.stringify({
+                  kind: 'offline', label: 'Waiting for internet…', pulse: true, action: 'switch-local',
+                });
+                const f_pac2_probeKnockA = knockDegraded && chipExact && knockSnap.veilUp === false
+                  && knockSnap.reloadCount === knockScBefore && knockSnap.probeHealthy === false;
+                // (B) recovery: the knock says alive ⇒ probeHealthy true ⇒ the degraded branch
+                //     recovers ('✓ Back online', chip collapsed, still no reload). Sampled so
+                //     a failure names the stuck link (probe verdict vs offlineTick recovery).
+                cloudCtl!.setReachProbeOverride(async () => 'alive');
+                const bTrace: Array<{ t: number; s: string; ph: boolean | null; pm: number; v: boolean }> = [];
+                const knockRecovered = await waitFor(async () => {
+                  const p = await statusSnap();
+                  bTrace.push({ t: Date.now() - knockT0, s: p.offlineState, ph: p.probeHealthy, pm: p.probeMisses, v: p.veilUp });
+                  return p.offlineState === 'ok';
+                }, 20000, 500);
+                const recSnap = await statusSnap();
+                // The flash is a PRESENTATION: the ✓-chip stays up STATUS_FLASH_MS, THEN the
+                // native footprint collapses — so the collapse is waited for, not snapshotted
+                // (run-1/run-2 lesson: at recSnap time the chip is still flashing, not 0×0).
+                const flashOk = recSnap.lastHideFlash === '✓ Back online';
+                const collapsedAfterFlash = await waitFor(async () =>
+                  (await statusSnap()).collapsed, 6000, 100);
+                const f_pac2_probeKnockB = knockRecovered && flashOk && collapsedAfterFlash
+                  && recSnap.reloadCount === knockScBefore;
+                // (C) the flag-truth path unchanged: flag false ⇒ degraded via the EXISTING
+                //     net-flag path (the knock says alive — the chip is the flag's verdict);
+                //     flag back ⇒ the probe's alive re-opens recovery.
+                cloudCtl!.setNetOverride(false);
+                const flagDegraded = await waitFor(async () =>
+                  (await statusSnap()).offlineState === 'degraded', 6000, 100);
+                cloudCtl!.setNetOverride(null);
+                const flagRecovered = await waitFor(async () =>
+                  (await statusSnap()).offlineState === 'ok', 16000, 100);
+                const f_pac2_probeKnockC = flagDegraded && flagRecovered;
+                // (D) veil protection — deterministic: force the entry-failed veil (flag dead +
+                //     the REAL forced -105 handler), hold it under the dead knock, then flip the
+                //     flag ⇒ the C3 recovery reload owns the room (connectingUp true + veil up)
+                //     and STILL nothing changes until the load itself lands.
+                cloudCtl!.setReachProbeOverride(async () => 'dead');
+                cloudCtl!.setNetOverride(false);
+                cloudCtl!.onSiteLoadFailed(-105, true, CLOUD_URL); // the REAL handler ⇒ the veil
+                await sleep(800);
+                const dVeil = await statusSnap(); // entry-failed HELD under a dead knock
+                cloudCtl!.setNetOverride(true); // flag up ⇒ the C3 auto-recovery (within 2 s)
+                const dConnecting = await waitFor(async () =>
+                  (await statusSnap()).connectingUp === true, 8000, 50);
+                let dClean = true; // sample the connecting window: the probe must move NOTHING
+                const dT0 = Date.now();
+                while (Date.now() - dT0 < 2000) {
+                  const p = await statusSnap();
+                  if (p.offlineState === 'degraded' || p.probeHealthy === false) { dClean = false; break; }
+                  if (p.offlineState === 'ok' && !p.connectingUp) break; // fast load lifted it — fine
+                  await sleep(100);
+                }
+                const dConnSnap = await statusSnap();
+                const f_pac2_probeKnockD = dVeil.offlineState === 'entry-failed'
+                  && dVeil.probeHealthy !== false && dConnecting && dClean
+                  && dConnSnap.offlineState !== 'degraded' && dConnSnap.probeHealthy !== false;
+                // restore: the recovery reload was the REAL CLOUD_URL ⇒ the site heals itself;
+                // the overrides die here so the picker legs run on truth.
+                cloudCtl!.setReachProbeOverride(null);
+                cloudCtl!.setNetOverride(null);
+                const knockHealed = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.siteLoadOk === true && p.offlineState === 'ok' && !p.showing;
+                }, 20000, 100);
+                const f_pac2_probeKnock = f_pac2_probeKnockA && f_pac2_probeKnockB
+                  && f_pac2_probeKnockC && f_pac2_probeKnockD && knockHealed;
+                console.log('[pac2-knock]', JSON.stringify({
+                  f_pac2_probeKnock,
+                  matrix: {
+                    A: f_pac2_probeKnockA, B: f_pac2_probeKnockB, C: f_pac2_probeKnockC,
+                    D: f_pac2_probeKnockD, knockHealed, chipExact,
+                    degradeMs: degradeAt, dConnecting, dClean,
+                    dVeilRaw: { s: dVeil.offlineState, ph: dVeil.probeHealthy },
+                    dConnRaw: { s: dConnSnap.offlineState, c: dConnSnap.connectingUp, ph: dConnSnap.probeHealthy },
+                    bTraceTail: bTrace.slice(-8),
+                  },
+                }));
+
+                // f_pac2_sharePicker — OUR picker (FIX B).
+                const spBase = cloudCtl!.shareProbe().settleCount;
+                // (i) evil origin: no window ever, settled EXACTLY once, empty.
+                await cloudCtl!.sharePickerTest({ securityOrigin: 'https://evil.example' });
+                const spEvil = cloudCtl!.shareProbe();
+                const f_pac2_shareEvil = spEvil.open === false && spEvil.settleCount === spBase + 1
+                  && spEvil.lastVideoId === null && spEvil.lastVerdictAudio === undefined;
+                // (ii) open: window visible + the page rendered EXACTLY sourcesSent cards.
+                await cloudCtl!.sharePickerTest();
+                const spOpened = await waitFor(async () => {
+                  const p = cloudCtl!.shareProbe();
+                  return p.open && p.sourcesSent > 0;
+                }, 10000, 100);
+                type PickerRenderProbe = { cards: number; screens: number; windows: number; empty: boolean; theme: string; audioRowOn: boolean };
+                let pageRender: PickerRenderProbe | null = null;
+                for (let i = 0; i < 24 && !pageRender; i++) {
+                  await sleep(250);
+                  // pickerEval returns the expression's value — a STRING (JSON.stringify);
+                  // parse it before reading fields (the run-1 lesson: strings have no .cards).
+                  const raw = await cloudCtl!.pickerEval<string>(
+                    'JSON.stringify({ cards: document.querySelectorAll(".src").length,'
+                    + ' screens: document.querySelectorAll("#screens .src").length,'
+                    + ' windows: document.querySelectorAll("#windows .src").length,'
+                    + ' empty: document.getElementById("empty").style.display !== "none",'
+                    + ' theme: document.documentElement.getAttribute("data-picker-theme"),'
+                    + ' audioRowOn: document.getElementById("audioRow").classList.contains("on") })'
+                  );
+                  const p = JSON.parse(raw) as PickerRenderProbe;
+                  if (p.cards > 0) pageRender = p;
+                }
+                const spOpen = cloudCtl!.shareProbe();
+                const renderExact = !!pageRender && pageRender.cards === spOpen.sourcesSent
+                  && pageRender.screens + pageRender.windows === pageRender.cards
+                  && pageRender.theme !== null && pageRender.audioRowOn === spOpen.canLoopback;
+                // checkbox persistence (page contract): toggle ⇒ localStorage remembers.
+                const persistRaw = await cloudCtl!.pickerEval<string>(
+                  'JSON.stringify((function(){ var c = document.getElementById("audioChk");'
+                  + ' c.checked = true; c.dispatchEvent(new Event("change"));'
+                  + ' var v1 = localStorage.getItem("dropsync.picker.audio");'
+                  + ' c.checked = false; c.dispatchEvent(new Event("change"));'
+                  + ' var v2 = localStorage.getItem("dropsync.picker.audio");'
+                  + ' return { v1: v1, v2: v2 }; })())'
+                );
+                const persist = JSON.parse(persistRaw) as { v1: string | null; v2: string | null };
+                const audioPersist = persist.v1 === 'true' && persist.v2 === 'false';
+                const f_pac2_shareOpen = spOpened && renderExact && spOpen.open && audioPersist;
+                // (iii) pick: settled once, video id matches, verdict audio per the loopback
+                // gate — first with the checkbox OFF, then with the relay carrying true.
+                const firstId = await cloudCtl!.pickerEval<string | null>(
+                  'var c = document.querySelector(".src"); c ? c.dataset.id : null'
+                );
+                cloudCtl!.sharePickerPick(String(firstId), false);
+                const spPick = cloudCtl!.shareProbe();
+                const f_pac2_sharePick = spPick.settleCount === spBase + 2
+                  && spPick.lastVideoId === firstId && spPick.lastAudio === false
+                  && spPick.lastVerdictAudio === undefined && spPick.open === false;
+                await cloudCtl!.sharePickerTest(); // fresh request for the audio leg
+                const spOpened2 = await waitFor(async () => cloudCtl!.shareProbe().open, 10000, 100);
+                const firstId2 = await cloudCtl!.pickerEval<string | null>(
+                  'var c = document.querySelector(".src"); c ? c.dataset.id : null'
+                );
+                cloudCtl!.sharePickerPick(String(firstId2), true);
+                const spPick2 = cloudCtl!.shareProbe();
+                // The verdict formula, evaluated with THIS platform's canLoopback: win32 ⇒
+                // 'loopback'; elsewhere (this WSL battery) ⇒ undefined. The formula itself is
+                // what the battery proves — the win32 sound outcome is the owner's hands-on.
+                const loopbackExpected = spPick2.canLoopback ? 'loopback' as const : undefined;
+                const f_pac2_shareAudio = spOpened2 && spPick2.settleCount === spBase + 3
+                  && spPick2.lastAudio === true && spPick2.lastVerdictAudio === loopbackExpected;
+                // (iv) cancel: settled EXACTLY once, empty, window gone.
+                await cloudCtl!.sharePickerTest();
+                const spOpened3 = await waitFor(async () => cloudCtl!.shareProbe().open, 10000, 100);
+                cloudCtl!.sharePickerCancel();
+                const spCancel = cloudCtl!.shareProbe();
+                // (iv-b) settle-once insurance — a LATE duplicate cancel (double-Esc / cancel
+                // racing the window's own close) must NOT settle again: the count holds at
+                // base+4. This is the exact path the RED pair drives (the guard removed
+                // ⇒ +5 ⇒ key false); with the guard the duplicate is a loud no-op.
+                cloudCtl!.sharePickerCancel();
+                const spCancel2 = cloudCtl!.shareProbe();
+                const f_pac2_shareCancel = spOpened3 && spCancel.settleCount === spBase + 4
+                  && spCancel.lastVideoId === null && spCancel.open === false
+                  && spCancel2.settleCount === spBase + 4;
+                const f_pac2_sharePicker = f_pac2_shareEvil && f_pac2_shareOpen
+                  && f_pac2_sharePick && f_pac2_shareAudio && f_pac2_shareCancel;
+                console.log('[pac2-picker]', JSON.stringify({
+                  f_pac2_sharePicker,
+                  matrix: {
+                    evil: f_pac2_shareEvil, open: f_pac2_shareOpen, pick: f_pac2_sharePick,
+                    audio: f_pac2_shareAudio, cancel: f_pac2_shareCancel, audioPersist,
+                  },
+                  raw: {
+                    spBase, pageRender, persist,
+                    evil: spEvil, openProbe: { sourcesSent: spOpen.sourcesSent, canLoopback: spOpen.canLoopback },
+                    pick: { video: spPick.lastVideoId, verdict: spPick.lastVerdictAudio ?? null },
+                    pick2: { audio: spPick2.lastAudio, verdict: spPick2.lastVerdictAudio ?? null, canLoopback: spPick2.canLoopback },
+                    cancel: { video: spCancel.lastVideoId },
+                    cancel2: { count: spCancel2.settleCount },
+                  },
+                }));
+
+                // ==== PAC-4 — THE CORNERSTONE (repair-order-pac4-cornerstone.md) ==============
+
+                // f_pac4_trailingSlashOrigin — FIX A's leg: THE leg that would have caught the
+                // owner-diary bug. Real Chromium's securityOrigin carries a TRAILING SLASH
+                // ('https://drag-drop-app.vercel.app/') while CLOUD_ORIGIN has none — the old
+                // raw-string guard refused OUR OWN SITE on every real share click (the dev
+                // battery always passed the exact constant, so only this synthetic trailing
+                // slash can exercise the real shape). The trailing-slash origin must OPEN the
+                // picker (window visible, sources sent) and a pick must settle with the chosen
+                // source; the evil origin must STILL deny exactly once, empty.
+                {
+                  const pac4Base = cloudCtl!.shareProbe().settleCount;
+                  await cloudCtl!.sharePickerTest({ securityOrigin: CLOUD_ORIGIN + '/' });
+                  const pac4Opened = await waitFor(async () => {
+                    const p = cloudCtl!.shareProbe();
+                    return p.open && p.sourcesSent > 0;
+                  }, 10000, 100);
+                  // RED-shape safety: with the guard reverted the window never opens, so
+                  // pickerEval would THROW and kill the stage — the leg must REPORT false, not
+                  // crash. A missing window just means no pick; opened=false already fails the leg.
+                  let pac4Id: string | null = null;
+                  try {
+                    pac4Id = await cloudCtl!.pickerEval<string | null>(
+                      'var c = document.querySelector(".src"); c ? c.dataset.id : null'
+                    );
+                  } catch {
+                    pac4Id = null;
+                  }
+                  if (pac4Id !== null) cloudCtl!.sharePickerPick(String(pac4Id), false);
+                  const pac4Pick = cloudCtl!.shareProbe();
+                  const slashOpensAndPicks = pac4Opened && pac4Pick.settleCount === pac4Base + 1
+                    && pac4Pick.lastVideoId === pac4Id && pac4Pick.open === false;
+                  await cloudCtl!.sharePickerTest({ securityOrigin: 'https://evil.example' });
+                  const pac4Evil = cloudCtl!.shareProbe();
+                  const evilStillDenied = pac4Evil.open === false
+                    && pac4Evil.settleCount === pac4Base + 2 && pac4Evil.lastVideoId === null;
+                  const f_pac4_trailingSlashOrigin = slashOpensAndPicks && evilStillDenied;
+                  console.log('[pac4-slash]', JSON.stringify({
+                    f_pac4_trailingSlashOrigin,
+                    matrix: { slashOpensAndPicks, evilStillDenied },
+                    raw: { opened: pac4Opened, pick: { id: pac4Pick.lastVideoId, count: pac4Pick.settleCount },
+                      evil: { count: pac4Evil.settleCount, video: pac4Evil.lastVideoId, open: pac4Evil.open } },
+                  }));
+                }
+
+                // ==== PAC-5 — THE HONEST HANDOFF (repair-order-pac5-permanent-stage.md) =====
+
+                // f_pac5_shareVerdictOmitsAudioKey — FIX D leg 4: the verdict's OWN-PROPERTY
+                // keys, captured by the DEV mock callback (shareProbe.lastVerdictKeys). An
+                // unticked pick must hand the site a verdict whose keys are EXACTLY ['video'] —
+                // the old { video, audio: undefined } verdict (keys ['video','audio'] with an
+                // undefined value) is the proven root cause of the unticked-share failure.
+                // The DEV-only assumeWin32 opt forces the loopback branch so the ticked shape
+                // (keys ['video','audio'], value 'loopback') is provable on Linux too; the NEXT
+                // request recomputes canLoopback from the platform (the production truth).
+                // RED: the 1.0.3 verdict shape ⇒ unticked keys ['video','audio'] (audio
+                // undefined) ⇒ the EXACT-equality assert fails.
+                {
+                  const pac5Base = cloudCtl!.shareProbe().settleCount;
+                  await cloudCtl!.sharePickerTest();
+                  const p5Opened = await waitFor(async () => {
+                    const p = cloudCtl!.shareProbe();
+                    return p.open && p.sourcesSent > 0;
+                  }, 10000, 100);
+                  let p5Id: string | null = null;
+                  try {
+                    p5Id = await cloudCtl!.pickerEval<string | null>(
+                      'var c = document.querySelector(".src"); c ? c.dataset.id : null'
+                    );
+                  } catch { p5Id = null; }
+                  if (p5Id !== null) cloudCtl!.sharePickerPick(String(p5Id), false);
+                  const p5Unticked = cloudCtl!.shareProbe();
+                  const untickedVideoOnly = p5Opened && p5Unticked.settleCount === pac5Base + 1
+                    && !!p5Unticked.lastVerdictKeys
+                    && p5Unticked.lastVerdictKeys!.length === 1 && p5Unticked.lastVerdictKeys![0] === 'video';
+                  await cloudCtl!.sharePickerTest({ assumeWin32: true });
+                  const p5Opened2 = await waitFor(async () => cloudCtl!.shareProbe().open, 10000, 100);
+                  let p5Id2: string | null = null;
+                  try {
+                    p5Id2 = await cloudCtl!.pickerEval<string | null>(
+                      'var c = document.querySelector(".src"); c ? c.dataset.id : null'
+                    );
+                  } catch { p5Id2 = null; }
+                  if (p5Id2 !== null) cloudCtl!.sharePickerPick(String(p5Id2), true);
+                  const p5Ticked = cloudCtl!.shareProbe();
+                  const tickedLoopback = p5Opened2 && p5Ticked.settleCount === pac5Base + 2
+                    && !!p5Ticked.lastVerdictKeys
+                    && p5Ticked.lastVerdictKeys!.length === 2 && p5Ticked.lastVerdictKeys![0] === 'video'
+                    && p5Ticked.lastVerdictKeys![1] === 'audio'
+                    && p5Ticked.lastVerdictAudio === 'loopback';
+                  // Recompute-truth insurance: a fresh request resets canLoopback to the
+                  // platform's answer (false on this Linux battery) — assumeWin32 never sticks.
+                  await cloudCtl!.sharePickerTest();
+                  const p5Opened3 = await waitFor(async () => cloudCtl!.shareProbe().open, 10000, 100);
+                  cloudCtl!.sharePickerCancel();
+                  const p5Reset = cloudCtl!.shareProbe();
+                  const recomputeHeld = p5Opened3 && p5Reset.canLoopback === false
+                    && p5Reset.settleCount === pac5Base + 3;
+                  const f_pac5_shareVerdictOmitsAudioKey = untickedVideoOnly && tickedLoopback && recomputeHeld;
+                  console.log('[pac5-verdict]', JSON.stringify({
+                    f_pac5_shareVerdictOmitsAudioKey,
+                    matrix: { untickedVideoOnly, tickedLoopback, recomputeHeld },
+                    raw: { unticked: { keys: p5Unticked.lastVerdictKeys }, ticked: { keys: p5Ticked.lastVerdictKeys, audio: p5Ticked.lastVerdictAudio }, reset: { canLoopback: p5Reset.canLoopback } },
+                  }));
+                }
+
+                // f_pac5_shareEndToEndVideoOnly — FIX D leg 5, THE KILLER: the only leg that
+                // resolves a REAL display-media promise through Chromium's own reply validator
+                // (every prior battery answered the picker with a mock callback, which accepts
+                // anything — exactly why the undefined-audio-key bug slipped every round). A
+                // hidden battery window on the cloud PARTITION loads a small local fixture page
+                // (file:// is a secure context — probe-proven, /tmp/opencode/shareprobe) whose
+                // getDisplayMedia({video, audio:{...}}) request is handled by the REAL
+                // openSharePicker; sharePickerPick answers; the page promise must RESOLVE with
+                // 1 video track / 0 audio tracks. RED: the { audio: undefined } verdict ⇒ the
+                // page rejects AbortError (probe-reproduced on Linux 2026-08-31, mode D).
+                {
+                  const e2eWinBefore = BrowserWindow.getAllWindows().length;
+                  const fixturePath = join(tmpdir(), 'pac5-e2e-fixture.html');
+                  writeFileSync(fixturePath, '<!doctype html><meta charset="utf-8"><title>pac5 e2e fixture</title><body>fixture</body>', 'utf8');
+                  const e2eWin = new BrowserWindow({
+                    show: false,
+                    webPreferences: {
+                      partition: 'persist:cloud', // the session the display-media handler lives on
+                      sandbox: true,
+                      contextIsolation: true,
+                      nodeIntegration: false,
+                    },
+                  });
+                  e2eWin.setMenu(null);
+                  await e2eWin.loadURL('file://' + fixturePath);
+                  // The REAL request (userGesture: true — the same gate the guard demands):
+                  // store the outcome on the window, then poll it (executeJavaScript's own
+                  // promise resolution would wedge the battery on a hung share).
+                  void e2eWin.webContents.executeJavaScript(
+                    `window.__pac5e2e = 'pending';
+                     navigator.mediaDevices.getDisplayMedia({ video: true,
+                       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
+                       .then(function (s) {
+                         window.__pac5e2e = JSON.stringify({ ok: true,
+                           video: s.getVideoTracks().length, audio: s.getAudioTracks().length });
+                         s.getTracks().forEach(function (t) { t.stop(); });
+                       })
+                       .catch(function (e) {
+                         window.__pac5e2e = JSON.stringify({ ok: false, name: e && e.name,
+                           msg: String(e && e.message).slice(0, 200) });
+                       });`, true /* userGesture */).catch(() => undefined);
+                  // The REAL openSharePicker handles the page's request: the picker must open.
+                  const e2eOpened = await waitFor(async () => {
+                    const p = cloudCtl!.shareProbe();
+                    return p.open && p.sourcesSent > 0;
+                  }, 15000, 100);
+                  // Pick the first SCREEN source (a real capturable stream on WSLg); fall back
+                  // to the literal first source when no screen exists.
+                  let e2ePickId: string | null = null;
+                  try {
+                    e2ePickId = await cloudCtl!.pickerEval<string | null>(
+                      'var c = document.querySelector("#screens .src") || document.querySelector(".src"); c ? c.dataset.id : null'
+                    );
+                  } catch { e2ePickId = null; }
+                  if (e2ePickId !== null) cloudCtl!.sharePickerPick(String(e2ePickId), false);
+                  // The page promise must RESOLVE with 1 video / 0 audio (a clean VIDEO-ONLY
+                  // share — §3.5: no dummy audio track).
+                  let e2eResult: { ok: boolean; video?: number; audio?: number; name?: string; msg?: string } | null = null;
+                  const e2eT0 = Date.now();
+                  while (Date.now() - e2eT0 < 20000) {
+                    const raw = await e2eWin.webContents.executeJavaScript('window.__pac5e2e === "pending" ? "pending" : window.__pac5e2e')
+                      .then((s) => String(s));
+                    if (raw !== 'pending') { e2eResult = JSON.parse(raw); break; }
+                    await sleep(100);
+                  }
+                  const e2eResolved = !!e2eResult && e2eResult.ok === true
+                    && e2eResult.video === 1 && e2eResult.audio === 0;
+                  const e2eClosed = await (async (): Promise<boolean> => {
+                    if (!e2eWin.isDestroyed()) e2eWin.destroy();
+                    for (let i = 0; i < 10 && BrowserWindow.getAllWindows().length > e2eWinBefore; i++) await sleep(100);
+                    return BrowserWindow.getAllWindows().length === e2eWinBefore;
+                  })();
+                  const f_pac5_shareEndToEndVideoOnly = e2eOpened && e2eResolved && e2eClosed;
+                  console.log('[pac5-e2e]', JSON.stringify({
+                    f_pac5_shareEndToEndVideoOnly,
+                    matrix: { e2eOpened, e2eResolved, e2eClosed },
+                    raw: { picked: e2ePickId, result: e2eResult, settle: cloudCtl!.shareProbe().settleCount },
+                  }));
+                }
+
+                // ==== PAC-3 — THE STEADY CURTAIN (repair-order-pac3-steady-curtain.md) ========
+
+                // f_pac3_curtainPresentAck — FIX A's leg: the curtain reports ready only after
+                // the page's TWO-rAF SUBMISSION ack (rafTicksAtReady ≥ 2, read from the
+                // __c2mFader fixture via faderProbe.page), on a REAL user-armed Cloud→Local
+                // melt — the C2m meltLeg pattern (the pill:flip handler's exact arm write +
+                // the real relay; production CLICK arming is covered by f_c2g_realClickFlips).
+                // Cloud→Local is THE direction the fix targets (the investigation's cause 1:
+                // the curtain-vs-removal race). Covered-swap truth re-asserted here AND carried
+                // by f_c2m_flipDissolve (the regression gate, which MUST stay green).
+                {
+                  // premise enforcement: the melt legs above left us in Cloud (knockHealed);
+                  // a relay flip re-syncs both sides if anything drifted.
+                  if (appMode !== 'cloud') {
+                    win.webContents.send('pill:flipRequested', 'cloud');
+                    await sleep(1800);
+                  }
+                  const pac3WasCloud = appMode === 'cloud';
+                  transitionArmedAt = Date.now(); // the pill:flip handler's exact arm write
+                  win.webContents.send('pill:flipRequested', 'local');
+                  let coveredSwap = false;
+                  const ackT0 = Date.now();
+                  while (Date.now() - ackT0 < 1000) { // curtain-up window (decode+ack+pad+fade)
+                    const p = await cloudCtl!.faderProbe();
+                    if (p.inFlight && p.attached
+                      && p.bounds !== null && Math.abs(p.bounds.width - win.getContentBounds().width) <= 2) {
+                      coveredSwap = appMode === 'cloud'; // curtain BEFORE the swap ⇒ no peek
+                      break;
+                    }
+                    await sleep(25);
+                  }
+                  let ackSettled = false;
+                  const ackT1 = Date.now();
+                  while (Date.now() - ackT1 < 2500) { // settle: fade + done-delay + collapse
+                    const p = await cloudCtl!.faderProbe();
+                    if (!p.inFlight && p.collapsed && p.attached) { ackSettled = true; break; }
+                    await sleep(25);
+                  }
+                  const ackPage = (await cloudCtl!.faderProbe()).page;
+                  const f_pac3_curtainPresentAck = pac3WasCloud && coveredSwap && ackSettled
+                    && ackPage !== null && ackPage.rafTicksAtReady >= 2
+                    && Array.isArray(ackPage.readyRafAt) && ackPage.readyRafAt.length === 2
+                    && ackPage.readyRafAt.every((t) => t > 0)
+                    && ackPage.readyRafAt[1] >= ackPage.readyRafAt[0];
+                  console.log('[pac3-curtain]', JSON.stringify({
+                    f_pac3_curtainPresentAck,
+                    matrix: {
+                      pac3WasCloud, coveredSwap, ackSettled,
+                      rafTicksAtReady: ackPage?.rafTicksAtReady ?? -1,
+                      readyRafAt: ackPage?.readyRafAt ?? null,
+                    },
+                  }));
+                }
+
+                // f_pac3_noBlankOnEntry — FIX B's leg: from-rest Style-B entries paint the REST
+                // circle, NEVER the hotfix-5 blank gate — ZERO hidden ticks at PAGE frame rate
+                // (the investigation's pillscan/rAF-sampler method, adapted into the battery):
+                // a rAF sampler inside the pill page watches #pillB's computed visibility
+                // across each entry. ≥10 fresh entries, each from TRUE rest — PAC-5: the page's
+                // own rest truth (bloomed class gone; the old `innerWidth === 28` room gate no
+                // longer exists — the stage is permanent), cursor away well past the 90 ms
+                // hysteresis. (The choreography this leg guarded is DELETED in PAC-5 — the leg
+                // now proves the replacement one-path entry is just as blank-free.)
+                {
+                  const g3 = cloudCtl!;
+                  const styleBefore3 = (await g3.pillProbe()).style;
+                  const truth3 = (): Promise<{ style: string; bloomed: boolean } | null> =>
+                    g3.pillEval('JSON.stringify(window.__c2gPill || null)').then((s) => JSON.parse(s as string) as { style: string; bloomed: boolean } | null);
+                  if ((await truth3())?.style !== 'B') {
+                    await g3.pillDrive('contextmenu'); // → B (the REAL toggle path)
+                    await sleep(400);
+                  }
+                  const entries3: Array<{ i: number; ticks: number; hidden: number; bloomed: boolean; fromRest: boolean }> = [];
+                  for (let i = 0; i < 12; i++) {
+                    await g3.pillDrive('mouseleave'); // collapse (no-op if already at rest)
+                    let fromRest = false;
+                    const tr0 = Date.now();
+                    // PAC-5 — the room is PERMANENT (innerWidth is ALWAYS 132), so the old
+                    // "room back to 28" true-rest gate is replaced by the page's own rest
+                    // truth: the bloomed class gone (the collapse ran its full hysteresis).
+                    while (Date.now() - tr0 < 4000) { // wait for TRUE rest (page at rest)
+                      const t3 = await truth3();
+                      if (t3 && t3.bloomed === false) { fromRest = true; break; }
+                      await sleep(60);
+                    }
+                    await sleep(350); // cursor-away margin (hysteresis 90 ms long since passed)
+                    // Install the sampler (read-only, OUR page; a generation token retires any
+                    // previous loop so ticks can never double-count).
+                    await g3.pillEval(`(function(){
+                      var gen = (window.__pac3gen = (window.__pac3gen || 0) + 1);
+                      window.__pac3scan = { ticks: [], on: true, gen: gen };
+                      (function scan(){
+                        if (!window.__pac3scan || window.__pac3scan.gen !== gen || !window.__pac3scan.on) return;
+                        var p = document.getElementById('pillB');
+                        var hidden = !p || getComputedStyle(p).visibility === 'hidden';
+                        window.__pac3scan.ticks.push(hidden ? 1 : 0);
+                        requestAnimationFrame(scan);
+                      })();
+                      return true; })()`);
+                    await g3.pillDrive('mouseenter'); // THE fresh from-rest entry
+                    await sleep(400); // bloom (0.55 s) underway — no reveal gate exists anymore
+                    const scan3 = JSON.parse(await g3.pillEval(`(function(){
+                      window.__pac3scan.on = false;
+                      return JSON.stringify({ ticks: window.__pac3scan.ticks.length,
+                        hidden: window.__pac3scan.ticks.filter(function (t) { return t === 1; }).length,
+                        bloomed: !!(window.__c2gPill && window.__c2gPill.bloomed) }); })()`)) as { ticks: number; hidden: number; bloomed: boolean };
+                    entries3.push({ i, ticks: scan3.ticks, hidden: scan3.hidden, bloomed: scan3.bloomed, fromRest });
+                    await sleep(500); // bloom settles before the next collapse
+                  }
+                  if (styleBefore3 === 'A' && (await truth3())?.style === 'B') {
+                    await g3.pillDrive('contextmenu'); // restore the pre-leg style
+                    await sleep(400);
+                  }
+                  const f_pac3_noBlankOnEntry = entries3.length >= 10
+                    && entries3.every((e) => e.fromRest && e.bloomed && e.hidden === 0);
+                  console.log('[pac3-blink]', JSON.stringify({
+                    f_pac3_noBlankOnEntry,
+                    matrix: {
+                      entries: entries3.length,
+                      allFromRest: entries3.every((e) => e.fromRest),
+                      allBloomed: entries3.every((e) => e.bloomed),
+                      styleBefore: styleBefore3,
+                    },
+                    raw: entries3,
+                  }));
+                }
+
+                // f_pac5_stageNeverMoves — FIX D leg 1 (replaces f_pac4_roomOriginFixed's
+                // transient-room assertions): THE PERMANENT STAGE law. The room is sized once
+                // per style and NEVER changes at runtime — no width/height swaps, no origin
+                // moves (zero moves is a STRONGER twitch guarantee than PAC-4's origin-fixed
+                // growth). Sampled on the REAL paths: 20 real-click flips (Style A) and 10
+                // hover bloom/collapse cycles (Style B), bounds read on every available tick,
+                // EVERY sample equal to the style's constant stage EXACTLY —
+                // A (center−70, 10, 140, 28); B (center−66, 2, 132, 44).
+                // RED: reintroduce any transient branch or width-only growth ⇒ a change is detected.
+                {
+                  const g4 = cloudCtl!;
+                  const cw0 = win.getContentBounds().width;
+                  const stageA: [number, number, number, number] =
+                    [Math.round((cw0 - (PILL_W + PILL_A_ROOM_PAD_X * 2)) / 2), PILL_TOP,
+                      PILL_W + PILL_A_ROOM_PAD_X * 2, PILL_H];
+                  const stageB: [number, number, number, number] =
+                    [Math.round((cw0 - (PILL_W + PILL_BLOOM_PAD_X * 2)) / 2), PILL_TOP - PILL_BLOOM_PAD_Y,
+                      PILL_W + PILL_BLOOM_PAD_X * 2, PILL_H + PILL_BLOOM_PAD_Y * 2];
+                  const sameRect = (p: [number, number, number, number], s: [number, number, number, number]): boolean =>
+                    p[0] === s[0] && p[1] === s[1] && p[2] === s[2] && p[3] === s[3];
+                  const style0 = (await g4.pillProbe()).style;
+                  if (style0 !== 'A') { await g4.pillDrive('contextmenu'); await sleep(400); }
+                  // Hit-test-gated REAL click (the C2g robot's mandatory gate, local to this leg).
+                  const hitAndClick = async (sel: string): Promise<boolean> => {
+                    const ht = JSON.parse(await g4.pillEval(`(function(){ var el = document.querySelector('${sel}');
+                        if (!el) return JSON.stringify({ ok:false });
+                        var r = el.getBoundingClientRect();
+                        var h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+                        return JSON.stringify({ ok: !!h && (h === el || el.contains(h)) }); })()`)) as { ok: boolean };
+                    if (!ht.ok) return false;
+                    return (await g4.pillEval(`(function(){ var el = document.querySelector('${sel}'); if (!el) return false; el.click(); return true; })()`)) === true;
+                  };
+                  // Main-side bounds sampler at the tightest practical cadence; runs until the
+                  // requested mode has landed AND ≥1.2 s have passed (arm → melt → apply →
+                  // settle), capped at capMs. Every sample must match the constant stage.
+                  const sampleUntil = async (want: string, capMs: number): Promise<Array<[number, number, number, number]>> => {
+                    const out: Array<[number, number, number, number]> = [];
+                    const t0 = Date.now();
+                    while (Date.now() - t0 < capMs) {
+                      const b = (await g4.pillProbe()).bounds;
+                      out.push([b.x, b.y, b.width, b.height]);
+                      if (appMode === want && Date.now() - t0 >= 1200) break;
+                      await sleep(2);
+                    }
+                    return out;
+                  };
+                  const sampleFor = async (ms: number): Promise<Array<[number, number, number, number]>> => {
+                    const out: Array<[number, number, number, number]> = [];
+                    const t0 = Date.now();
+                    while (Date.now() - t0 < ms) {
+                      const b = (await g4.pillProbe()).bounds;
+                      out.push([b.x, b.y, b.width, b.height]);
+                      await sleep(2);
+                    }
+                    return out;
+                  };
+
+                  // Part A — 20 REAL-click flips (both directions), stage constant throughout.
+                  let aClicked = 0;
+                  const samplesA: Array<[number, number, number, number]> = [];
+                  for (let i = 0; i < 20; i++) {
+                    const want = appMode === 'cloud' ? 'local' : 'cloud';
+                    if (await hitAndClick(want === 'cloud' ? '#btn-cloud-a' : '#btn-local-a')) aClicked += 1;
+                    samplesA.push(...await sampleUntil(want, 4000));
+                  }
+                  const aHeld = samplesA.length >= 20 && samplesA.every((p) => sameRect(p, stageA));
+
+                  // Part B — 10 hover bloom/collapse cycles (Style B), stage constant throughout.
+                  await g4.pillDrive('contextmenu'); // → B
+                  await sleep(400);
+                  let bCycles = 0;
+                  const samplesB: Array<[number, number, number, number]> = [];
+                  for (let i = 0; i < 10; i++) {
+                    await g4.pillDrive('mouseenter');
+                    samplesB.push(...await sampleFor(1100)); // bloom + elastic settle while hovered
+                    const bOn = JSON.parse(await g4.pillEval('JSON.stringify(!!(window.__c2gPill && window.__c2gPill.bloomed))')) as boolean;
+                    await g4.pillDrive('mouseleave');
+                    samplesB.push(...await sampleFor(1200)); // hysteresis 90 + CSS shrink
+                    const bOff = JSON.parse(await g4.pillEval('JSON.stringify(!!(window.__c2gPill && window.__c2gPill.bloomed))')) as boolean;
+                    if (bOn && !bOff) bCycles += 1;
+                  }
+                  const bHeld = samplesB.length >= 20 && samplesB.every((p) => sameRect(p, stageB));
+
+                  // f_pac5_bloomCentered — FIX D leg 2 (the owner's defect 1): style B, REAL
+                  // hover robot. The bloomed pill must land DEAD CENTERED (window-space pill
+                  // center within 1 px of the window's horizontal midline), in the SAME height
+                  // band as the circle (window-space top == PILL_TOP ±0.5 — the 8 px down-settle
+                  // is deleted), and the rest circle's rect must be byte-identical before and
+                  // after. RED: PAC-4's [0,8] anchoring ⇒ center off (the rightward unfurl) and
+                  // top off by +8.
+                  const truth5 = (): Promise<{ style: string; bloomed: boolean } | null> =>
+                    g4.pillEval('JSON.stringify(window.__c2gPill || null)').then((s) => JSON.parse(s as string) as { style: string; bloomed: boolean } | null);
+                  const readBRect5 = async (): Promise<[number, number, number, number, boolean]> =>
+                    g4.pillEval(`(function(){ var p = document.getElementById('pillB');
+                        var r = p.getBoundingClientRect();
+                        return JSON.stringify([+r.left.toFixed(1), +r.top.toFixed(1),
+                          +r.width.toFixed(1), +r.height.toFixed(1), p.classList.contains('bloomed')]); })()`)
+                      .then((x) => JSON.parse(x as string) as [number, number, number, number, boolean]);
+                  let bRest0: [number, number, number, number, boolean] | null = null;
+                  let pbRest: Electron.Rectangle | null = null;
+                  const bT0 = Date.now();
+                  while (Date.now() - bT0 < 4000) { // from TRUE page rest
+                    const t = await truth5();
+                    const r = await readBRect5();
+                    if (t && t.bloomed === false && !r[4]) { bRest0 = r; pbRest = (await g4.pillProbe()).bounds; break; }
+                    await sleep(60);
+                  }
+                  // Hover reachability: the painted circle must be the hit target at its center.
+                  const hoverHit = JSON.parse(await g4.pillEval(`(function(){ var el = document.getElementById('pillB');
+                      if (!el) return JSON.stringify({ ok:false });
+                      var r = el.getBoundingClientRect();
+                      var h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+                      return JSON.stringify({ ok: !!h && (h === el || el.contains(h)) }); })()`)) as { ok: boolean };
+                  await g4.pillDrive('mouseenter');
+                  let bloomRect: [number, number, number, number, boolean] | null = null;
+                  const bloomT0 = Date.now();
+                  while (Date.now() - bloomT0 < 6000) { // elastic settle (contract .55 s)
+                    const r = await readBRect5();
+                    if (r[4] && Math.abs(r[0] - 10) <= 1 && Math.abs(r[2] - PILL_W) <= 0.5) { bloomRect = r; break; }
+                    await sleep(100);
+                  }
+                  await sleep(300); // elastic fully home before the window-space math
+                  const settled = await readBRect5();
+                  const pbB = (await g4.pillProbe()).bounds;
+                  const cwB = win.getContentBounds().width;
+                  const pillCenterWin = pbB.x + settled[0] + settled[2] / 2;
+                  const pillTopWin = pbB.y + settled[1];
+                  await g4.pillDrive('mouseleave');
+                  let bRest1: [number, number, number, number, boolean] | null = null;
+                  const cT0 = Date.now();
+                  while (Date.now() - cT0 < 6000) { // collapse: hysteresis + elastic shrink
+                    const r = await readBRect5();
+                    if (!r[4] && r[2] === PILL_B_REST_W) { bRest1 = r; break; }
+                    await sleep(60);
+                  }
+                  const bloomCenteredOk = !!bRest0 && !!pbRest && hoverHit.ok && !!bloomRect && !!bRest1
+                    && Math.abs(pillCenterWin - cwB / 2) <= 1
+                    && Math.abs(pillTopWin - PILL_TOP) <= 0.5
+                    // the rest circle sits at window center−14..+14 × PILL_TOP..+28 (eternal)
+                    && Math.abs(pbRest.x + bRest0[0] + bRest0[2] / 2 - cwB / 2) <= 1
+                    && Math.abs(pbRest.y + bRest0[1] - PILL_TOP) <= 0.5
+                    && bRest1[0] === bRest0[0] && bRest1[1] === bRest0[1]
+                    && bRest1[2] === bRest0[2] && bRest1[3] === bRest0[3];
+                  if (style0 === 'A') { await g4.pillDrive('contextmenu'); await sleep(400); } // restore A
+
+                  const f_pac5_stageNeverMoves = aClicked === 20 && bCycles === 10 && aHeld && bHeld;
+                  const stageChanges = samplesA.filter((p) => !sameRect(p, stageA)).length
+                    + samplesB.filter((p) => !sameRect(p, stageB)).length;
+                  console.log('[pac5-stage]', JSON.stringify({
+                    f_pac5_stageNeverMoves,
+                    matrix: {
+                      aClicked, bCycles, aHeld, bHeld, stageChanges,
+                      aSamples: samplesA.length, bSamples: samplesB.length,
+                    },
+                    raw: { style0, stageA, stageB, aTail: samplesA.slice(-2), bTail: samplesB.slice(-2) },
+                  }));
+                  console.log('[pac5-bloom]', JSON.stringify({
+                    f_pac5_bloomCentered: bloomCenteredOk,
+                    matrix: { hoverHit, bloomCenteredOk },
+                    raw: { bRest0, bloomRect, settled, roomAtBloom: pbB, roomAtRest: pbRest, pillCenterWin, cwB, pillTopWin, bRest1 },
+                  }));
+
+                  // f_pac5_knobOvershootFree — FIX D leg 3 (the owner's defect 2): Style A
+                  // real-click flip in BOTH directions. Two truths: (a) the page-measured knob
+                  // extent past the painted pill's end at the elastic PEAK must be ≤ the 14 px
+                  // stage pad; (b) a compositor READBACK of the pill view (capturePage on OUR
+                  // layer — the PAC-4 B2 clip-observation tooling precedent) must show the
+                  // knob's WHITE pixels PRESENT past the painted end (the overshoot actually
+                  // paints — not clipped by an invisible wall). RED: pad 0 (the 1.0.3 left
+                  // wall) ⇒ the overshoot pixels are cropped ⇒ (b) fails.
+                  {
+                    const g5 = cloudCtl!;
+                    if ((await g5.pillProbe()).style !== 'A') { await g5.pillDrive('contextmenu'); await sleep(400); }
+                    // rAF watcher on OUR page: track the knob rect's extents past #pillA's ends.
+                    const armKnobWatch = (): Promise<void> =>
+                      g5.pillEval(`(function(){
+                        var gen = (window.__pac5knobGen = (window.__pac5knobGen || 0) + 1);
+                        window.__pac5knob = { gen: gen, on: true, maxR: -999, maxL: -999 };
+                        (function scan(){
+                          if (!window.__pac5knob || window.__pac5knob.gen !== gen || !window.__pac5knob.on) return;
+                          var k = document.querySelector('#pillA .knob'), p = document.getElementById('pillA');
+                          if (k && p) {
+                            var kr = k.getBoundingClientRect(), pr = p.getBoundingClientRect();
+                            var extR = kr.right - pr.right, extL = pr.left - kr.left;
+                            if (extR > window.__pac5knob.maxR) window.__pac5knob.maxR = extR;
+                            if (extL > window.__pac5knob.maxL) window.__pac5knob.maxL = extL;
+                          }
+                          requestAnimationFrame(scan);
+                        })();
+                        return true; })()`).then(() => undefined);
+                    const readKnobWatch = async (): Promise<{ maxR: number; maxL: number }> =>
+                      g5.pillEval(`(function(){ return JSON.stringify({ maxR: +window.__pac5knob.maxR.toFixed(2), maxL: +window.__pac5knob.maxL.toFixed(2) }); })()`)
+                        .then((s) => JSON.parse(s as string) as { maxR: number; maxL: number });
+                    // Readback truth: white-ish (knob) pixels past the painted pill's ACTUAL end
+                    // in the capture. The scan zone is anchored on the page's own #pillA rect
+                    // (paintedLeft/paintedWidth CSS px, scaled by the capture's real device
+                    // scale) — NOT on the assumed 140-room formula, so a pad-0 geometry (the
+                    // RED) yields an EMPTY overshoot zone and can never "find" white inside the
+                    // pill body. White-ish = ALL four bitmap bytes ≥ 200 (order-agnostic BGRA/
+                    // RGBA; only near-white opaque pixels qualify — ink/shadow/void have a
+                    // dark channel).
+                    const whitePastEnd = (dataUrl: string, side: 'left' | 'right',
+                      paintedLeftCss: number, paintedWidthCss: number, viewportCss: number): boolean => {
+                      const img = nativeImage.createFromDataURL(dataUrl);
+                      const size = img.getSize();
+                      const scale = size.width / viewportCss;
+                      const l = Math.round(paintedLeftCss * scale);
+                      const r = Math.round((paintedLeftCss + paintedWidthCss) * scale);
+                      const buf = img.toBitmap();
+                      const from = side === 'right' ? r + 1 : 0;
+                      const to = side === 'right' ? size.width - 1 : l - 1;
+                      for (let y = 0; y < size.height; y++) {
+                        for (let x = from; x <= to; x++) {
+                          const o = (y * size.width + x) * 4;
+                          if (buf[o] >= 200 && buf[o + 1] >= 200 && buf[o + 2] >= 200 && buf[o + 3] >= 200) return true;
+                        }
+                      }
+                      return false;
+                    };
+                    const overshootDir = async (want: string, side: 'left' | 'right'): Promise<{ seen: number; pixels: boolean }> => {
+                      const startMode = want === 'cloud' ? 'local' : 'cloud';
+                      for (let attempt = 0; attempt < 3; attempt++) {
+                        // Pre-position: the flip needs a REAL mode change, so we must START on
+                        // the opposite side (a same-mode click is a safe no-op, no knob slide).
+                        if (appMode !== startMode) {
+                          await hitAndClick(startMode === 'cloud' ? '#btn-cloud-a' : '#btn-local-a');
+                          await sleep(1300);
+                        }
+                        await armKnobWatch();
+                        const clicked = await hitAndClick(want === 'cloud' ? '#btn-cloud-a' : '#btn-local-a');
+                        if (!clicked) continue;
+                        // The watcher records the whole transition; the moment the overshoot
+                        // passes the painted end (extent > 1 px) grab the readback — the peak
+                        // window is brief (~120 ms of the 0.6 s elastic).
+                        const t0 = Date.now();
+                        let peak: { maxR: number; maxL: number } = { maxR: -999, maxL: -999 };
+                        while (Date.now() - t0 < 4000) {
+                          peak = await readKnobWatch();
+                          if ((side === 'right' ? peak.maxR : peak.maxL) > 1) break;
+                          await sleep(15);
+                        }
+                        await sleep(30); // let the presenting frame be the peak frame
+                        const shot = await g5.pillCapture();
+                        const geo = JSON.parse(await g5.pillEval(`(function(){
+                            var r = document.getElementById('pillA').getBoundingClientRect();
+                            return JSON.stringify({ l: r.left, w: r.width, vw: window.innerWidth }); })()`)) as { l: number; w: number; vw: number };
+                        if (whitePastEnd(shot, side, geo.l, geo.w, geo.vw)) {
+                          return { seen: side === 'right' ? peak.maxR : peak.maxL, pixels: true };
+                        }
+                        // Missed the peak (capture landed outside the overshoot window) — flip
+                        // back and retry from the other side.
+                        await sleep(300);
+                      }
+                      const peak = await readKnobWatch();
+                      return { seen: side === 'right' ? peak.maxR : peak.maxL, pixels: false };
+                    };
+                    const overshootR = await overshootDir('local', 'right');
+                    await sleep(600);
+                    const overshootL = await overshootDir('cloud', 'left');
+                    const f_pac5_knobOvershootFree = overshootR.pixels && overshootL.pixels
+                      && overshootR.seen <= PILL_A_ROOM_PAD_X && overshootL.seen <= PILL_A_ROOM_PAD_X;
+                    console.log('[pac5-knob]', JSON.stringify({
+                      f_pac5_knobOvershootFree,
+                      matrix: { overshootR, overshootL, pad: PILL_A_ROOM_PAD_X },
+                      raw: { modeEnd: appMode },
+                    }));
+                  }
+                }
+
+                // Cleanup for the dead-last C2h idle stage: local, synced, chip idle, veil
+                // down, no net override, real site restored, no warm arm. Same desync
+                // insurance on the way home.
+                let localReady = false;
+                for (let attempt = 0; attempt < 3 && !localReady; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'local');
+                  localReady = await waitFor(async () =>
+                    (await readModeSafe()) === 'local' && appMode === 'local', 2500, 50);
+                }
+                transitionArmedAt = 0;
+                const endSnap = await statusSnap();
+                console.log('[c3-clean]', JSON.stringify({
+                  chipIdleAtEnd: !endSnap.showing && endSnap.collapsed,
+                  finalMode: appMode,
+                }));
+              }
+
+              // (6) C2h FIX 6 — f_c2h_cloudActivityFeedsIdleLock — DEAD-LAST in this stage; its
+              // cleanup leaves a sane unlocked Local stage for anything that might follow.
+              //
+              // SOUNDNESS (why this isolation proves the wiring): during FEED we synthesize
+              // wheel gestures into the SITE view via sendInputEvent — Electron's native input
+              // pipeline generates ZERO ipcMain traffic and the site has NO bridge (invariant
+              // I1), so the handle()-choke-point toucher can never fire for them. The ONLY code
+              // that can advance lastActivity during FEED is the new C2h `input-event` listener
+              // → onUserActivity → manager.touch(). Sampling uses DIRECT manager.status() calls
+              // (no renderer IPC, no bridge round-trip), so sampling itself cannot feed the
+              // clock either. With autoLockMinutes=1 the existing watchdog WOULD seal by ~60 s
+              // of silence — staying unlocked through ≥65 s of feeding proves gestures reach
+              // the shared clock; locking shortly AFTER feeding stops proves nothing else did.
+              {
+                await manager.setSettings({ autoLockMinutes: 1 }); // minimum legal; this very call touches ⇒ t₀
+                // C3-hotfix-3 run-2 lesson: this was the LAST single-fire relay in the harness
+                // and it got DROPPED (enteredCloud:false — the documented C2m-hotfix-2
+                // dropped-relay artifact; the renderer was still settling from the (5e)
+                // cleanup's guarded switch). Same desync insurance as every (5e) relay.
+                // Harness-only; the product path is untouched. (waitFor is (5e)-scoped —
+                // this sibling block polls with sleep + readModeSafe directly.)
+                let c2hCloudReady = false;
+                for (let attempt = 0; attempt < 3 && !c2hCloudReady; attempt++) {
+                  win.webContents.send('pill:flipRequested', 'cloud');
+                  const c2hT0 = Date.now();
+                  while (Date.now() - c2hT0 < 2500 && !c2hCloudReady) {
+                    c2hCloudReady = (await readModeSafe()) === 'cloud' && appMode === 'cloud';
+                    if (!c2hCloudReady) await sleep(50);
+                  }
+                }
+                const enteredCloud = c2hCloudReady && appMode === 'cloud';
+                const t0 = Date.now();
+                let lastFeedAt = Date.now();
+                const samples: Array<{ tMs: number; state: string }> = [{ tMs: 0, state: manager.status().state }];
+                let fedOk = true;
+                while (Date.now() - t0 < 70000) { // FEED phase ≥70 s
+                  await sleep(15000);
+                  try {
+                    fedOk = fedOk && (await cloudCtl.siteDriveWheel(300, 300, -120)) === true;
+                    lastFeedAt = Date.now();
+                  } catch { fedOk = false; }
+                  samples.push({ tMs: Date.now() - t0, state: manager.status().state });
+                }
+                const feedElapsedMs = Date.now() - t0;
+                const stayedUnlockedWhileFed = enteredCloud && fedOk
+                  && feedElapsedMs >= 65000 && samples.length >= 4
+                  && samples.every((s) => s.state === 'unlocked');
+                // STARVE phase: stop feeding entirely; watch the SHARED clock do its job alone.
+                let lockedAfterStarve = false;
+                let lockAfterLastFeedMs = -1;
+                while (Date.now() - lastFeedAt < 120000) { // cap 120 s starvation (watchdog granularity 30 s ⇒ expect ~60–90 s)
+                  await sleep(10000);
+                  const st = manager.status().state;
+                  samples.push({ tMs: Date.now() - t0, state: st });
+                  if (st === 'locked') { lockedAfterStarve = true; lockAfterLastFeedMs = Date.now() - lastFeedAt; break; }
+                }
+                const f_c2h_cloudActivityFeedsIdleLock = stayedUnlockedWhileFed && lockedAfterStarve;
+                console.log('[c2h-idle]', JSON.stringify({
+                  f_c2h_cloudActivityFeedsIdleLock,
+                  raw: { enteredCloud, fedOk, feedElapsedMs, stayedUnlockedWhileFed, lockedAfterStarve, lockAfterLastFeedMs, lastFeedIso: new Date(lastFeedAt).toISOString(), sampleCount: samples.length, samples },
+                }));
+                // CLEANUP: Local re-entered (lands on the password screen — fine, the starve
+                // legitimately locked it), re-unlocked through the SAME path other dev paths use
+                // (dev:testOnly `vaultUnlock` → manager.unlock), then the C2l Off leg, then a
+                // fresh mount so any later stages boots sane.
+                // C2l 4b NOTE: the restore used to be this block's FIRST line — but setSettings
+                // asserts unlocked, so while the starve-lock was still sealed it THREW
+                // ('[c1] failed: Vault is locked.' sits in every prior green log) and the
+                // flip/unlock/reload never ran. The restore now happens after the unlock.
+                win.webContents.send('pill:flipRequested', 'local');
+                await sleep(1500);
+                try { await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch { /* already open or gone */ }
+                // C2l (4b) — watchdog Off leg: with autoLockMinutes = null (explicit Off — legal
+                // per the engine validator) the starved watchdog must NEVER lock. Same no-feed
+                // discipline as the starve control above: sampling is DIRECT manager.status()
+                // (no IPC, no renderer bridge round-trip), the renderer sits idle, zero gestures.
+                // Honest scope: 90 s proves "no lock in a window where minutes=1 provably locks"
+                // (the control above locked after ~83 s of starvation); the full 10-minute
+                // equivalence rests on code review + the owner's hands-on, not a 10-minute leg.
+                const offLegT0 = Date.now();
+                const offSamples: Array<{ tMs: number; state: string }> = [];
+                let autoLockOffStaysUnlocked90s = false;
+                const offLegUnlocked = manager.status().state === 'unlocked';
+                if (offLegUnlocked) {
+                  await manager.setSettings({ autoLockMinutes: null });
+                  while (Date.now() - offLegT0 < 92000) {
+                    await sleep(10000);
+                    offSamples.push({ tMs: Date.now() - offLegT0, state: manager.status().state });
+                  }
+                  autoLockOffStaysUnlocked90s = offSamples.length > 0
+                    && offSamples.every((s) => s.state === 'unlocked');
+                }
+                console.log('[c2l-off]', JSON.stringify({
+                  autoLockOffStaysUnlocked90s,
+                  raw: { offLegUnlocked, elapsedMs: Date.now() - offLegT0, sampleCount: offSamples.length, offSamples },
+                }));
+                await manager.setSettings({ autoLockMinutes: 10 }); // C2l 4b — restore at stage end
+                win.webContents.reload();
+                await sleep(4000);
+              }
+
+              // Real-restart proof helper: leave a specific memory value behind for the NEXT
+              // boot to read (DROPSYNC_CLOUD_DEV_MEM=local ⇒ next launch must open on Local).
+              if (process.env.DROPSYNC_CLOUD_DEV_MEM === 'local') {
+                await win.webContents.executeJavaScript(
+                  "localStorage.setItem('dropsync.mode.last','local')"
+                );
+              }
+            } catch (error) {
+              console.error('[c1] failed:', error instanceof Error ? error.message : String(error));
+            }
+          })();
+        }, 3000);
+      }
     });
   }
   // Renderer dev server URL is injected by electron-vite via ELECTRON_RENDERER_URL.
   if (process.env.ELECTRON_RENDERER_URL) {
     // Sitting-2 battery AND the Sitting-3 round-trip need the dev-only __EXCAL hook — tag the
     // URL so main.tsx enables it. FIX 14's cache-size probe rides the same flag for DOM checks.
-    const devUrl = process.env.DROPSYNC_E2E_S2 === '1' || process.env.DROPSYNC_E2E_SIT3 === '1'
-      || process.env.DROPSYNC_SIT3_DOMCHECKS === '1'
-      ? `${process.env.ELECTRON_RENDERER_URL}?e2eHooks`
-      : process.env.ELECTRON_RENDERER_URL;
+    // C2f-hotfix-1: the cloud battery needs the same tag for its guard fixture (__c2fEditTest
+    // + __DC_METRICS), and its renderer-console lines are forwarded for failure visibility.
+    const wantsHooks = process.env.DROPSYNC_E2E_S2 === '1' || process.env.DROPSYNC_E2E_SIT3 === '1'
+      || process.env.DROPSYNC_SIT3_DOMCHECKS === '1' || process.env.DROPSYNC_CLOUD_DEV === '1';
+    const devUrl = `${process.env.ELECTRON_RENDERER_URL}${wantsHooks ? '?e2eHooks' : ''}`;
     void mainWindow.loadURL(devUrl);
   } else {
     void mainWindow.loadFile(join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/index.html'));
@@ -3429,6 +6755,20 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    // PAC-2 FIX A — the menu that never was: the owner's real-Windows round 2 found the
+    // DEFAULT Electron menu bar (File/Edit/View/Window) shipping on the installed v1.0.0 —
+    // zero Menu usage exists in src/main (verified sweep, 2026-08-30), so the default menu
+    // was never ours to show. Removing it also kills its reload/devtools accelerators, which
+    // a shipped vault app should not carry anyway. BEFORE createWindow, once.
+    Menu.setApplicationMenu(null);
+    // 1.0.5 FIX B — the YouTube Referer stamp on the DEFAULT session, once at boot (the
+    // Error 153 cure; see the attachYouTubeRefererStamp block above for the probe evidence).
+    attachYouTubeRefererStamp(session.defaultSession);
+    // PACKAGING-1 FIX A — boot best-effort, mirroring the currentTheme() pattern: an unlocked
+    // (dev-harness) boot gets the true theme immediately; a locked boot starts 'light' and
+    // corrects — the renderer's pre-unlock localStorage cache fixes the shell at first
+    // main-window load, and the vault:unlock seam fixes it for real at unlock.
+    applyFrameTheme(currentTheme());
     registerMediaProtocol();
     registerIpc();
     void sit3BootUnlock().then(() => {
@@ -3557,10 +6897,264 @@ function registerIpc(): void {
   handle('vault:create', (_e, folder: string, password: string) => manager.create(folder, password));
   handle('vault:unlock', async (_e, folder: string, password: string) => {
     await manager.unlock(folder, password);
+    // PACKAGING-1 FIX A — main can only read settings AFTER unlock (assertUnlocked-guarded):
+    // this is the moment a locked boot's 'light' fallback gets corrected for real.
+    applyFrameTheme(manager.getSettings().theme);
     await recoverInterruptedImport(manager); // kill-during-import rollback on next unlock
     return manager.status();
   });
   handle('vault:lock', () => manager.lock());
+
+  // ---- C2h cloud mode --------------------------------------------------------------------
+  // Mode switches flip the VIEW ONLY (C2h owner decision): entering Cloud NEVER seals the vault
+  // and leaving it NEVER required a lock — the EXISTING idle auto-lock (vault/vault.ts
+  // startIdleWatch) remains the ONLY thing that locks, driven by lastActivity from REAL activity
+  // in EITHER world. Activity feeding for the cloud view is wired where the view exists — see
+  // initCloud's `onUserActivity` dep in cloud.ts (gestures there → manager.touch()). Entering
+  // Cloud still never requires a vault: touch() on a locked/none state is harmless. The old
+  // "leaving Local locks it" rule (CLOUD-MODE-PLAN §5) was REOPENED by the owner 2026-08-27.
+  // C2m-hotfix-1 — overlapping flips SERIALIZE through a promise chain ("serial, like the
+  // card pump"): beginMelt's ready handshake widened applyMode's async window to ~100-200 ms,
+  // so a rapid flip arriving mid-melt used to early-return as a same-mode no-op (appMode not
+  // yet swapped ⇒ the guard misread it) — a DROPPED flip. The chain makes every queued flip
+  // apply, in arrival order. Rejections (invalid mode) still propagate to their caller
+  // without poisoning the chain (the next link runs on either outcome).
+  let modeApplyChain: Promise<'cloud' | 'local'> = Promise.resolve(appMode);
+  /** C3 STEP 5 (D7) — race a promise against CAPTURE_DEADLINE_MS; the loser's result is
+   * discarded. A capturePage() on a never-painted (dead cloud) view HANGS — try/catch
+   * catches rejections, not hangs — and the serialized modeApplyChain queued every later
+   * flip behind the stall (owner evidence §2.4: blocked a few tries). Timeout ⇒ null ⇒
+   * the existing instant-flip fail-open. */
+  const withTimeout = async <T>(p: Promise<T>, ms: number): Promise<T | null> => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        p,
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), ms);
+        }),
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  };
+  const applyModeNow = async (next: 'cloud' | 'local'): Promise<'cloud' | 'local'> => {
+    if (next !== 'cloud' && next !== 'local') throw new Error('Invalid mode.');
+    if (next === appMode) return appMode;
+    // C2m — the dissolve plays ONLY for USER-armed flips (pill:flip stamps transitionArmedAt;
+    // here the flag must still be warm). Boot-into-last-mode, dev probes, battery storms and
+    // every programmatic applyMode stay INSTANT. The Settings-modal switch line stays instant
+    // too (it never routes through pill:flip) — extendable later if the owner asks.
+    const armed = Date.now() - transitionArmedAt < 10_000;
+    transitionArmedAt = 0; // one-shot — an unapplied arm never outlives the next real flip
+    // C2m FIX 3 step 1 — capture the OUTGOING world BEFORE the swap (fail-open: any error or
+    // empty frame ⇒ null ⇒ today's instant flip; the effect can never break a flip).
+    // Cloud→Local captures the SITE view; Local→Cloud captures the MAIN window's page (the
+    // local page only — native overlays are separate views and never in the shot).
+    // C3 STEP 5 (D7) — BOTH captures race the CAPTURE_DEADLINE_MS deadline; a hang or slow
+    // frame ⇒ null ⇒ instant flip. A snapshot may never hold the flip chain hostage.
+    let png: string | null = null;
+    // PAC-3 FIX A — the flip's diagnostic clock (performance.now() deltas, one line per flip).
+    const diagT0 = performance.now();
+    let diagCaptureMs = -1;
+    if (armed) {
+      try {
+        if (next === 'local') {
+          png = cloudCtl ? await withTimeout(cloudCtl.captureViewPng(), CAPTURE_DEADLINE_MS) : null;
+        } else if (mainWindow && !mainWindow.isDestroyed()) {
+          const image = await withTimeout(mainWindow.webContents.capturePage(), CAPTURE_DEADLINE_MS);
+          png = !image || image.isEmpty() ? null : `data:image/png;base64,${image.toPNG().toString('base64')}`;
+        }
+      } catch {
+        png = null;
+      }
+      diagCaptureMs = performance.now() - diagT0;
+    }
+    // C2m-hotfix-1 (THE COVERED SWAP) step 2 — raise the curtain FIRST: beginMelt inflates
+    // the fader over the OUTGOING world (identical pixels ⇒ seamless) and returns only when
+    // the snapshot is fully painted (or false on deadline ⇒ instant flip below). The world
+    // swap happens ONLY under a painted curtain — no new-world peek-through, no two-step melt.
+    let ready = false;
+    let diagReadyMs = -1;
+    let diagPadMs = -1;
+    if (png && cloudCtl) {
+      // PAC-3 FIX A — a melt superseding an UNSETTLED predecessor (rapid flip mid-fade):
+      // its done can never arrive (the page's show guard discards it) — flush its line now
+      // so every USER flip gets exactly one [melt] line.
+      if (meltDiagPending !== null) {
+        const superseded = meltDiagPending;
+        meltDiagPending = null;
+        printMeltDiag(superseded, -1);
+      }
+      meltDiagReadyAt = -1; // only THIS melt's ready may feed the diagnostic
+      const tMelt = performance.now();
+      ready = await cloudCtl.beginMelt(png);
+      const tSwap = performance.now();
+      if (ready && meltDiagReadyAt >= 0) {
+        diagReadyMs = meltDiagReadyAt - tMelt; // decode + two-rAF submission ack (PAC-3)
+        diagPadMs = tSwap - meltDiagReadyAt; // the MELT_SWAP_PAD_MS tail inside beginMelt
+      }
+    }
+    if (next === 'cloud') {
+      appMode = 'cloud';
+      if (!cloudCtl) throw new Error('Cloud controller unavailable.');
+      cloudCtl.show();
+    } else {
+      appMode = 'local';
+      cloudCtl?.hide();
+      // C3 STEP 4 — the veil is cloud-only: reaching Local clears ANY active offline state
+      // (entry-failed veil or degraded chip) — the edge case the order names. Idempotent.
+      cloudCtl?.clearOfflineState();
+    }
+    // C2f FIX 2 — the knob slides ONLY when the mode ACTUALLY applied (never on request).
+    cloudCtl?.setPillMode(appMode);
+    // C2m-hotfix-1 step 3 — the swap is hidden; start the fade over the live new world. No
+    // curtain in time ⇒ cancel (collapse) — the fail-open path, nothing left behind.
+    if (png && cloudCtl) {
+      if (ready) {
+        cloudCtl.runMelt();
+        // PAC-3 FIX A — the line completes when the melt settles (fader:done handler).
+        meltDiagPending = {
+          armed, captureMs: diagCaptureMs, readyMs: diagReadyMs, padMs: diagPadMs,
+          tSwap: performance.now(),
+        };
+      } else {
+        cloudCtl.cancelMelt();
+        printMeltDiag({ armed, captureMs: diagCaptureMs, readyMs: diagReadyMs, padMs: diagPadMs }, -1);
+      }
+    } else if (armed) {
+      // PAC-3 FIX A — no snapshot ⇒ no melt (instant flip): still ONE line for this USER flip
+      // (negative fields = the phase never happened).
+      printMeltDiag({ armed, captureMs: diagCaptureMs, readyMs: diagReadyMs, padMs: diagPadMs }, -1);
+    }
+    return appMode;
+  };
+  const applyMode = (next: 'cloud' | 'local'): Promise<'cloud' | 'local'> => {
+    const run = (): Promise<'cloud' | 'local'> => applyModeNow(next);
+    modeApplyChain = modeApplyChain.then(run, run);
+    return modeApplyChain;
+  };
+  applyCloudMode = applyMode;
+  handle('mode:get', () => appMode);
+  handle('mode:set', (_e, next: 'cloud' | 'local') => applyCloudMode(next));
+  // C2f FIX 2 — the pill's ONE outbound channel: forward the flip request to the MAIN window
+  // renderer, which runs the EXISTING guarded switchMode (unsaved-work discard-confirm
+  // included). The pill never switches anything by itself. Then give keyboard focus back.
+  // C3 STEP 4 — the body is FACTORED into requestUserFlip so the status veil's
+  // [Switch to Local] button rides THE SAME user-flip path (arm stamp + pill room + relay +
+  // focus return): one user-flip path, no duplicates (D5/D8 — the card-button flip melts
+  // exactly like a pill click, and from a dead page the D7 deadline keeps it instant).
+  const requestUserFlip = (next: 'cloud' | 'local'): void => {
+    if (next !== 'cloud' && next !== 'local') return;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    // C2m — arm the flip dissolve: THIS path is the user path. applyMode melts only while
+    // the stamp is warm (< 10 s); everything programmatic stays instant.
+    transitionArmedAt = Date.now();
+    // C2g-hotfix-6 FIX 2 — arm the Style A flip room BEFORE relaying: the 124 × 28 skirt must
+    // be in place before the renderer's guarded switch lands the knob's class and the elastic
+    // transform starts (its overshoot paints past the trough's ends instead of clipping).
+    cloudCtl?.beginPillFlip();
+    console.log('[pill] flip requested →', next);
+    mainWindow.webContents.send('pill:flipRequested', next);
+    cloudCtl?.blurPill();
+  };
+  ipcMain.on('pill:flip', (_e, next: 'cloud' | 'local') => {
+    if (next !== 'cloud' && next !== 'local') return;
+    pillFlipRelayCount += 1; // C2g-hotfix-1 §5 — receipts of REAL pill:flip ipc (status-driven
+    // flips deliberately do NOT increment: this counter means pill clicks, robot-leg evidence)
+    requestUserFlip(next);
+  });
+  // C3 STEP 1 — the status layer's action buttons land here (preload enum-checked, main
+  // re-checks): cancel the shown download / take the guarded user-flip home / retry the
+  // dead page (veil stays up while trying).
+  ipcMain.on('status:action', (_e, a: unknown) => {
+    if (!a || typeof a !== 'object') return;
+    const id = (a as { id?: unknown }).id;
+    if (id === 'cancel') {
+      cloudCtl?.statusCancelDownload();
+    } else if (id === 'switch-local') {
+      requestUserFlip('local');
+    } else if (id === 'retry') {
+      cloudCtl?.offlineRetry();
+    }
+  });
+  // C3 STEP 1 — the page measured its chip content: main snaps the native room to the
+  // measured width (zero-miss click rule). Double-validated (preload already did). Payload
+  // is {width:number} per the C3 channel inventory.
+  ipcMain.on('status:measure', (_e, p: unknown) => {
+    if (!p || typeof p !== 'object') return;
+    const w = (p as { width?: unknown }).width;
+    if (typeof w !== 'number' || !Number.isFinite(w) || w < 0 || w > 2000) return;
+    cloudCtl?.statusMeasured(Math.round(w));
+  });
+  // C2g FIX 3 — Style B hover coupling: the layer reports enter/leave, main resizes the native
+  // view (re-centered) in the same tick its CSS bloom starts. Strictly validated.
+  ipcMain.on('pill:bloom', (_e, on: unknown) => {
+    if (typeof on !== 'boolean') return;
+    cloudCtl?.setPillBloom(on);
+  });
+  // C2g FIX 4 — right-click style toggle: main persists to disk + re-asserts bounds.
+  ipcMain.on('pill:setStyle', (_e, style: unknown) => {
+    if (style !== 'A' && style !== 'B') return;
+    cloudCtl?.setPillStyle(style);
+  });
+  // C2g-hotfix-1 FIX 3 — the layer asks on load; reply IMMEDIATELY with the true mode and the
+  // true style. Kills the queued-mode race permanently (queue stays as belt-and-braces).
+  ipcMain.on('pill:ready', () => {
+    if (!cloudCtl) return;
+    cloudCtl.resyncPill(appMode);
+  });
+  // C2j — the reminder card was clicked: dismiss it (advances the queue) + focus/restore the
+  // window, mirroring the native toast's click block (LEG 1).
+  ipcMain.on('card:click', (_e, id: unknown) => {
+    if (typeof id !== 'string' || id.length === 0) return;
+    cloudCtl?.reminderClick(id);
+  });
+  // C2m — the fader page reports its melt settled (transitionend or the page's safety net):
+  // collapse to 0×0 + hidden NOW. Idempotent — the grace deadline and repeats are no-ops.
+  ipcMain.on('fader:done', () => {
+    // PAC-3 FIX A — complete THIS melt's diagnostic line before the collapse bookkeeping
+    // (a pending record here is always the melt that just settled).
+    if (meltDiagPending !== null) {
+      const settled = meltDiagPending;
+      meltDiagPending = null;
+      printMeltDiag(settled, performance.now() - settled.tSwap);
+    }
+    cloudCtl?.faderDone();
+  });
+  // C2m-hotfix-1 — the fader page reports its curtain painted (snapshot decoded + committed):
+  // resolve the pending beginMelt ⇒ main may swap the world beneath it. Strays are no-ops.
+  ipcMain.on('fader:ready', () => {
+    meltDiagReadyAt = performance.now(); // PAC-3 FIX A — the submission ack landed (diagnostic)
+    cloudCtl?.faderReady();
+  });
+  // PAC-2 FIX B — the PICKER page's relay (our OWN sixth trusted page — the card:click house
+  // pattern: registered ONCE here, delegated into cloud.ts's picker state). The pick/cancel
+  // validation and the session whitelist live in cloud.ts; these handlers only forward.
+  ipcMain.on('picker:ready', () => {
+    cloudCtl?.pickerReady();
+  });
+  ipcMain.on('picker:pick', (_e, id: unknown, audio: unknown) => {
+    cloudCtl?.pickerPick(id, audio);
+  });
+  ipcMain.on('picker:cancel', () => {
+    cloudCtl?.pickerCancel();
+  });
+  // DEV-ONLY probes (I6): never registered without DROPSYNC_CLOUD_DEV=1.
+  if (process.env.DROPSYNC_CLOUD_DEV === '1') {
+    handle('mode:devProbe', async () => {
+      if (!cloudCtl) throw new Error('Cloud controller unavailable.');
+      const st = cloudCtl.probeState();
+      const isolation = await cloudCtl.probeIsolation();
+      const authSeen = await cloudCtl.probeAuthSeen();
+      return { mode: appMode, ...st, isolation, authSeen };
+    });
+    handle('mode:c2Evidence', (_e, evidence: unknown) => {
+      const tagged = evidence as { c2cTag?: string };
+      const line = tagged && tagged.c2cTag === 'pillfloat' ? '[c2c]' : '[c2]';
+      console.log(line, JSON.stringify(evidence));
+    });
+  }
   handle('vault:changePassword', (_e, oldPassword: string, newPassword: string) => manager.changePassword(oldPassword, newPassword));
   handle('vault:status', () => manager.status());
   handle('vault:probeFolder', (_e, folder: string) => manager.probeFolder(folder));
@@ -3663,7 +7257,14 @@ function registerIpc(): void {
 
   // ---- settings
   handle('vault:settingsGet', () => manager.getSettings());
-  handle('vault:settingsSet', (_e, patch: Record<string, unknown>) => manager.setSettings(patch));
+  handle('vault:settingsSet', async (_e, patch: Record<string, unknown>) => {
+    const next = await manager.setSettings(patch);
+    // PACKAGING-1 FIX A — the settings-write path is where main learns every theme change
+    // (the renderer's setTheme and updateSettings both funnel through this one channel); the
+    // shell follows the VALIDATED result (the patch may not even carry a theme).
+    applyFrameTheme(next.theme);
+    return next;
+  });
 
   // ---- import (.dropsync → vault)
   handle('vault:importInspect', (_e, filePath: string, password: string) => inspectArchive(filePath, password, undefined, (progress) => {
@@ -3775,30 +7376,49 @@ function registerIpc(): void {
   const notifyFallback = (title: string, body: string): void => {
     mainWindow?.webContents.send('vault:notifyFallback', { title, body });
   };
-  manager.setNotifier((title, body) => {
+  // Reminder loop → THREE delivery legs (C2j — owner LOCKED: never rely on one channel again).
+  // LEG 1 native: the legacy Windows toast path kept byte-identical (click focuses the window;
+  //   an unsupported platform falls back to the legacy in-app event; a throw warns + falls back).
+  // LEG 2 overlay: OUR reminder card over whichever world is on screen — ALWAYS (cloud.ts's
+  //   trusted third layer; WSLg can swallow toasts, it cannot swallow a native view we own).
+  // LEG 3 missed: when the app wasn't front-and-center at fire time, the reminder re-surfaces
+  //   oldest-first on the next window focus (overlay only).
+  // DORMANCY RULING (C2j §1): the legacy `vault:notifyFallback` renderer wiring stays UNWIRED
+  // by design from now on — it has had zero subscribers since baseline 90edc85 and the overlay
+  // replaces it. The emission here stays byte-identical; nothing renderer-side listens. DO-NOT-FIX.
+  const engineNotify = (title: string, body: string): void => {
     if (!Notification.isSupported()) {
       notifyFallback(title, body);
-      return;
+    } else {
+      try {
+        const toast = new Notification({ title, body });
+        toast.on('click', () => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.show();
+            mainWindow.focus();
+          }
+        });
+        toast.show();
+      } catch (error) {
+        console.warn('[notify] failed, using in-app fallback:', error);
+        notifyFallback(title, body);
+      }
     }
-    try {
-      const toast = new Notification({ title, body });
-      toast.on('click', () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          if (mainWindow.isMinimized()) mainWindow.restore();
-          mainWindow.show();
-          mainWindow.focus();
-        }
-      });
-      toast.show();
-    } catch (error) {
-      console.warn('[notify] failed, using in-app fallback:', error);
-      notifyFallback(title, body);
+    cloudCtl?.reminderShow(title, body, currentTheme()); // LEG 2 — ALWAYS (C2j red-proof: comment me out); C2k — CURRENT theme
+    if (!mainWindow || mainWindow.isMinimized() || !mainWindow.isFocused()) {
+      cloudCtl?.enqueueMissed(title, body); // LEG 3 — cannot be seen anywhere right now
     }
-  });
+  };
+  manager.setNotifier(engineNotify);
+  engineNotifier = engineNotify; // DEV battery tap-point: the exact function the engine calls
 
   // ---- DEV-ONLY test seeds (DROPSYNC_E2E_SIT3=1 or the DOM-checks harness). Registered
   // exclusively under harness env flags so production IPC surface stays untouched.
-  if (process.env.DROPSYNC_E2E_SIT3 === '1' || process.env.DROPSYNC_SIT3_DOMCHECKS === '1') {
+  // C2i FIX D — DROPSYNC_CLOUD_DEV joins the gate: its battery consumes the SAME
+  // listCallStats/resetListCallCount counter exposure the S2 zero-refetch leg uses.
+  if (process.env.DROPSYNC_E2E_SIT3 === '1' || process.env.DROPSYNC_SIT3_DOMCHECKS === '1'
+    || process.env.DROPSYNC_CLOUD_DEV === '1') {
     handle('dev:testOnly', async (_e, action: string, dropId: string, value?: number) => {
       if (action === 'expireDrop') {
         // Backdate expiresAt to 1 minute ago through the normal journal chain.

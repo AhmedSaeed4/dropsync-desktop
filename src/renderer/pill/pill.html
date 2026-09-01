@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>DropSync Pill</title>
+    <!-- C2g — THE PUNCH-HOLE PILL: two owner-approved styles, CSS values ported VERBATIM from
+         pill-variants-explainer.html (§1 design contract; §2 ANIMATION CONTRACT). Style A =
+         "punch-hole" 112 × 28 (default); Style B = "micro bloom" 28 × 28 dot-pair that blooms to
+         the full pill on hover. Right-click anywhere on the layer toggles A ⇄ B. The demo's
+         playground JS is NOT ported (known active-highlight inversion bug there): the COLOR RULE
+         lives in plain CSS below — word under the white knob is ALWAYS #1a1a1a, the other word
+         ALWAYS rgba(255,255,255,.55). Transparent body (spike-proven, STEP 0.5); strict CSP:
+         local scripts only, no remote anything, styles inline (knob transform is set via CSSOM
+         from pill.ts, which CSP does not govern). -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
+    />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent; /* the whole point — no rectangle behind the pill */
+        overflow: hidden;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+        user-select: none;
+      }
+      /* C2g-hotfix-3 FIX 3 — give #root a REAL footprint. Before this it had no CSS at all:
+         computed height 0, so every layer event worked only by BUBBLING up from descendants.
+         The surface is now geometrically the whole native view (paint unchanged — root is
+         transparent), and mouseenter/leave/contextmenu no longer depend on where children sit. */
+      #root { position: absolute; inset: 0; }
+      /* Neither style renders until pill.ts applies the boot class — a late module must never
+         flash the WRONG style (C2g FIX 4: persisted style from the first frame). */
+      #pillA, #pillB { display: none; }
+      /* C2g-hotfix-3 FIX 1 — ONE WORD that was the whole Style A bug: this toggler outranked
+         `.pill` on specificity (id beats class) while carrying `display: block`. That killed the
+         flex row → both buttons flowed like paragraph words → "Local" WRAPPED below y=28, outside
+         the pill's own 112 × 28 window: invisible AND unclickable (live-measured 2026-08-27,
+         rect y 27.5..53, elementFromPoint at its center = OUTSIDE-VIEWPORT). The visibility
+         toggler now CARRIES the container's display itself — inline-flex for A — so the cascade
+         can never strip the layout again. B's OUTER circle stays `block`: it is not a flex
+         container; only B's INNER mode-pill is (via .mode-pill / .pill base). */
+      body.style-a #pillA { display: inline-flex; }
+      body.style-b #pillB { display: block; }
+      /* ---- demo `.pill` base, VERBATIM (explainer :47-52) — shared trough by BOTH styles'
+         mode-switchers (#pillA and B's inner .pill): ink #1a1a1a · radius 100px · shadow 0 1px 6px
+         rgba(26,26,26,.22) · Inter 500 · inline-flex ROW.
+         HOTFIX-3 comment honesty (FIX 4): the previous comment here claimed "flex:1 1 50% on
+         buttons is layout plumbing" — no such property exists on any button rule, and under a
+         non-flex container it would be inert anyway. Archaeology: C2f's original had BOTH
+         `display:flex` fused into the same rule that made the pill visible AND flex sizing on
+         buttons; the C2g port split container-layout into this `.pill` rule and handed the
+         WINNING `display` to the visibility togglers — losing the cascade fight nobody noticed.
+         Buttons size by their content inside the row (same as the demo); the knob's calc(50% − 2px)
+         geometry keeps each side aligned under its word. All VISUAL values are the demo's. */
+      .pill {
+        display: inline-flex;
+        background: #1a1a1a;
+        border-radius: 100px;
+        position: relative;
+        align-items: stretch;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+        font-weight: 500;
+        box-shadow: 0 1px 6px rgba(26, 26, 26, 0.22);
+        box-sizing: border-box;
+      }
+      .pill button {
+        position: relative;
+        z-index: 2;
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        color: rgba(255, 255, 255, 0.55);
+        border-radius: 100px;
+        font: inherit;
+        transition: color 0.3s ease; /* ANIMATION CONTRACT: word color .3s ease */
+        line-height: 1;
+      }
+      .pill button.active { color: #1a1a1a; } /* COLOR RULE: ink on white — readable */
+      .pill .knob {
+        position: absolute;
+        background: #ffffff;
+        border-radius: 100px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+        transition: transform 0.6s cubic-bezier(0.34, 1.56, 0.64, 1); /* CONTRACT: .6s elastic */
+        will-change: transform;
+        transform: translateX(0); /* Cloud rest */
+      }
+      .pill .knob.on-local { transform: translateX(100%); } /* demo :66 — Local side */
+      /* ---- C2g-hotfix-3 FIX 2 — SHARED word-pill sizing (demo's `.pill.va` pattern: one sizing
+         class on BOTH mode-switchers; the port dropped that class and scoped every metric to
+         #pillA's id, leaving Style B's inner pill with NO knob geometry (computed 0×0 — its white
+         slider vanished when bloomed) and NO type/padding scale (16px UA words). Values VERBATIM
+         from demo/C2g §1 — a generalization to both pills, not a retune. */
+      .mode-pill {
+        padding: 2px;
+        font-size: 10.5px;
+      }
+      /* C2l FIX 3 — content-sized buttons (word + side padding) overflowed the pill and drifted
+         the word pair ~4px right of the midline, leaving "Local" visibly off-center in the knob
+         (measured 20px left vs 8px right of the word). Each button now takes EXACTLY one
+         geometric half (54px of the 108px content box at rest), so every word centers dead under
+         its knob half and each half is fully clickable. Vertical padding untouched. */
+      .mode-pill button { flex: 1 1 0; min-width: 0; padding: 7.5px 0; }
+      .mode-pill .knob { top: 2px; left: 2px; height: calc(100% - 4px); width: calc(50% - 2px); }
+      /* ---- A's own footprint. PAC-5 FIX A — FIXED 14 px INSIDE THE PERMANENT STAGE:
+         the native room is a PERMANENT 140 × 28 (cloud.ts PILL_A_ROOM_PAD_X — sized once,
+         never moved or resized at runtime), and #pillA paints at [14,0,112,28] in room
+         coordinates — window center−56..+56, PIXEL-IDENTICAL to every earlier layout.
+         ANCHOR HISTORY: center-anchored (C2f..hotfix-4) → PAC-4 top-left [0,0] with the
+         origin-fixed 124-wide flip skirt (12 px pad on the right; the Cloud-ward overshoot
+         still clipped at the LEFT wall — the owner's 1.0.3 "knob sliced flat" verdict) →
+         PAC-5: 14 px of breathing room EACH SIDE inside the permanent room, so the knob's
+         ~5 px elastic overshoot + shadow paint free on BOTH ends (the B2 clip is dead).
+         No entry choreography for A — no blink mask exists here; no room swap ever happens.
+         The inherited .pill shadow's left/right halo is now VISIBLE at rest for the first
+         time (demo-true: the demo page never clipped it) — owner-judged at hands-on. */
+      #pillA {
+        position: absolute;
+        left: 14px;
+        top: 0;
+        width: 112px;
+        height: 28px;
+      }
+      /* ---- demo Variant B "micro bloom", VERBATIM timings (explainer :68-79), with PAC-5
+         FIX B's PERMANENT STAGE anchoring. The bloom is JS-DRIVEN (class `bloomed`), not
+         :hover — the layer tells main the bloom state in the same tick the CSS class lands
+         (main's room work is a no-op stub now; the report keeps the bridge contract).
+         Timings are the demo's exact values: width .55s elastic · dots .18s ease · inner
+         reveal .25s ease .12s.
+         ANCHOR HISTORY: the C2f original was `inset:0` (left-nailed — the painted circle
+         teleported with the room swap, "comes from the left"); C2g-hotfix-4 made it
+         CENTER-ANCHORED (left/top 50% + static translate(-50%,-50%), the demo's `.pos-tc-b`
+         middle-out pattern); PAC-4 FIX B3 pinned it TOP-LEFT with a rightward unfurl +
+         down-settle (bloomed pill at room 0..112 × 8..36) — OWNER REJECTED at the 1.0.3
+         hands-on ("sprouts rightward, ends ~42 px right of center, 8 px down-settle").
+         PAC-5 FIX B — FIXED ROOM COORDINATES, MIDDLE-OUT, NO SETTLE: the room is a
+         PERMANENT 132 × 44 (cloud.ts PILL_BLOOM_PAD_*), the rest circle paints at
+         [52,8,28,28] — window center−14..+14 × PILL_TOP..+28, byte-identical to every
+         older layout — and the bloomed pill lands at [10,8,112,28] — window center±56,
+         the SAME height band as the circle (the 8 px down-settle is deleted), DEAD
+         CENTERED. `left` rides the SAME .55s elastic as `width` (52→10 while 28→112),
+         so the pill grows symmetrically around its own center — the hotfix-4 middle-out
+         bloom restored, ending dead centered on the window. `top` NEVER animates. Nothing
+         else animates except width/left (and the dots/inner rules below). */
+      #pillB {
+        position: absolute;
+        left: 52px;   /* room 52..80 → window center−14..+14 (the circle's eternal position) */
+        top: 8px;     /* room 8..36 → window PILL_TOP..PILL_TOP+28 */
+        width: 28px;
+        height: 28px;
+        border-radius: 100px;
+        background: #1a1a1a;
+        cursor: pointer;
+        box-shadow: 0 1px 6px rgba(26, 26, 26, 0.25);
+        transition: width 0.55s cubic-bezier(0.34, 1.56, 0.64, 1),
+          left 0.55s cubic-bezier(0.34, 1.56, 0.64, 1); /* CONTRACT: .55s elastic (width); left rides it → middle-out */
+        overflow: hidden;
+        box-sizing: border-box;
+      }
+      #pillB.bloomed { width: 112px; left: 10px; } /* centered pill: room 10..122 → window center±56 */
+      /* C2g-hotfix-1 FIX 1 — at rest the WHOLE circle is the button (#pillB's own click handler
+         flips); the hidden inner pill must not swallow those clicks, so it is pointer-transparent
+         until bloomed. When bloomed the words handle their sides and the circle handler no-ops —
+         no double-fire either way. Layout/paint untouched (inner was already opacity:0). */
+      #pillB .inner { pointer-events: none; }
+      #pillB.bloomed .inner { pointer-events: auto; }
+      #pillB .inner {
+        position: absolute;
+        inset: 0;
+        opacity: 0;
+        transition: opacity 0.25s ease 0.12s; /* CONTRACT: reveal .25s ease, .12s delay */
+      }
+      #pillB.bloomed .inner { opacity: 1; }
+      #pillB .inner .pill { position: absolute; inset: 0; }
+      #pillB .dots {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+        transition: opacity 0.18s ease; /* CONTRACT: dots fade .18s ease */
+      }
+      #pillB.bloomed .dots { opacity: 0; }
+      #pillB .dot { width: 5.5px; height: 5.5px; border-radius: 50%; background: rgba(255, 255, 255, 0.45); transition: background 0.3s; }
+      #pillB .dot.active { background: #c9a227; } /* gold dot = ACTIVE side */
+    </style>
+  </head>
+  <body>
+    <!-- Both styles ship in the DOM; body.style-a / body.style-b (set by pill.ts from the
+         persisted boot style) picks the visible one. #root spans the whole native view, so its
+         mouseenter/mouseleave/contextmenu ARE the layer's interaction surface. -->
+    <div id="root" data-testid="pill-layer">
+      <div id="pillA" class="pill mode-pill">
+        <span class="knob" aria-hidden="true"></span>
+        <button id="btn-cloud-a" type="button">Cloud</button>
+        <button id="btn-local-a" type="button">Local</button>
+      </div>
+      <div id="pillB">
+        <div class="dots">
+          <span class="dot" id="dot-cloud" aria-hidden="true"></span>
+          <span class="dot" id="dot-local" aria-hidden="true"></span>
+        </div>
+        <div class="inner">
+          <div class="pill mode-pill">
+            <span class="knob" aria-hidden="true"></span>
+            <button id="btn-cloud-b" type="button">Cloud</button>
+            <button id="btn-local-b" type="button">Local</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="./pill.ts"></script>
+  </body>
+</html>

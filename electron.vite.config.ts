@@ -9,9 +9,22 @@ export default defineConfig({
   },
   preload: {
     // Sandboxed preloads must be CommonJS; with "type": "module" we emit .cjs explicitly.
+    // C2f: TWO preloads — the main app bridge and the floating pill's minimal bridge.
+    // C2j: THREE — the reminder card layer joins with the same least-privilege shape.
+    // C2m: FOUR — the flip-dissolve fader layer joins with the same least-privilege shape.
+    // C3: FIVE — the status layer (chip + offline veil) joins with the same least-privilege shape.
+    // PAC-2: SIX — the share picker joins with the same least-privilege shape.
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
+        input: {
+          index: resolve(__dirname, 'src/preload/index.ts'),
+          pillPreload: resolve(__dirname, 'src/renderer/pill/pillPreload.ts'),
+          cardPreload: resolve(__dirname, 'src/renderer/card/cardPreload.ts'),
+          faderPreload: resolve(__dirname, 'src/renderer/fader/faderPreload.ts'),
+          statusPreload: resolve(__dirname, 'src/renderer/status/statusPreload.ts'),
+          pickerPreload: resolve(__dirname, 'src/renderer/picker/pickerPreload.ts'),
+        },
         output: {
           entryFileNames: '[name].cjs',
           format: 'cjs',
@@ -24,6 +37,24 @@ export default defineConfig({
     resolve: {
       alias: {
         '@': resolve(__dirname, 'src/renderer/src'),
+      },
+    },
+    // C2f: TWO renderer pages — the main app and the floating pill layer (FIX 2).
+    // C2j: THREE — the reminder card layer page (zero remote assets; local css/ts only).
+    // C2m: FOUR — the flip-dissolve fader layer page (zero remote assets; local css/ts only).
+    // C3: FIVE — the status layer page (chip + offline veil; zero remote assets; local css/ts only).
+    // PAC-2: SIX — the share picker page (zero remote assets; local css/ts only; img-src data:
+    // for the capturer thumbnails).
+    build: {
+      rollupOptions: {
+        input: {
+          index: resolve(__dirname, 'src/renderer/index.html'),
+          pill: resolve(__dirname, 'src/renderer/pill/pill.html'),
+          card: resolve(__dirname, 'src/renderer/card/card.html'),
+          fader: resolve(__dirname, 'src/renderer/fader/fader.html'),
+          status: resolve(__dirname, 'src/renderer/status/status.html'),
+          picker: resolve(__dirname, 'src/renderer/picker/picker.html'),
+        },
       },
     },
   },

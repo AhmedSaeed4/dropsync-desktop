@@ -18,6 +18,7 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import type { Drop, ExpirationOption } from '../../lib/types';
 import { useBodyScrollLock } from '../../hooks/useBodyScrollLock';
 import { useModalBackClose } from '../../hooks/useModalBackClose';
+import { MODE_SWITCH_EVENT, type ModeSwitchDetail } from '../../lib/modeSwitchGuard';
 import { useEscapeClose } from '../../hooks/useEscapeClose';
 import { getEditorialThemeColors } from '../../lib/editorialTheme';
 import { dedupeCategoryNames } from '../../lib/categories';
@@ -150,6 +151,10 @@ export function EditorialTextModal({
   // Unsaved-changes close guard: X/backdrop/Cancel/hardware-back route through handleClose, which
   // confirms ("Discard changes?") before actually closing when anything changed in edit mode.
   const [showCloseDiscardConfirm, setShowCloseDiscardConfirm] = useState(false);
+  // C2 unsaved-work guard: a MODE SWITCH requested while dirty routes through THIS SAME
+  // dialog; the switch continuation fires right after "Discard" closes the modal
+  // (lib/modeSwitchGuard contract — no silent loss, no duplicate confirm UI).
+  const pendingModeSwitchRef = useRef<(() => void) | null>(null);
   // Desktop: the exported drawing rides as raw PNG bytes (they cross IPC once into the vault).
   const [drawingBytes, setDrawingBytes] = useState<Uint8Array | null>(null);
   // Spec edge case: zero non-deleted elements ⇒ block save with an inline hint.
@@ -178,6 +183,16 @@ export function EditorialTextModal({
     w.seq.push({ t: Date.now(), ev: 'modal-state:' + mode + '/' + String(extractingScene) + '/id:' + (editDrop?.id || '-') });
     if (w.seq.length > 240) w.seq.shift();
   }, [mode, extractingScene, editDrop]);
+
+  // C2f-hotfix-1 trace (same DEV/e2eHooks gating, zero prod impact): the mode-switch discard-
+  // confirm's visibility lifecycle. The cloud battery asserts on these events (plus plain DOM
+  // checks) instead of reaching into component state.
+  useEffect(() => {
+    if (!(import.meta.env.DEV && window.location.search.includes('e2eHooks'))) return;
+    const w = (window as unknown as { __DC_METRICS?: { seq: { t: number; ev: string }[] } }).__DC_METRICS;
+    w?.seq.push({ t: Date.now(), ev: showCloseDiscardConfirm ? 'mode-guard-confirm-open' : 'mode-guard-confirm-close' });
+    if (w && w.seq.length > 240) w.seq.shift();
+  }, [showCloseDiscardConfirm]);
 
   // Load existing image for edit mode — media:// URL through the bridge (no Firebase decrypt).
   useEffect(() => {
@@ -443,6 +458,19 @@ export function EditorialTextModal({
   // Esc mirrors the same routing (polish sweep #3): discard dialog first, else the guarded close.
   useEscapeClose(!showCloseDiscardConfirm, handleClose);
   useEscapeClose(showCloseDiscardConfirm, () => setShowCloseDiscardConfirm(false));
+  // C2: intercept mode switches while dirty — preventDefault() tells the requester the guard
+  // took over; the continuation is stashed and fired by the Discard button below.
+  useEffect(() => {
+    const onRequest = (e: Event): void => {
+      const ce = e as CustomEvent<ModeSwitchDetail>;
+      if (!(isEditMode && hasChanges)) return;
+      ce.preventDefault();
+      pendingModeSwitchRef.current = ce.detail.proceed;
+      setShowCloseDiscardConfirm(true);
+    };
+    window.addEventListener(MODE_SWITCH_EVENT, onRequest);
+    return () => window.removeEventListener(MODE_SWITCH_EVENT, onRequest);
+  }, [isEditMode, hasChanges]);
 
   const handleModeSwitch = (newMode: 'text' | 'draw') => {
     if (newMode === mode) return;
@@ -1191,6 +1219,10 @@ export function EditorialTextModal({
                   if (loading) return;
                   setShowCloseDiscardConfirm(false);
                   onClose();
+                  // C2: the guarded mode switch proceeds only AFTER the discard completed.
+                  const proceed = pendingModeSwitchRef.current;
+                  pendingModeSwitchRef.current = null;
+                  proceed?.();
                 }}
                 className={`flex-1 px-4 py-2 ${tc.activePillBg} ${tc.activePillText} text-sm rounded-lg hover:opacity-90 transition-opacity ${tc.fontClass}`}
               >

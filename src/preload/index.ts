@@ -58,6 +58,20 @@ const api: DropsyncBridge = {
   youtube: {
     refreshTitles: (spaceId: string) => invoke('youtube:refreshTitles', spaceId),
   },
+  mode: {
+    get: () => invoke<'cloud' | 'local'>('mode:get'),
+    set: (next: 'cloud' | 'local') => invoke<'cloud' | 'local'>('mode:set', next),
+    devProbe: () => invoke<unknown>('mode:devProbe'),
+  },
+  onPillFlipRequested: (listener: (next: 'cloud' | 'local') => void): (() => void) => {
+    const wrapped = (_e: Electron.IpcRendererEvent, next: 'cloud' | 'local'): void => {
+      if (next === 'cloud' || next === 'local') listener(next);
+    };
+    ipcRenderer.on('pill:flipRequested', wrapped);
+    return () => {
+      ipcRenderer.removeListener('pill:flipRequested', wrapped);
+    };
+  },
   shell: {
     openExternal: (url: string) => invoke('shell:openExternal', url),
   },

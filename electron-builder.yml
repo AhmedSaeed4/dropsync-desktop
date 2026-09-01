@@ -1,0 +1,16 @@
+# PACKAGING-1 STEP 1 — Windows installer config (the FINALE). Exactly what the order locked,
+# nothing else: unsigned NSIS one-click per-user (SmartScreen "More info → Run anyway" is the
+# documented, accepted trade-off), no publish block, no code signing. The installer is built
+# ON WINDOWS from a sibling copy of this tree (dropsync-desktop-build) via npm run dist:win.
+appId: com.dropsync.desktop
+productName: DropSync Desktop
+directories:
+  output: dist
+files:
+  - out/**
+  - package.json
+win:
+  target: NSIS
+  icon: build/icon.png
+nsis:
+  oneClick: true

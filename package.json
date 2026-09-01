@@ -1,6 +1,6 @@
 {
   "name": "dropsync-desktop",
-  "version": "0.1.0",
+  "version": "1.0.5",
   "description": "DropSync Desktop — offline encrypted vault companion for .dropsync backups",
   "main": "./out/main/index.js",
   "type": "module",
@@ -13,7 +13,9 @@
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck": "npm run typecheck:web && npm run typecheck:node",
-    "make-test-archives": "node scripts/make-test-archives.ts"
+    "make-test-archives": "node scripts/make-test-archives.ts",
+    "icons": "node scripts/make-icons.ts",
+    "dist:win": "electron-vite build && electron-builder --win"
   },
   "dependencies": {
     "@excalidraw/excalidraw": "^0.18.1",
@@ -30,10 +32,12 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.0.0",
     "electron": "43.4.1",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^5.0.0",
     "motion": "^12.40.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "sharp": "^0.35.4",
     "tailwindcss": "^4.3.3",
     "typescript": "^5",
     "vite": "^7.3.6"

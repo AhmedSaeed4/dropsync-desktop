@@ -18,13 +18,135 @@ import { dropDtoToDrop } from './lib/types';
 import { isTextFileDrop, drawingMediaKind } from './lib/dropsHelpers';
 import { invalidatePreviewPayload, clearPreviewPayloadCache, putCachedPreviewPayload } from './lib/previewPayloadCache';
 import { Toast } from './components/shared/Toast';
+import { requestModeSwitch } from './lib/modeSwitchGuard';
+
+/** C2f — desktop mode. (The old bottom-strip badge is gone with the porch.) */
+type DesktopMode = 'cloud' | 'local';
+
+/** Memory rule (§2, KEPT EXACTLY from C2): localStorage `dropsync.mode.last`; first-ever launch
+ * (absent/corrupt) ⇒ LOCAL. Read BEFORE first paint so boot goes straight into the last mode. */
+const MEMORY_KEY = 'dropsync.mode.last';
+function readLastMode(): DesktopMode {
+  try {
+    const v = localStorage.getItem(MEMORY_KEY);
+    return v === 'cloud' ? 'cloud' : 'local'; // corrupt/absent ⇒ Local default (§5)
+  } catch {
+    return 'local';
+  }
+}
+function writeLastMode(mode: DesktopMode): void {
+  try {
+    localStorage.setItem(MEMORY_KEY, mode);
+  } catch { /* storage unavailable — memory simply won't persist */ }
+}
 import type { CreateExpirationOptionDTO, DropDTO, UpdateMetaPatchDTO } from '../../preload/apiTypes';
 
 export default function App() {
   return (
     <VaultStoreProvider>
-      <AppBody />
+      <CloudModeShell />
     </VaultStoreProvider>
+  );
+}
+
+/**
+ * C2f — launch goes STRAIGHT into the last used mode (memory rule above; no porch, no cards,
+ * no strip). The mode switcher is the floating pill — its OWN tiny native layer above the site
+ * view (src/renderer/pill/), never DOM here. A pill click arrives as `pill:flipRequested` and
+ * rides the EXISTING guarded switchMode (unsaved-work discard-confirm included). Cloud = the
+ * REAL website full-window, raw; Local = this app exactly as committed. There is NO desktop
+ * settings door while IN cloud (accepted trade-off: flip to Local for that).
+ */
+function CloudModeShell() {
+  const { status, handleUnlocked, handleLocked, reconcileStatus } = useVaultStore();
+  // Boot: read the memory rule BEFORE first paint and render that mode directly.
+  const [screen, setScreen] = useState<DesktopMode>(() => readLastMode());
+
+  // Boot-into-last-mode: when the remembered mode is Cloud, main must raise the site view.
+  // (Local needs nothing — the local flow below is exactly as committed.) The pill's knob is
+  // set main-side (setPillMode on boot + after every applied mode change).
+  useEffect(() => {
+    if (screen === 'cloud') void window.dropsync.mode.set('cloud');
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- boot-only: run once on mount
+  }, []);
+
+  /** Actual transition: main raises/hides the site view (and sets the pill knob); NOTHING
+   * seals — switching never locks (C2h). The renderer flips its world and the homecoming
+   * WHISPER-CHECK below reconciles status ONLY when reality differs from belief. Writes the
+   * memory rule (C2 §2 — choice is written on switch). */
+  const applyMode = useCallback(
+    async (next: DesktopMode): Promise<void> => {
+      if (next === screen) return;
+      await window.dropsync.mode.set(next);
+      setScreen(next);
+      writeLastMode(next);
+      // C2i FIX B — homecoming WHISPER-CHECK replaces the C1-era forced refreshAll (obsolete
+      // once C2h stopped sealing the vault on every flip). One cheap status() round-trip;
+      // touch NOTHING unless reality differs from what we believe (vault.status() is
+      // ACTIVITY_EXEMPT, so asking cannot feed the idle clock either):
+      if (next === 'local') {
+        const s = await window.dropsync.vault.status();
+        if (s.state !== status) {
+          if (s.state === 'unlocked') await handleUnlocked(); // unlocked-but-stale ⇒ hydrate like any unlock path does
+          else if (s.state === 'locked') handleLocked(); // idle-lock fired behind Cloud ⇒ instant password screen, ZERO fetches
+          else reconcileStatus('none'); // mirror of the 8 s watcher's bare setStatus for non-unlocked worlds
+        }
+        // Equal state ⇒ strictly NO-OP: no setLoading, no setDropsRaw, no list/category/
+        // settings/spaces refetch of any kind — the warm world simply stays as it is.
+      }
+    },
+    [screen, status, handleUnlocked, handleLocked, reconcileStatus]
+  );
+
+  /** Guarded switch — if an editor has unsaved changes its OWN discard-confirm runs first
+   * and fires the continuation after "Discard"; otherwise we proceed immediately. */
+  const switchMode = useCallback(
+    (next: DesktopMode): void => {
+      requestModeSwitch(() => void applyMode(next));
+    },
+    [applyMode]
+  );
+
+  // C2f FIX 2/3 — the floating pill's flip requests land here and ride the SAME guarded
+  // switchMode a keyboard/user path would. (The pill itself never switches anything.)
+  useEffect(() => {
+    const off = window.dropsync.onPillFlipRequested((next) => switchMode(next));
+    return () => { off(); };
+  }, [switchMode]);
+
+  // SettingsModal "Switch to Cloud" line rides the event bus (same style as open-settings).
+  useEffect(() => {
+    const h = (): void => switchMode('cloud');
+    window.addEventListener('dropsync:request-mode-cloud', h);
+    return () => window.removeEventListener('dropsync:request-mode-cloud', h);
+  }, [switchMode]);
+
+  // C2i-hotfix-1 — the inner container is PERMANENT and ALWAYS VISIBLE. The C2i original
+  // (cream class only while Cloud + visibility:hidden while Cloud) caused two owner-visible
+  // regressions, both measured live (probe: /tmp/c2iflash): (a) main removes the site view
+  // SYNCHRONOUSLY during mode.set, but React only flips this container's visibility one
+  // renderer round-trip + commit later (+126 ms caught on tape) — the reveal gap painted the
+  // page's invisible root over Chromium's default WHITE canvas = the full-screen white flash;
+  // (b) a whole-subtree visibility:hidden wake-up repaint + the class-list swing
+  // ('' ⇄ 'fixed inset-0…') = the post-arrival "flinch". The site view ALREADY covers Local
+  // completely while Cloud is up (native z-order — the same guarantee the pill relies on), so
+  // CSS hiding buys nothing and costs both symptoms. World separation stays attr-level only:
+  // the outer wrapper's data-shell keeps flipping for probes/state, nothing visual toggles.
+  //
+  // Hidden-liveness audit (C2i FIX C, still true): an always-mounted AppBody keeps its global
+  // listeners (useEscapeClose/EditorialSelect keydown captures, EditorialDropZone paste,
+  // EditorialDropList pointerdown, useModalBackClose popstate), yet NONE can misfire while
+  // Cloud is up: keyboard focus belongs to the site view after every flip (cloud.ts show()
+  // ends with site webContents.focus(); hide() hands it back to the window) and site-input
+  // events live in a DIFFERENT webContents that never reaches this DOM. The boot probe's
+  // `rootChildren: 1` contract still holds in every mode (one element-child under this
+  // contents wrapper, as always).
+  return (
+    <div className="contents" data-shell={screen}>
+      <div className="fixed inset-0 bg-[#FAF7F2]">
+        <AppBody />
+      </div>
+    </div>
   );
 }
 
@@ -40,6 +162,12 @@ function AppBody() {
   const tc = getEditorialThemeColors(theme);
 
   const [showSettings, setShowSettings] = useState(false);
+  // C1 — badge menu "Desktop settings" rides this event (see CloudModeShell planner ruling).
+  useEffect(() => {
+    const open = (): void => setShowSettings(true);
+    window.addEventListener('dropsync:open-settings', open);
+    return () => window.removeEventListener('dropsync:open-settings', open);
+  }, []);
   const [importScope, setImportScope] = useState<'personal' | 'workspace' | null>(null);
   // Export-back target (M5): 'personal' or a workspace id, plus its display name.
   const [exportTarget, setExportTarget] = useState<{ scope: 'personal' | { workspaceId: string }; name: string } | null>(null);
@@ -235,6 +363,17 @@ function AppBody() {
    * preview modal's own fetch matrix exactly, so the reopened modal cache-hits with ZERO
    * loading frame and zero IPC fetches. Per-slot failures resolve null — the modal then pays
    * its normal cold fetch for just that slot (graceful, never blocking).
+   *
+   * C2f-hotfix-2 — METADATA-ONLY save of a plain text drop: handleEditDrop just ran
+   * invalidatePreviewPayload() (the cached copy is stale by definition), and the updateMeta
+   * DTO carries no encrypted payload — so `editedContent` is undefined here. Priming an empty
+   * string in that case made the reopened preview render a BLANK body on an unconditional
+   * cache hit (EditorialPreviewModal :81-87 never falls back on a hit). Instead, fetch the
+   * stored text (mirroring openEditModal's guard) so the cache is primed complete. The caller
+   * AWAITS this before reopenSavedPreview, so the fetch fires-before-reopen — the instant-
+   * render bar (FIX 18) holds with zero loading frame and zero skeleton flash. Drawings are
+   * excluded (no text payload; their body rides imageUrl below); FILE drops keep their own
+   * existing branch and never take this one.
    */
   const primeSavedPreviewPayload = useCallback(async (saved: Drop, editedContent: string | undefined) => {
     let text = '';
@@ -242,7 +381,15 @@ function AppBody() {
     let imageUrl: string | null = null;
     try {
       if (saved.type === 'text') {
-        text = editedContent ?? '';
+        if (editedContent !== undefined) {
+          // Content save: prime with EXACTLY what was saved (regression bar — must stay byte-equal).
+          text = editedContent;
+        } else if (!saved.isDrawing) {
+          text = await fetchTextPayload(saved.id).catch((err) => {
+            console.error('[preview-prime] meta-only save could not re-fetch text — reopened preview will be blank:', err);
+            return ''; // old behavior as fallback — degraded render, never a hang
+          });
+        }
       } else if (isTextFileDrop(saved)) {
         text = await fetchTextPayload(saved.id).catch(() => '');
       }
@@ -460,6 +607,64 @@ function AppBody() {
     if (w.seq.length > 240) w.seq.shift();
   }, [editDrop]);
 
+  // C2f-hotfix-1 DEV fixture (?e2eHooks only): lets the cloud battery open the REAL edit modal
+  // for a seeded drop — the exact setEditDrop call the row's Edit action makes (App.tsx onEdit)
+  // — and read guard-relevant truth back from the DOM. Dirtying itself is NOT done here: the
+  // battery types through the real editor surface (execCommand → native input event), so no
+  // React state is ever poked for the action under test.
+  //
+  // C2f-hotfix-2 additions: openPreview() re-points the REAL preview modal at a seeded drop
+  // (same setPreviewDrop the card click makes) and previewState() reads the rendered body back
+  // from the DOM (<pre> textContent — absent entirely when the body is blank, which is exactly
+  // the meta-only-save symptom). The battery still clicks the REAL 'Edit' button itself so the
+  // save→prime→reopen path runs through openEditModal's preview-originated branch.
+  useEffect(() => {
+    if (!(import.meta.env.DEV && window.location.search.includes('e2eHooks'))) return;
+    const w = window as unknown as {
+      __c2fEditTest?: {
+        open(dropId: string): boolean;
+        openPreview(dropId: string): boolean;
+        state(): { open: boolean; saveDisabled: boolean | null; typedChars: number; discardConfirmVisible: boolean };
+        previewState(): { preText: string | null; editBtnVisible: boolean };
+      };
+    };
+    w.__c2fEditTest = {
+      open(dropId: string): boolean {
+        const source = drops.find((d) => d.id === dropId);
+        if (!source) return false;
+        setEditDrop(source);
+        return true;
+      },
+      openPreview(dropId: string): boolean {
+        const source = drops.find((d) => d.id === dropId);
+        if (!source) return false;
+        setPreviewDrop(source);
+        return true;
+      },
+      state() {
+        const editor = document.querySelector<HTMLDivElement>('div[contenteditable][role="textbox"]');
+        // The edit-mode submit button is disabled ⇔ `isEditMode && !hasChanges` (modal :1180),
+        // so its disabled flag IS the hasChanges truth, read from the DOM like a user sees it.
+        const saveBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+          .find((b) => b.textContent?.trim() === 'Save changes');
+        const discardConfirmVisible = Array.from(document.querySelectorAll('p'))
+          .some((el) => el.textContent?.trim() === 'Discard changes?');
+        return {
+          open: !!editor,
+          saveDisabled: saveBtn ? saveBtn.disabled : null,
+          typedChars: editor ? (editor.textContent || '').replace(/\u200B/g, '').length : -1,
+          discardConfirmVisible,
+        };
+      },
+      previewState() {
+        const pre = document.querySelector('pre');
+        const editBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+          .find((b) => b.textContent?.trim() === 'Edit');
+        return { preText: pre ? pre.textContent : null, editBtnVisible: !!editBtn };
+      },
+    };
+  }, [drops, editDrop]);
+
   if (checking) {
     return (
       <div className={`min-h-screen ${tc.bg} flex items-center justify-center`}>
@@ -469,6 +674,8 @@ function AppBody() {
   }
 
   if (status !== 'unlocked') {
+    // C2f: Local renders DIRECT full-window exactly as these components always have (the C2b
+    // porch portal slot is gone; no component needed any porch-only props).
     return status === 'none' ? (
       <FirstRunSetup
         theme={theme}
@@ -669,6 +876,8 @@ function AppBody() {
         <SettingsModal
           onClose={() => setShowSettings(false)}
           onLockNow={() => void handleLockNow()}
+          // C2 §2: same guarded path as the badge menu (unsaved-editor confirm included).
+          onSwitchToCloud={() => window.dispatchEvent(new CustomEvent('dropsync:request-mode-cloud'))}
           onVaultMoved={() => {
             // FIX 3: the ONLY refresh wired to Settings — a moved vault means a new folder and
             // the shell must re-probe. Every other close path is silent (zero refetch).

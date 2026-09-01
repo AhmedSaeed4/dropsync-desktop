@@ -198,6 +198,18 @@ export interface DropsyncBridge {
   youtube: {
     refreshTitles(spaceId: string): Promise<RefreshTitlesResultDTO>;
   };
+  /** C1 — desktop mode. Cloud = embedded real site; Local = the encrypted vault UI.
+   * (C2f: the porch-era probeEmail/devC2 members are gone with the porch.) */
+  mode: {
+    get(): Promise<'cloud' | 'local'>;
+    /** 'cloud' seals the vault via the existing lock path; 'local' reveals the entry branch. */
+    set(next: 'cloud' | 'local'): Promise<'cloud' | 'local'>;
+    /** DEV-ONLY (DROPSYNC_CLOUD_DEV=1) — f_c1_* evidence; unregistered otherwise. */
+    devProbe?(): Promise<unknown>;
+  };
+  /** C2f FIX 2/3 — the floating pill's flip relay. Main forwards the pill's ONE flip request
+   * here; the renderer runs the EXISTING guarded switchMode. Returns the unsubscribe. */
+  onPillFlipRequested(listener: (next: 'cloud' | 'local') => void): () => void;
   shell: {
     openExternal(url: string): Promise<boolean>;
   };

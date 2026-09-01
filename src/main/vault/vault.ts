@@ -873,7 +873,11 @@ export class VaultManager {
   private startIdleWatch(): void {
     this.stopIdleOnly();
     this.idleTimer = setInterval(() => {
-      const minutes = this.index?.settings.autoLockMinutes ?? 10;
+      // C2l FIX 2 — `?? 10` collapsed the STORED "Off" (null) into 10 minutes, silently locking
+      // despite Off and making the null guard below unreachable. Undefined (never set) still
+      // falls back to the 10-minute default; an explicit Off now reaches the guard and stays off.
+      const stored = this.index?.settings.autoLockMinutes;
+      const minutes = stored === undefined ? 10 : stored;
       if (minutes === null || minutes <= 0) return;
       if (Date.now() - this.lastActivity > minutes * 60 * 1000 && this.keys) {
         void this.lock();

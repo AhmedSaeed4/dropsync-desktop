@@ -20,6 +20,9 @@ if (import.meta.env.DEV && window.location.search.includes('e2eHooks')) {
     const W = window as unknown as Record<string, unknown>;
     W.__previewCacheSize = c.previewPayloadCacheSize;
     W.__previewCacheHas = (id: string) => !!c.getCachedPreviewPayload(id);
+    // C2f-hotfix-2: let the cloud battery read the PRIMED PAYLOAD itself (dev/e2eHooks only) —
+    // the meta-save key asserts the cache holds the FULL text, not merely that an entry exists.
+    W.__previewCacheGet = (id: string) => c.getCachedPreviewPayload(id) ?? null;
   });
 }
 

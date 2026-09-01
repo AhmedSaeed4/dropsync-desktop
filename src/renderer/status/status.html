@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>DropSync Status Layer</title>
+    <!-- C3 — the STATUS layer: a FIFTH trusted local view (pill/card/fader sibling). Two
+         presentations share the page: #chip (the compact ink-bar pill under the mode pill —
+         downloads + degraded-offline) and #veil (the themed full-window offline page with the
+         centered card). The owner picked BOTH looks live from c3-status-strip-preview.html
+         (2026-08-29): style A "ink bar", compact chip centered under the pill, offline card
+         centered on a calm page — that pick is the visual contract (order §3 D1).
+         ZERO remote anything: strict CSP below (connect-src 'none'), Raleway rides in via the
+         locally-bundled @fontsource-variable package (imported in status.ts), no images.
+         C2k token-table approach: CSS custom properties scoped by the root data-status-theme
+         attribute (set by status.ts BEFORE the veil reveals). At rest BOTH presentations are
+         hidden with pointer-events: none — the collapsed 0×0 native footprint paints nothing
+         and eats nothing. prefers-reduced-motion ⇒ transitions off (CSS; nothing here depends
+         on transitionend, unlike the fader). -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
+    />
+    <style>
+      /* C3 D1 theme tokens — default (no attribute) = light values; the explicit light block
+         mirrors it for symmetry. Card tokens follow the C2k card table; the VEIL background is
+         the calm themed page (cream / dark equivalent / sage minimal). */
+      :root {
+        --st-veil: #FAF7F2;
+        --st-surface: #ffffff; --st-edge: #e0e0e0;
+        --st-t1: #1a1a1a; --st-t2: #666666;
+        --st-bar: #1a1a1a;
+        --st-tile: #F1ECE3;
+        --st-shadow: 0 14px 40px rgba(26, 26, 26, .16);
+      }
+      :root[data-status-theme="light"] {
+        --st-veil: #FAF7F2;
+        --st-surface: #ffffff; --st-edge: #e0e0e0;
+        --st-t1: #1a1a1a; --st-t2: #666666;
+        --st-bar: #1a1a1a;
+        --st-tile: #F1ECE3;
+        --st-shadow: 0 14px 40px rgba(26, 26, 26, .16);
+      }
+      :root[data-status-theme="dark"] {
+        --st-veil: #161616;
+        --st-surface: #1a1a1a; --st-edge: #333333;
+        --st-t1: #ffffff; --st-t2: #888888;
+        --st-bar: #ffffff;
+        --st-tile: rgba(255, 255, 255, .08);
+        --st-shadow: 0 14px 40px rgba(0, 0, 0, .55);
+      }
+      :root[data-status-theme="minimal"] {
+        --st-veil: #C5C9B8;
+        --st-surface: #C5C9B8; --st-edge: #b0b4a5;
+        --st-t1: #1a1a1a; --st-t2: #4a4a4a;
+        --st-bar: #1a1a1a;
+        --st-tile: rgba(26, 26, 26, .06);
+        --st-shadow: 0 14px 40px rgba(26, 26, 26, .16);
+      }
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent; /* the native bounds own the room; no page rectangle */
+        overflow: hidden;
+        font-family: 'Raleway Variable', 'Raleway', ui-sans-serif, system-ui, sans-serif;
+        user-select: none;
+      }
+      #root { width: 100vw; height: 100vh; }
+
+      /* ---- the compact chip (ink bar, centered, y owned by the native bounds) ---- */
+      #chip {
+        position: absolute; top: 0; left: 50%;
+        transform: translate(-50%, -10px);
+        height: 36px; box-sizing: border-box;
+        display: flex; align-items: center; gap: 12px;
+        padding: 0 16px; border-radius: 999px;
+        background: #1A1A1A; color: #fff; /* D1 style A — ink bar, hairline-free */
+        box-shadow: 0 6px 18px rgba(0, 0, 0, .28);
+        font-size: 13.5px; font-weight: 600; white-space: nowrap;
+        opacity: 0; pointer-events: none;
+        transition: opacity .28s ease, transform .28s ease; /* D1: slide-down + fade */
+      }
+      #chip.showC { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+      #dot { width: 7px; height: 7px; border-radius: 50%; background: #C9A227; flex: none; }
+      #dot.pulse { animation: pulse 1.1s ease-in-out infinite; }
+      @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+      #track { width: 130px; height: 5px; border-radius: 999px; overflow: hidden; flex: none; background: rgba(255, 255, 255, .18); }
+      #fill { display: block; height: 100%; width: 0%; background: #C9A227; border-radius: 999px; transition: width .2s linear; }
+      #pct { font-variant-numeric: tabular-nums; font-size: 12.5px; opacity: .85; min-width: 34px; }
+      #act {
+        font-family: inherit; font-size: 12px; font-weight: 700; cursor: pointer;
+        background: transparent; color: #fff; border: 1.3px solid rgba(255, 255, 255, .5);
+        border-radius: 999px; padding: 4px 12px;
+      }
+      #act:hover { background: rgba(255, 255, 255, .12); }
+
+      /* ---- the flash chip (paper, ink text, ✓) — D1 done/done-reconnect presentation ---- */
+      #flash {
+        position: absolute; top: 0; left: 50%;
+        transform: translate(-50%, -10px);
+        height: 36px; box-sizing: border-box;
+        display: flex; align-items: center;
+        padding: 0 16px; border-radius: 999px;
+        background: #FAF7F2; color: #1a1a1a; border: 1px solid rgba(26, 26, 26, .14);
+        box-shadow: 0 6px 18px rgba(0, 0, 0, .16);
+        font-size: 13.5px; font-weight: 700; white-space: nowrap;
+        opacity: 0; pointer-events: none;
+        transition: opacity .25s ease, transform .25s ease;
+      }
+      #flash.showF { opacity: 1; transform: translate(-50%, 0); }
+
+      /* ---- the offline veil (themed calm page + centered card) ---- */
+      #veil {
+        position: absolute; inset: 0;
+        background: var(--st-veil);
+        display: flex; align-items: center; justify-content: center;
+        opacity: 0; pointer-events: none;
+        transition: opacity .35s ease;
+      }
+      #veil.showV { opacity: 1; pointer-events: auto; } /* veil INTENTIONALLY blocks the dead site */
+      #offCard {
+        width: min(400px, 82%); box-sizing: border-box;
+        background: var(--st-surface); color: var(--st-t1);
+        border: 1px solid var(--st-edge); border-top: 4px solid var(--st-bar);
+        border-radius: 8px; box-shadow: var(--st-shadow);
+        padding: 26px 26px 22px; text-align: left;
+        transform: translateY(10px); opacity: 0;
+        transition: opacity .3s ease .08s, transform .3s ease .08s;
+      }
+      #veil.showV #offCard { opacity: 1; transform: translateY(0); }
+      #ic {
+        width: 40px; height: 40px; border-radius: 10px; background: var(--st-tile);
+        display: flex; align-items: center; justify-content: center; font-size: 19px;
+        margin-bottom: 14px;
+      }
+      #offTitle { margin: 0; font-size: 17.5px; font-weight: 700; letter-spacing: -.01em; }
+      #offBody { margin: 6px 0 0; font-size: 13.5px; line-height: 1.55; color: var(--st-t2); }
+      #offRow { display: flex; gap: 10px; margin-top: 18px; }
+      #offRow button {
+        font-family: inherit; font-size: 13.5px; font-weight: 600; cursor: pointer;
+        border-radius: 999px; padding: 9px 18px; border: 1.5px solid var(--st-t1);
+        background: transparent; color: var(--st-t1);
+      }
+      #offRow #offLocal { background: var(--st-bar); color: var(--st-surface); border-color: var(--st-bar); }
+      #offRow button:hover { filter: brightness(1.06); }
+
+      @media (prefers-reduced-motion: reduce) {
+        #chip, #flash, #veil, #offCard, #fill { transition: none; animation: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div id="chip" aria-live="polite">
+        <span id="dot"></span>
+        <span id="msg"></span>
+        <span id="track"><span id="fill"></span></span>
+        <span id="pct"></span>
+        <button id="act" type="button"></button>
+      </div>
+      <div id="flash" aria-live="polite"></div>
+      <div id="veil">
+        <div id="offCard" role="alertdialog" aria-label="Offline">
+          <div id="ic">📡</div>
+          <h3 id="offTitle"></h3>
+          <p id="offBody"></p>
+          <div id="offRow">
+            <button id="offLocal" type="button">Switch to Local</button>
+            <button id="offRetry" type="button">Try again</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="./status.ts"></script>
+  </body>
+</html>

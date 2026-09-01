@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en" role="presentation">
+  <head>
+    <meta charset="UTF-8" />
+    <title>DropSync Flip Fader</title>
+    <!-- C2m — the flip DISSOLVE layer: a FOURTH trusted local view (pill/card sibling). The page
+         is a dumb single <img>: main hands it a still frame (PNG data URL) of the world being
+         left, the page wakes it fully opaque over the live new world and fades it away over
+         FLIP_FADE_MS (the melt — owner-approved 250 ms, both directions). ZERO remote anything:
+         strict CSP below (connect-src 'none'; img-src data: is the ONE ingest — the snapshot
+         itself). No fonts, no stylesheets beyond this block, nothing at rest (opacity 0 img +
+         transparent body — the collapsed 0×0 native footprint is invisible).
+         prefers-reduced-motion is respected PAGE-SIDE in fader.ts via matchMedia (duration
+         clamps to ≤16 ms there — deliberately NOT a CSS transition:none, which would kill
+         transitionend and delay the settle report). pointer-events: none everywhere: the fader
+         is a picture, never a click target (STEP 0.5: full-window overlays DO intercept clicks
+         on this Electron build, so the melt is owner-accepted click-waited; the layer MUST
+         collapse to 0×0 the moment the fade ends). -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
+    />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent; /* the whole point — no rectangle behind the melt */
+        overflow: hidden;
+        pointer-events: none; /* a still frame is never a click target */
+        user-select: none;
+      }
+      /* The outgoing world, exactly filling the native room (native bounds own placement; the
+         page just paints the snapshot at 0,0). object-fit: fill: the capture is the same aspect
+         as the room by construction — stretch is a no-op, undershoot can never letterbox. */
+      #faderImg {
+        position: absolute; top: 0; left: 0;
+        width: 100%; height: 100%;
+        object-fit: fill;
+        opacity: 0; /* parked — paints NOTHING until a show wakes it */
+        will-change: opacity;
+      }
+    </style>
+  </head>
+  <body>
+    <img id="faderImg" alt="" draggable="false" />
+    <script type="module" src="./fader.ts"></script>
+  </body>
+</html>

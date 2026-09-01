@@ -455,9 +455,15 @@ export async function updateTextDropMeta(
     }
   }
   if (patch.reminderAt !== undefined) {
+    const reminderChanged = patch.reminderAt !== record.reminderAt;
     journalPatch.reminderAt = patch.reminderAt;
     journalPatch.reminderSetByUid = patch.reminderAt ? 'local' : null;
     journalPatch.reminderDismissedBy = null;
+    // C2j-hotfix-1 — a RE-ARMED reminder is a fresh lifecycle: clear the fired stamp so the
+    // engine (vault.ts reminderEligible) will announce it when due. Guarded on an actual value
+    // change so unrelated meta re-saves can't re-announce an old past-due reminder. Web parity:
+    // drops.ts has no stamp — due = time + not-dismissed.
+    if (reminderChanged) journalPatch.reminderFiredAt = null;
   }
 
   const labelsChanged =

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Choose what to share</title>
+    <!-- PAC-2 FIX B — OUR share picker: the SIXTH trusted local page (card sibling). ZERO
+         remote assets: strict CSP below (connect-src 'none', img-src data: for the capturer
+         thumbnails), styling hand-rolled so the app's Tailwind build is NOT needed here.
+         Themed via the root data-picker-theme attribute (set by picker.ts from the payload),
+         same token families as the card (C2k): themed surface, 1px hairline, 8px corners,
+         Raleway Variable bundled locally by Vite. prefers-reduced-motion kills the hover
+         lift/fade. Every label is textContent-only — the payload is main-built, but the page
+         never trusts it into innerHTML. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src data:; connect-src 'none'"
+    />
+    <style>
+      :root {
+        --pk-bg: #FAF7F2; --pk-surface: #ffffff; --pk-edge: #e0e0e0;
+        --pk-t1: #1a1a1a; --pk-t2: #666666; --pk-accent: #C9A227;
+        --pk-card-hover: #ffffff; --pk-shadow: 0 10px 28px rgba(26, 26, 26, .16);
+      }
+      :root[data-picker-theme="light"] {
+        --pk-bg: #FAF7F2; --pk-surface: #ffffff; --pk-edge: #e0e0e0;
+        --pk-t1: #1a1a1a; --pk-t2: #666666; --pk-accent: #C9A227;
+        --pk-card-hover: #ffffff; --pk-shadow: 0 10px 28px rgba(26, 26, 26, .16);
+      }
+      :root[data-picker-theme="dark"] {
+        --pk-bg: #161616; --pk-surface: #222222; --pk-edge: #3a3a3a;
+        --pk-t1: #ffffff; --pk-t2: #999999; --pk-accent: #E3C558;
+        --pk-card-hover: #2a2a2a; --pk-shadow: 0 12px 30px rgba(0, 0, 0, .6);
+      }
+      :root[data-picker-theme="minimal"] {
+        --pk-bg: #C5C9B8; --pk-surface: #D3D6C7; --pk-edge: #b0b4a5;
+        --pk-t1: #1a1a1a; --pk-t2: #4a4a4a; --pk-accent: #8A6D1F;
+        --pk-card-hover: #DADDCB; --pk-shadow: 0 10px 26px rgba(26, 26, 26, .18);
+      }
+      html, body {
+        margin: 0; padding: 0; height: 100%;
+        background: var(--pk-bg); color: var(--pk-t1);
+        font-family: 'Raleway Variable', 'Raleway', ui-sans-serif, system-ui, sans-serif;
+        user-select: none; overflow: hidden;
+        display: flex; flex-direction: column;
+      }
+      #hdr {
+        flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+        padding: 14px 18px 10px 18px; border-bottom: 1px solid var(--pk-edge);
+      }
+      #hdr h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: .01em; }
+      #close {
+        border: none; background: transparent; color: var(--pk-t2); cursor: pointer;
+        font-size: 18px; line-height: 1; padding: 4px 8px; border-radius: 6px;
+      }
+      #close:hover { color: var(--pk-t1); background: var(--pk-card-hover); }
+      #body { flex: 1 1 auto; overflow-y: auto; padding: 12px 18px; }
+      .grp { margin: 0 0 4px 0; font-size: 11px; font-weight: 600; letter-spacing: .08em;
+             text-transform: uppercase; color: var(--pk-t2); padding: 8px 2px 6px 2px; }
+      .src {
+        display: flex; align-items: center; gap: 12px; width: 100%; box-sizing: border-box;
+        background: var(--pk-surface); border: 1px solid var(--pk-edge); border-radius: 8px;
+        padding: 8px; margin: 0 0 8px 0; cursor: pointer; text-align: left; color: var(--pk-t1);
+        font: inherit;
+        transition: transform .12s ease-out, border-color .12s ease-out, background .12s ease-out;
+      }
+      .src:hover { border-color: var(--pk-accent); background: var(--pk-card-hover); transform: translateY(-1px); }
+      .thumb { position: relative; flex: 0 0 160px; }
+      .thumb img { display: block; width: 160px; height: 90px; object-fit: cover;
+                   border-radius: 6px; border: 1px solid var(--pk-edge); background: #000; }
+      .thumb .badge {
+        position: absolute; right: 4px; bottom: 4px; width: 22px; height: 22px;
+        border-radius: 5px; background: var(--pk-surface); border: 1px solid var(--pk-edge);
+        display: none; align-items: center; justify-content: center; overflow: hidden;
+      }
+      .thumb .badge img { width: 16px; height: 16px; object-fit: contain; border: none; border-radius: 0; background: transparent; }
+      .thumb.has-badge .badge { display: flex; }
+      .lbl { flex: 1; min-width: 0; font-size: 13px; font-weight: 500;
+             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      #empty { display: none; padding: 40px 0; text-align: center; color: var(--pk-t2); font-size: 13px; }
+      #ftr {
+        flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+        padding: 10px 18px 14px 18px; border-top: 1px solid var(--pk-edge); color: var(--pk-t2);
+        font-size: 12px;
+      }
+      #audioRow { display: none; align-items: center; gap: 6px; cursor: pointer; color: var(--pk-t1); }
+      #audioRow.on { display: flex; }
+      #audioRow input { accent-color: var(--pk-accent); width: 14px; height: 14px; cursor: pointer; }
+      @media (prefers-reduced-motion: reduce) { .src { transition: none; } }
+    </style>
+  </head>
+  <body>
+    <div id="hdr">
+      <h1>Choose what to share</h1>
+      <button id="close" title="Cancel" aria-label="Cancel sharing">&#10005;</button>
+    </div>
+    <div id="body">
+      <div id="empty">Nothing to share found</div>
+      <div id="screensGrp" class="grp" style="display:none">Screens</div>
+      <div id="screens"></div>
+      <div id="windowsGrp" class="grp" style="display:none">Windows</div>
+      <div id="windows"></div>
+    </div>
+    <div id="ftr">
+      <label id="audioRow">
+        <input type="checkbox" id="audioChk" />
+        <span>Include system audio</span>
+      </label>
+      <div>Esc to cancel</div>
+    </div>
+    <script type="module" src="./picker.ts"></script>
+  </body>
+</html>
