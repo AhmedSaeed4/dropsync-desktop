@@ -456,6 +456,12 @@ export interface CloudController {
   /** C3 STEP 2 (D2) — the chip's [Cancel]: item.cancel() on the download the chip currently
    * shows; the done handler cleans up the partial + the chip. No-op without an active item. */
   statusCancelDownload(): void;
+  /** 1.0.6 FIX B — the Local Save-As chip: the Cloud chip layer, honest minimal payload,
+   * ZERO site contact. saving ⇒ "Saving <name>…" with the pulse dot, NO progress bar, NO
+   * cancel (a local disk write has neither); done ⇒ the standard ✓ Saved flash
+   * (STATUS_FLASH_MS); fail ⇒ quiet hide. The chip room is mainWindow-content-based, so it
+   * displays over the Local world exactly as over the site. */
+  localSaveChip(p: { phase: 'saving'; name: string } | { phase: 'done' } | { phase: 'fail' }): void;
   /** C3 STEP 4 (D5) — the veil's [Try again]: reload the site view; the veil STAYS up while
    * trying (failure ⇒ did-fail-load ⇒ veil remains — honest). No-op outside entry-failed. */
   offlineRetry(): void;
@@ -503,6 +509,11 @@ export interface CloudController {
     notificationsEvil: boolean;
     notificationsSite: boolean;
     notificationsEvilReq: boolean;
+    /** 1.0.6 FIX A — the clipboard gate, both paths, both origins. */
+    clipboardSite: boolean;
+    clipboardEvilReq: boolean;
+    checkClipboardSite: boolean;
+    checkClipboardEvil: boolean;
   }>;
   // ==== PAC-2 FIX B — the share picker =======================================================
   /** The picker page's handshake/relay targets (registered ONCE in index.ts's registerIpc —
@@ -1801,10 +1812,12 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   // STEP 3 (D3) — the DOORMAN handlers, hoisted to controller scope so doormanProbe can
   // invoke them DIRECTLY (the only deterministic allow-path proof). Registered on the site
   // partition session ONLY — our tiny layers keep their deny-all handlers on the default
-  // session. Allow ONLY 'media' (mic + camera) AND 'notifications' (PAC-2 FIX C — the site's
-  // own Notification.permission read 'denied' forever, so its code skipped every fire; grant
-  // is silent, origin-gated, same posture as mic/camera: our site, our shell) — and only from
-  // the site origin; everything else denies with a one-line log. The CHECK handler is what
+  // session. The allowlist is the SITE_ALLOWED_PERMISSIONS set below: 'media' (mic + camera),
+  // 'notifications' (PAC-2 FIX C — the site's own Notification.permission read 'denied'
+  // forever, so its code skipped every fire; grant is silent, origin-gated, same posture as
+  // mic/camera: our site, our shell), and, since 1.0.6 FIX A, 'clipboard-sanitized-write'
+  // (the site's copy/share buttons — see the set's comment above) — still strictly
+  // origin-gated; everything else denies with a one-line log. The CHECK handler is what
   // makes the site's own Permissions-API gate report "granted" (un-deads the voice buttons).
   // electron.d.ts verified: details.requestingUrl exists (PermissionRequest, REQUIRED);
   // wc.mainFrameUrl does NOT exist on this build — the verified fallback is wc.mainFrame.url
@@ -1816,6 +1829,20 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       return '';
     }
   };
+  // 1.0.6 FIX A — 'clipboard-sanitized-write' joins the allowlist: the site's copy/share
+  // buttons end in navigator.clipboard.writeText, which Electron gates through THESE very
+  // handlers (electron.d.ts:13352/13361 list the string on both signatures). With the gate
+  // shut, every Cloud copy died silently (copy: no catch, no feedback —
+  // EditorialDropItem.tsx:403; share: spinner → swallowed rejection, nothing copied —
+  // EditorialDropItem.tsx:320; owner report 2026-08-31; Chrome works because it auto-grants
+  // clipboard-write on a user gesture). Same posture as media/notifications: our site, our
+  // shell, strictly origin-gated. 'clipboard-read' stays DENIED — the site pastes via paste
+  // events, not the async clipboard API.
+  const SITE_ALLOWED_PERMISSIONS: ReadonlySet<string> = new Set([
+    'media',
+    'notifications',
+    'clipboard-sanitized-write',
+  ]);
   const sitePermissionRequest = (
     wc: Electron.WebContents,
     permission: string,
@@ -1828,7 +1855,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     const source = details.requestingUrl ?? (wc.isDestroyed() ? '' : wc.mainFrame.url);
     // PAC-2 FIX C — 'notifications' joins the allowlist (still strictly origin-gated below):
     // the site gates its own toasts on Notification.permission, which read 'denied' forever.
-    const ok = (permission === 'media' || permission === 'notifications') && originOf(source) === CLOUD_ORIGIN;
+    const ok = SITE_ALLOWED_PERMISSIONS.has(permission) && originOf(source) === CLOUD_ORIGIN;
     // FIX C — EVERY verdict is loud, grants included (the mic bug taught us: an invisible
     // refusal path is undebuggable; the request log shows the EXACT permission string the
     // site sent, which is the evidence the allowlist must match).
@@ -1840,7 +1867,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     permission: string,
     requestingOrigin: string,
   ): boolean => {
-    const ok = (permission === 'media' || permission === 'notifications') && originOf(requestingOrigin) === CLOUD_ORIGIN;
+    const ok = SITE_ALLOWED_PERMISSIONS.has(permission) && originOf(requestingOrigin) === CLOUD_ORIGIN;
     // FIX C — log EVERY invocation: what the site's Permissions-API query asked us, and what
     // we answered. If the query never consults this handler, the silence is itself evidence.
     console.log('[cloud] permission-check', permission, requestingOrigin, ok ? '→ granted' : '→ denied');
@@ -2562,6 +2589,15 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     statusCancelDownload,
     offlineRetry,
     clearOfflineState,
+    localSaveChip: (p): void => {
+      if (p.phase === 'saving') {
+        statusShow({ kind: 'download', label: `Saving ${p.name}…`, pulse: true, action: null });
+      } else if (p.phase === 'done') {
+        statusHide('✓ Saved');
+      } else {
+        statusHide();
+      }
+    },
     onSiteLoadFailed,
     onSiteLoadSucceeded: (): void => {
       if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('onSiteLoadSucceeded is DROPSYNC_CLOUD_DEV-only');
@@ -2695,6 +2731,11 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
         notificationsEvil: sitePermissionCheck(null, 'notifications', 'https://evil.example'),
         notificationsSite: await ask('notifications', CLOUD_URL),
         notificationsEvilReq: await ask('notifications', 'https://evil.example/'),
+        // 1.0.6 FIX A — the clipboard gate, both paths, both origins.
+        clipboardSite: await ask('clipboard-sanitized-write', CLOUD_URL),
+        clipboardEvilReq: await ask('clipboard-sanitized-write', 'https://evil.example/'),
+        checkClipboardSite: sitePermissionCheck(null, 'clipboard-sanitized-write', CLOUD_ORIGIN),
+        checkClipboardEvil: sitePermissionCheck(null, 'clipboard-sanitized-write', 'https://evil.example'),
       };
     },
     // ==== PAC-2 FIX B — the share picker =====================================================

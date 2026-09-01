@@ -5790,6 +5790,108 @@ function createWindow(): void {
                   && door2.checkMediaEvil === false;
                 console.log('[pac2-notif]', JSON.stringify({ f_pac2_notificationsAllowed, door: door2 }));
 
+                // f_106_clipboardAllowed — the clipboard gate opens (1.0.6 FIX A): a FRESH
+                // probe; the four new clipboard keys must pass AND every carried doorman key
+                // must read EXACTLY as before (the allowlist grew by ONE permission; no other
+                // verdict may drift). (The probe const is `door106` — the f_c3_doorman leg
+                // at :5076 already owns `door` in this scope.)
+                const door106 = await cloudCtl!.doormanProbe();
+                const f_106_clipboardAllowed = door106.clipboardSite === true
+                  && door106.clipboardEvilReq === false
+                  && door106.checkClipboardSite === true && door106.checkClipboardEvil === false
+                  && door106.mediaSite === true && door106.mediaEvil === false && door106.geoSite === false
+                  && door106.checkMediaSite === true && door106.checkMediaEvil === false
+                  && door106.checkNotifications === true && door106.notificationsSite === true
+                  && door106.notificationsEvil === false && door106.notificationsEvilReq === false;
+                console.log('[f106-door]', JSON.stringify({ f_106_clipboardAllowed, door: door106 }));
+
+                // f_106_localSaveChip — the Local ✓-Saved chip (1.0.6 FIX B/C): the controller
+                // method is driven DIRECTLY and the layer is asserted through the REAL page
+                // (statusEval DOM truth — element ids/classes per status.ts/status.html) plus
+                // the main-side probe (statusSnap). Phases: saving (pulse dot, NO progress
+                // track, NO button) → done (✓ Saved flash inside the 1.4 s window, collapse
+                // after main's 1.8 s hold) → fail after a fresh saving (plain hide — NO flash
+                // — then collapse). The layer is left collapsed at leg end. The REAL native
+                // Save dialog cannot be driven headlessly (§6): this leg proves the chip
+                // surface mapping; FIX C's call-site wiring is audit + owner hands-on.
+                await waitFor(async () => {
+                  const p = await statusSnap();
+                  return !p.showing && p.collapsed;
+                }, 4000);
+                cloudCtl!.localSaveChip({ phase: 'saving', name: 'battery.txt' });
+                const saveUp = await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.showing && !p.veilUp && p.bounds.width > 0 && p.bounds.y === STATUS_TOP;
+                }, 4000);
+                // The payload lands page-side a beat after the main-side show (ipc) — poll
+                // the DOM itself so a stale read from a previous presentation can't pass.
+                const saveDomT0 = Date.now();
+                let saveDom: { msg: string; pulse: boolean; trackHidden: boolean; actHidden: boolean; chipShown: boolean } | null = null;
+                for (;;) {
+                  saveDom = await cloudCtl!.statusEval<{ msg: string; pulse: boolean; trackHidden: boolean; actHidden: boolean; chipShown: boolean }>(`({
+                    msg: document.getElementById('msg').textContent,
+                    pulse: document.getElementById('dot').classList.contains('pulse'),
+                    trackHidden: document.getElementById('track').style.display === 'none',
+                    actHidden: document.getElementById('act').style.display === 'none',
+                    chipShown: document.getElementById('chip').classList.contains('showC'),
+                  })`);
+                  if (saveDom.msg === 'Saving battery.txt…' && saveDom.pulse
+                    && saveDom.trackHidden && saveDom.actHidden && saveDom.chipShown) break;
+                  if (Date.now() - saveDomT0 > 3000) break;
+                  await sleep(50);
+                }
+                const savingDomOk = saveDom !== null && saveDom.msg === 'Saving battery.txt…'
+                  && saveDom.pulse === true && saveDom.trackHidden === true
+                  && saveDom.actHidden === true && saveDom.chipShown === true;
+                const saveSnap = await statusSnap();
+                const savingPayloadOk = saveSnap.lastShow !== null
+                  && (saveSnap.lastShow as { label?: unknown }).label === 'Saving battery.txt…'
+                  && (saveSnap.lastShow as { pulse?: unknown }).pulse === true
+                  && (saveSnap.lastShow as { progress?: unknown }).progress === undefined
+                  && (saveSnap.lastShow as { action?: unknown }).action === null;
+
+                cloudCtl!.localSaveChip({ phase: 'done' });
+                const doneT0 = Date.now();
+                let flashDom: { text: string; shown: boolean } | null = null;
+                for (;;) {
+                  flashDom = await cloudCtl!.statusEval<{ text: string; shown: boolean }>(`({
+                    text: document.getElementById('flash').textContent,
+                    shown: document.getElementById('flash').classList.contains('showF'),
+                  })`);
+                  if (flashDom.shown && flashDom.text === '✓ Saved') break;
+                  if (Date.now() - doneT0 > 1100) break; // stay INSIDE the ~1.4 s flash window
+                  await sleep(50);
+                }
+                const doneSnap = await statusSnap();
+                const flashPhaseOk = flashDom !== null && flashDom.shown === true
+                  && flashDom.text === '✓ Saved' && doneSnap.lastHideFlash === '✓ Saved';
+                await sleep(Math.max(0, 1900 - (Date.now() - doneT0))); // ≥ 1.9 s after the hide
+                const doneSnap2 = await statusSnap();
+                const doneCollapsed = !doneSnap2.showing && doneSnap2.collapsed;
+
+                cloudCtl!.localSaveChip({ phase: 'saving', name: 'battery.txt' });
+                await waitFor(async () => {
+                  const p = await statusSnap();
+                  return p.showing && !p.veilUp && p.bounds.width > 0;
+                }, 4000);
+                cloudCtl!.localSaveChip({ phase: 'fail' });
+                const failT0 = Date.now();
+                const failFlashDom = await cloudCtl!.statusEval<{ shown: boolean }>(
+                  `({ shown: document.getElementById('flash').classList.contains('showF') })`);
+                const failSnap = await statusSnap();
+                await sleep(Math.max(0, 500 - (Date.now() - failT0))); // past the 280 ms hold
+                const failSnap2 = await statusSnap();
+                const failPhaseOk = failFlashDom.shown === false && failSnap.lastHideFlash === null
+                  && !failSnap2.showing && failSnap2.collapsed;
+
+                const f_106_localSaveChip = saveUp && savingDomOk && savingPayloadOk
+                  && flashPhaseOk && doneCollapsed && failPhaseOk;
+                console.log('[f106-chip]', JSON.stringify({
+                  f_106_localSaveChip,
+                  matrix: { saveUp, savingDomOk, savingPayloadOk, flashPhaseOk, doneCollapsed, failPhaseOk },
+                  raw: { saveDom, doneHideFlash: doneSnap.lastHideFlash, flashDom, failHideFlash: failSnap.lastHideFlash, failFlashShown: failFlashDom.shown },
+                }));
+
                 // f_pac2_probeKnock — THE KNOCK (FIX D). All four legs drive the state machine
                 // through SEAMS ONLY (netOverride / probe-override / the real forced-fail
                 // handler) so the real WSL network's flaps (-106/-118 seen in run 1) cannot
@@ -7330,11 +7432,23 @@ function registerIpc(): void {
       defaultPath: suggested,
     });
     if (result.canceled || !result.filePath) return { path: null };
-    // Stream decrypt → chosen path (never buffers the whole file for big blobs).
-    const decrypted = manager.streamMedia(entry, 0, Number.POSITIVE_INFINITY);
-    const nodeReadable = Readable.fromWeb(decrypted as unknown as import('node:stream/web').ReadableStream);
-    await pipeline(nodeReadable, createWriteStream(result.filePath));
-    return { path: result.filePath };
+    // 1.0.6 FIX B/C — the Local ✓-Saved chip (owner wish, parked since 1.0.5): the chip layer
+    // floats over BOTH worlds (mainWindow-content chip room), so Local Save-As now speaks to
+    // it. Saving shows only AFTER the dialog — a cancel stays silent (Cloud parity, 1.0.5
+    // FIX A); success flashes ✓ Saved; failure hides quietly — the IPC rejection below stays
+    // the one error signal.
+    cloudCtl?.localSaveChip({ phase: 'saving', name: suggested });
+    try {
+      // Stream decrypt → chosen path (never buffers the whole file for big blobs).
+      const decrypted = manager.streamMedia(entry, 0, Number.POSITIVE_INFINITY);
+      const nodeReadable = Readable.fromWeb(decrypted as unknown as import('node:stream/web').ReadableStream);
+      await pipeline(nodeReadable, createWriteStream(result.filePath));
+      cloudCtl?.localSaveChip({ phase: 'done' });
+      return { path: result.filePath };
+    } catch (err) {
+      cloudCtl?.localSaveChip({ phase: 'fail' });
+      throw err;
+    }
   });
 
   // ---- dialogs
