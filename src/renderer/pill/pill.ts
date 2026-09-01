@@ -11,12 +11,22 @@
  *   dots at rest; blooms to the full 112 × 28 pill while hovered). The boot style comes from
  *   the `?style=` query param that MAIN bakes into the layer URL from its persisted store —
  *   correct from the first frame, no style flash.
- * - Style B hover ⇒ JS-driven bloom (NOT :hover): the same tick the CSS class lands we tell
- *   main via `pill:bloom` so the native view footprint and the CSS width animate together
- *   (§1 ZERO-MISS CLICK RULE). A 90 ms collapse hysteresis (documented deviation-free: §1
- *   allows small hysteresis) swallows accidental edge-grazes without changing any timing.
+ * - Style B hover ⇒ JS-driven bloom (NOT :hover): the CSS class lands and we tell main via
+ *   `pill:bloom` in the same tick. PAC-5: main's setPillBloom is an honest no-op stub — the
+ *   native room is a PERMANENT 132 × 44 stage (never resized), so the report exists purely
+ *   to keep the bridge contract alive. A 90 ms collapse hysteresis (documented
+ *   deviation-free: §1 allows small hysteresis) swallows accidental edge-grazes without
+ *   changing any timing.
  * - Right-click ANYWHERE on the layer toggles A ⇄ B, suppresses the native context menu on
  *   THIS LAYER ONLY, and persists through main (`pill:setStyle`).
+ *
+ * PAC-5 — THE PERMANENT STAGE (both styles). The native room is sized once per style and
+ * NEVER changes at runtime: A = 140 × 28, B = 132 × 44 (cloud.ts). The §1 ZERO-MISS rule
+ * now reads: clicks INSIDE the painted footprint work exactly as before (the hover target
+ * moved onto the painted element — same geometry as the old at-rest footprint); the
+ * room's transparent margin is dead space over the empty header strip both apps keep there
+ * (owner-approved §3.2). All animation is pure in-page CSS — there is no room swap, so the
+ * old entry choreography (blanking, reveal polls, rest-paint gating) is deleted entirely.
  */
 
 interface PillBridge {
@@ -69,13 +79,6 @@ let bloomed = false;
 let collapseTimer: number | null = null;
 const COLLAPSE_HYSTERESIS_MS = 90; // §1-permitted hysteresis — see module doc
 
-/** C2g-hotfix-5 FIX 1 — SAFETY ceiling for the entry reveal poll. This is a safety timeout,
- * NOT an animation timing and NOT part of the ANIMATION CONTRACT: it only bounds how long the
- * blank-paint swap gate may hold the paint if the native room never lands (broken-install path —
- * bridge missing ⇒ no room swap; the loud bridge errors already fire). Normal reveals take
- * ≈2–4 frames, far below this. */
-const PILL_REVEAL_TIMEOUT_MS = 250;
-
 function applyStyle(s: 'A' | 'B'): void {
   style = s;
   document.body.classList.toggle('style-a', s === 'A');
@@ -107,76 +110,39 @@ function forceCollapse(): void {
   if (!bloomed) return;
   bloomed = false;
   document.getElementById('pillB')?.classList.remove('bloomed'); /* CSS starts… */
-  requireBridge('bloom')?.bloom(false); /* …same tick main shrinks the view */
+  requireBridge('bloom')?.bloom(false); /* …bridge contract kept — main's stub is a no-op */
 }
 
-/* Bloom in/out — driven by the layer's own mouseenter/mouseleave (root == the native view
- * footprint), so "leave" fires only when the cursor truly exits the CURRENT footprint.
+/* Bloom in/out — driven by the PAINTED element's own mouseenter/mouseleave (PAC-5: #pillB;
+ * at rest that is the 28 × 28 circle, bloomed the 112 × 28 pill), so "leave" fires only when
+ * the cursor truly exits the painted footprint — the permanent room's transparent margin
+ * stays dead (§3.2).
  * C2g-hotfix-4 FIX 3 — the 90 ms collapse LAG must never close the pill UNDER the cursor: a
  * fast graze (out ~1 px, back within 90 ms) used to leave `forceCollapse` armed behind the
  * `bloomed` short-circuit, so it fired with the pointer inside and hover went stale until a
- * full exit/re-enter. The timer clear now runs BEFORE any early-return; only the style gate
+ * full exit/re-enter. The timer clear runs BEFORE any early-return; only the style gate
  * precedes it. No timing values change.
  *
- * C2g-hotfix-5 FIX 1 — ENTRY CHOREOGRAPHY (blank-paint swap gate). Main resizes the native room
- * 28 → 132 in one instant step the same tick we ask; Chromium can present 1–3 STALE frames of
- * the old bitmap anchored at the NEW room's top-left before the first re-laid-out frame arrives
- * — the owner saw "a few frames coming from the left." So: set logical state FIRST, blank the
- * paint INSTANTLY and transition-free (inline `visibility:hidden` — NOT opacity; the dots/inner
- * own their opacity transitions), THEN send `pill:bloom(true)` so the swap happens over a blank
- * page, then REVEAL only when the page can see that the room landed (`innerWidth > 28`) — the
- * CSS bloom then starts fresh from width 28 in its FINAL room. Reveal always re-checks
- * `bloomed`: a graze that collapsed during the hidden window restores clean rest paint instead
- * of resurrecting a dead bloom, and the safety timeout guarantees no stuck-hidden paint. */
-root?.addEventListener('mouseenter', () => {
+ * PAC-5 — THE ENTRY CHOREOGRAPHY COLLAPSES TO ONE PATH (hotfix-6's fast path IS the only
+ * path): the native room is PERMANENT (window.innerWidth is ALWAYS 132 in style B), so the
+ * old from-rest branch — hotfix-5's blank-then-reveal, PAC-3's rest-paint + reveal poll,
+ * PILL_REVEAL_TIMEOUT_MS — was room-swap machinery for a swap that no longer exists.
+ * Deleting it deletes the PAC-3-era blink mechanism's last habitat: no frame of the entry
+ * can be blank or mispositioned because NOTHING swaps — the bloom is one CSS transition
+ * inside a never-moving room. */
+
+/* The painted element that owns hover. Resolved once; the module only runs on the pill page. */
+const pillEl = document.getElementById('pillB');
+
+pillEl?.addEventListener('mouseenter', () => {
   if (style !== 'B') return;
   if (collapseTimer !== null) { clearTimeout(collapseTimer); collapseTimer = null; } // hysteresis (re-entry always cancels)
   if (bloomed) return;
-  bloomed = true; // logical state FIRST — collapse/circle-click logic must stay correct while hidden
-  const pillEl = document.getElementById('pillB');
-  if (!pillEl) return;
-  if (window.innerWidth > 28) {
-    // C2g-hotfix-6 FIX 1 — RE-ENTRY while the room is ALREADY big (collapse hold pending or a
-    // just-regrown bloom): NO gate, NO visibility churn, NO poll. Nothing here can flash, so
-    // nothing may blink — the old unconditional hide could present one fully-blank frame when
-    // this configuration raced real-machine scheduling (the owner's caught-on-frame blink).
-    // bloom(true) lands on main's existing 132 × 44 hold and CANCELS it — the room never
-    // shrinks under the returning cursor.
-    // Accepted micro-residual (do NOT blank for it): if main's snap fired between the owner's
-    // leave and re-entry (knife-edge), the room resizes 132→28→132 around the visible rebloom —
-    // ≤2 frames of ≤6 px settle twitch on small mid-shrink paint.
-    pillEl.classList.add('bloomed'); /* CSS rebloom starts from the CURRENT width */
-    requireBridge('bloom')?.bloom(true);
-    return;
-  }
-  /* FROM REST (room still exactly 28): the full hotfix-5 entry choreography — hide the paint
-   * INSTANTLY and transition-free (inline `visibility:hidden`; NOT opacity — the dots/inner own
-   * their opacity transitions), send `pill:bloom(true)` so the native swap happens over BLANK
-   * paint, then reveal ONLY when the page can see that the room landed (`innerWidth > 28`) —
-   * the CSS bloom starts fresh from width 28 in its FINAL room. The reveal re-checks `bloomed`
-   * (a graze that collapsed during the hidden window restores clean rest paint instead of
-   * resurrecting a dead bloom); the safety timeout guarantees no stuck-hidden paint. */
-  pillEl.style.visibility = 'hidden'; /* instant, transition-free blank across the room swap */
-  pillEl.classList.remove('bloomed');
-  requireBridge('bloom')?.bloom(true); /* room swaps over blank paint */
-  const startedAt = Date.now();
-  const reveal = (): void => {
-    if (!bloomed) { // collapsed while hidden (fast graze): restore clean REST paint, no bloom class
-      pillEl.style.visibility = '';
-      return;
-    }
-    if (window.innerWidth > 28 || Date.now() - startedAt >= PILL_REVEAL_TIMEOUT_MS) {
-      // Room landed (or safety timeout fired) — start the CSS bloom fresh from width 28 in
-      // the FINAL room, then unblank in the same tick.
-      pillEl.classList.add('bloomed'); /* CSS starts… */
-      pillEl.style.visibility = ''; /* …reveal exactly when the bloom starts */
-      return;
-    }
-    requestAnimationFrame(reveal);
-  };
-  requestAnimationFrame(reveal);
+  bloomed = true; // logical state FIRST — collapse/circle-click logic must stay correct
+  pillEl.classList.add('bloomed'); /* CSS bloom starts: width 28→112, left 52→10, middle-out */
+  requireBridge('bloom')?.bloom(true); /* bridge contract kept — main's stub is a no-op */
 });
-root?.addEventListener('mouseleave', () => {
+pillEl?.addEventListener('mouseleave', () => {
   if (style !== 'B' || !bloomed || collapseTimer !== null) return;
   collapseTimer = window.setTimeout(forceCollapse, COLLAPSE_HYSTERESIS_MS);
 });

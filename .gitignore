@@ -1,8 +1,9 @@
 # dependencies
 node_modules/
 
-# build outputs
+# build outputs (build/ = icon + packaging assets, PACKAGING-1)
 out/
+build/
 dist/
 release/
 

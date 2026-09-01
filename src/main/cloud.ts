@@ -28,14 +28,17 @@
  *   aware width, always), with the 0/100/400 ms deferred re-apply on geometry events.
  */
 
-import { BrowserWindow, app, dialog, net, session, shell, WebContentsView } from 'electron';
+import { BrowserWindow, app, desktopCapturer, net, session, shell, WebContentsView } from 'electron';
 import { join } from 'node:path';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 export const CLOUD_URL = 'https://drag-drop-app.vercel.app';
-const CLOUD_ORIGIN = 'https://drag-drop-app.vercel.app';
+/** Exported for PAC-4's battery leg: the trailing-slash origin (`CLOUD_ORIGIN + '/'`) is the
+ * shape REAL Chromium sends (the owner-diary bug this round fixes) — the leg must spell the
+ * exact same constant the guard compares against, not a re-typed copy. */
+export const CLOUD_ORIGIN = 'https://drag-drop-app.vercel.app';
 const PARTITION = 'persist:cloud';
 /** §3-I2 auth-provider popup allowlist (hostnames). `dropsync-1773445054.firebaseapp.com` is
  * the web app's Firebase authDomain (drag-drop-app/.env.local:5 NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN,
@@ -52,11 +55,13 @@ const AUTH_POPUP_ALLOWLIST = new Set([
 
 /** C2g FIX 1 — floating pill geometry (owner-locked, ported VERBATIM from
  * pill-variants-explainer.html §1: "Variant A — punch-hole", 112 × 28 at TOP-CENTER,
- * 10px from the top). `PILL_B_REST_W` is Style B's at-rest footprint (the 28 × 28 dot-pair);
- * when Style B is hovered/bloomed the VISIBLE pill is the full 112 × 28 (§1 ZERO-MISS CLICK
- * RULE: view bounds always EQUAL the visible pill) — while BLOOMED the native ROOM adds
- * symmetric breathing room around it (`PILL_BLOOM_PAD_*`, hotfix-4 FIX 2), which changes no
- * rest-state footprint. The old C2f values (176/40/14 top-left) are gone. */
+ * 10px from the top). `PILL_B_REST_W` is Style B's at-rest PAGE footprint (the 28 × 28
+ * dot-pair) — PAC-5: PAGE-FOOTPRINT ONLY, the native room no longer derives from it (both
+ * stages are permanent; see PILL_BLOOM_PAD_* / PILL_A_ROOM_PAD_X below); the battery still
+ * imports it to assert the painted circle's rect. The §1 ZERO-MISS CLICK RULE's old
+ * "view bounds always EQUAL the visible pill" contract is superseded by the PAC-5 owner
+ * decision (§3.2): the bounds are the PERMANENT STAGE, clicks inside the painted footprint
+ * work exactly as before, the transparent margin is dead space over the empty header strip. */
 export const PILL_W = 112;
 export const PILL_H = 28;
 export const PILL_TOP = 10;
@@ -96,7 +101,13 @@ export const MELT_READY_TIMEOUT_MS = 400;
  * SCREEN before the world beneath changes: beginMelt resolves true only after the pad — 2-3
  * presented frames of headroom. Invisible by construction (the screen shows the outgoing
  * world under the identical curtain pixels); the melt starts ~50 ms later, still well inside
- * the pill knob's 600 ms swing. */
+ * the pill knob's 600 ms swing.
+ * PAC-3 FIX A (the steady curtain) — the pad now rides ON TOP of a true SUBMISSION ack: the
+ * fader page awaits TWO consecutive requestAnimationFrame callbacks (per-compositor-frame
+ * signals) before reporting ready, so `ready` means the painted curtain frame has been
+ * SUBMITTED to the presentation pipeline (the twitch investigation's cause-1 fix — the pad
+ * was a fixed guess riding a layout moment). The pad value is UNCHANGED and is now pure
+ * extra headroom; Windows tuning data rides the [melt] diagnostic line. */
 export const MELT_SWAP_PAD_MS = 50;
 
 /** C3 STEP 5 (D7) — the snapshot deadline. Owner evidence 2026-08-29: flipping away from a
@@ -115,6 +126,17 @@ export const CAPTURE_DEADLINE_MS = 350;
  * page is just slow). Healthy entries (~1.5 s loads) never see it. */
 export const ENTRY_CONNECT_TIMEOUT_MS = 3000;
 
+/** PAC-2 FIX D — THE KNOCK. net.isOnline() tracks network ADAPTERS, not the internet: the
+ * owner's real-Windows round 2 sat "online" with a dead pipe and the mid-session chip never
+ * came. The knock HEADs the site origin on a timer — ANY http response (any status, redirects
+ * included) proves reachability (a 404 is still an answer); transport error/timeout is a MISS;
+ * misses at threshold flip the flag-lie into the EXISTING degraded chip path (never a veil,
+ * never a reload — D6 holds). Flag-lies coverage: the chip may take ~10-15 s to appear
+ * (interval × threshold + timeouts) — accepted, owner-locked chip-only. */
+export const REACH_PROBE_INTERVAL_MS = 5000;
+export const REACH_PROBE_TIMEOUT_MS = 3000;
+export const REACH_PROBE_MISS_THRESHOLD = 2;
+
 /** C3 STEP 1 (D1) — the STATUS layer: compact chip anchored one comfortable row under the
  * pill band (pill rest bottom edge = PILL_TOP + PILL_H = 38, +12 gap ⇒ 50), height 36.
  * Owner picked the look live from c3-status-strip-preview.html (2026-08-29): ink-bar chip
@@ -130,32 +152,28 @@ export const STATUS_H = 36;
 export const STATUS_FLASH_MS = 1400;
 const STATUS_HIDE_HOLD_MS = 280;
 
-/** C2g-hotfix-4 FIX 2 — Style-B BLOOM-TIME breathing room ONLY (explicit owner-approved
- * trade-off). While bloomed, the native room grows to 132 × 44 so TWO things never clip inside
- * the page: the contracted elastic overshoot (bezier peaks ≈ +8 px past 112 mid-bounce) and the
- * ~7 px drop-shadow halo (which used to render as a hard-edged "box" against the room wall).
- * AT REST the room stays EXACTLY the 28 × 28 footprint — the zero-miss rule at rest is sacred;
- * Style A stays exactly 112 × 28 at all times. The skirt exists only WHILE BLOOMED, when the
- * cursor is by definition on the pill, so it eats no site clicks in practice; hover-out now
- * means clearing the 132 px room, so an open pill "holds" ~10 px longer around its edges
- * (documented behavior, not a bug). */
+/** PAC-5 FIX B — Style B's PERMANENT stage pads. The room is 132 × 44 at y = PILL_TOP − 8 in
+ * EVERY state (rest circle and bloomed pill alike): 10 px sides / 8 px top+bottom cover the
+ * ~7 px shadow halo AND the bloom's contracted elastic overshoot. The hotfix-4-era
+ * "bloom-time only" growth (and PAC-4's origin-fixed variant) is GONE — the room never
+ * changes size or position at runtime, so no resize can ever present a stale frame (§0:
+ * zero moves is a stronger twitch guarantee than origin-fixed growth). Owner-approved cost
+ * (§3.2): the transparent margin is permanently dead to clicks over the empty header strip. */
 export const PILL_BLOOM_PAD_X = 10;
 export const PILL_BLOOM_PAD_Y = 8;
 
-/** C2g-hotfix-6 FIX 2 — Style A FLIP-TIME breathing room ONLY. The knob's contracted elastic
- * transform (0.6s cubic-bezier(0.34,1.56,0.64,1), ~54 px travel) overshoots ≈+6 px past its
- * target on BOTH flip directions; at a rest room of exactly 112 × 28 that overshoot (+ shadow)
- * was hard-clipped by the room wall ("a box with a boundary attached to it"). While a Style A
- * flip is animating or holding, `pillBounds()` returns a 124 × 28 centered room
- * (112 + 2 × PILL_A_FLIP_PAD_X); pad_Y = 0 because the knob never moves vertically. AT REST the
- * room is STILL exactly 112 × 28 — the zero-miss footprint is sacred and untouched. These two
- * constants are NOT animation timings and are NOT part of the ANIMATION CONTRACT: */
-export const PILL_A_FLIP_PAD_X = 6;
-/** …the hold is a CONTRACT COUPLING (= the knob's 0.6 s transform duration + one frame): if the
- * CONTRACT knob duration ever changes, this constant MUST change with it. Same nature as
- * hotfix-5's collapse hold. Accepted micro-residual (documented, do NOT blank for it): when a
- * knife-edge room swap overlaps a click, the rebloom can settle with ≤2 frames of ≤6 px twitch. */
-const PILL_A_FLIP_ROOM_HOLD_MS = 620;
+/** PAC-5 FIX A — Style A's PERMANENT stage breathing room, EACH SIDE. The knob's contracted
+ * elastic transform (0.6s cubic-bezier(0.34,1.56,0.64,1), ~54 px travel) overshoots ≈+5 px
+ * past its target and its shadow reaches ~3 px further; at the old 112 × 28 rest room that
+ * painted into an invisible wall (hotfix-6's "box with a boundary"), and PAC-4's origin-fixed
+ * 12 px right-only pad left the Cloud-ward overshoot clipping at the LEFT wall (the owner's
+ * 1.0.3 "knob sliced flat" verdict). The permanent room is 112 + 2×14 = 140 wide: the painted
+ * pill stays 112 × 28 at window center−56..+56 (pixel-identical rest position) and BOTH end
+ * overshoots paint free. Vertical stays tight (28-tall room — the top/bottom shadow has been
+ * clipped since C2g; unchanged on purpose). NOT an animation timing, NOT part of the
+ * ANIMATION CONTRACT. The old PILL_A_FLIP_PAD_X / PILL_A_FLIP_ROOM_HOLD_MS (transient
+ * flip-time room + contract-coupled hold) are deleted with the whole room-swap machinery. */
+export const PILL_A_ROOM_PAD_X = 14;
 
 /** C2h — minimum gap between gesture→touch feeds so event bursts (key repeats, scroll storms)
  * collapse to one stamp per half-second on the shared idle-auto-lock clock. Policy constant,
@@ -164,14 +182,13 @@ const ACTIVITY_FEED_MIN_GAP_MS = 500;
 
 /** C2g-hotfix-5 FIX 2 — how long the BLOOMED native room (132 × 44) HOLDS after a collapse
  * request, so the CSS shrink (contract: width 0.55s elastic) can play OUTSIDE any clipping wall
- * and the final 28 px snap lands on an exactly-28-wide, centered, invisible-change pill. This is
- * a CONTRACT COUPLING, not an independent animation timing: it equals the contract's width
- * duration (550 ms) plus one frame (~16 ms) — if the CONTRACT width duration ever changes, this
- * constant MUST change with it. Known accepted micro-residual (documented, out of scope): at the
- * snap instant the compositor may present ≤1 stale frame cropped to the new room's top-left — an
- * ≤18×20 px sliver of the pill's left arc shifting ~10 px, at rest size, for ≤16 ms. */
-const PILL_COLLAPSE_ROOM_HOLD_MS = 570;
-
+ * and the final 28 px snap lands on an already-28-wide circle at the SAME origin — an invisible
+ * change. This is a CONTRACT COUPLING, not an independent animation timing: it equals the
+ * contract's width duration (550 ms) plus one frame (~16 ms) — if the CONTRACT width duration
+ * ever changes, this constant MUST change with it. (The old accepted micro-residual — a ≤1
+ * stale frame cropped to the new room's top-left shifting the pill's left arc ~10 px — was an
+ * ORIGIN-MOVE artifact; PAC-4's origin-fixed room pins the origin, so a stale snap frame now
+ * lands exactly in place.) */
 /** C2g — the two owner-approved pill styles. A = "punch-hole" (default on first boot),
  * B = "micro bloom" (28 × 28 dots → blooms to the full pill on hover). Right-click toggles;
  * the choice persists across restarts (FIX 4). */
@@ -213,13 +230,12 @@ export interface CloudController {
   /** C2f FIX 2 — tell the pill layer which mode the app is actually in (knob slides only on
    * this). Queued until the pill layer finishes loading; safe to call at any time. */
   setPillMode(mode: PillMode): void;
-  /** C2g FIX 3 — Style B bloom coupling (ZERO-MISS CLICK RULE): the pill layer reports
-   * hover-enter/leave; main resizes the overlay view to the bloomed (112 × 28) or rest
-   * (28 × 28) footprint RE-CENTERED, in the same tick the CSS transition starts. Idempotent;
-   * bloom requests while Style A is active are ignored. */
+  /** PAC-5 — HONEST NO-OP STUB (kept for bridge compatibility): bloom is pure in-page CSS
+   * inside the PERMANENT 132 × 44 Style B stage. The layer still reports hover enter/leave;
+   * main does no bounds work. */
   setPillBloom(bloomed: boolean): void;
-  /** C2g-hotfix-6 FIX 2 — Style A flip room: grow to 124 × 28 BEFORE the knob's flip transform
-   * starts (the `pill:flip` relay calls this first). Contract-coupled hold then snaps back. */
+  /** PAC-5 — HONEST NO-OP STUB (kept for bridge compatibility): the `pill:flip` relay still
+   * calls this; the stage never moves, so there is nothing to arm. */
   beginPillFlip(): void;
   /** C2g FIX 4 — right-click style toggle lands here: flip state, PERSIST to disk, re-assert
    * bounds for the new style's current footprint. */
@@ -282,8 +298,9 @@ export interface CloudController {
   }>;
   /** C2f FIX 5 — pill-layer evidence for f_c2f_pillPersistent: corner bounds, visibility,
    * load state, and the pill page's own computed transparency (background-color alpha).
-   * C2g: `expected` is now style/bloom-aware (centered), and `style`/`blooming` report the
-   * main-side truth for the f_c2g_* keys. */
+   * C2g: `expected` is the style's PERMANENT stage (PAC-5 — constant per style), and
+   * `style` reports the main-side truth for the f_c2g_* keys. The old `blooming` field is
+   * GONE: bloom is page-CSS state now, read via pillEval's __c2gPill.bloomed. */
   pillProbe(): Promise<{
     bounds: Electron.Rectangle;
     expected: Electron.Rectangle;
@@ -291,7 +308,6 @@ export interface CloudController {
     loaded: boolean;
     bodyBackgroundColor: string;
     style: PillStyle;
-    blooming: boolean;
   }>;
   /** C2g FIX 5 — drive the REAL pill layer's DOM listeners headlessly (battery only, env-gated):
    * dispatches synthetic mouseenter/mouseleave/contextmenu through the layer so the bloom and
@@ -300,6 +316,10 @@ export interface CloudController {
   /** C2g FIX 4/5 — evaluate JS inside the PILL layer (battery-only, env-gated): read computed
    * colors / the __c2gPill fixture. Throws when DROPSYNC_CLOUD_DEV ≠ 1. */
   pillEval<T = unknown>(expr: string): Promise<T>;
+  /** PAC-5 FIX D — battery-only readback capture of the PILL VIEW (env-gated): PNG data URL
+   * of the layer's live pixels, for f_pac5_knobOvershootFree's compositor-truth assert (the
+   * knob's overshoot pixels must paint PAST the painted pill's end, inside the stage pad). */
+  pillCapture(): Promise<string>;
   /** C2g FIX 4 — relaunch JUST the pill layer from disk state (persistence proof without an
    * app restart): re-navigates to pillPageUrl(loadPillStyle()) so the boot path — file → query
    * param → first frame — runs end-to-end. Battery-only, env-gated. */
@@ -385,6 +405,10 @@ export interface CloudController {
     inFlight: boolean;
     bounds: Electron.Rectangle | null;
     collapsed: boolean;
+    /** PAC-3 FIX A — the fader page's submission-ack truth (rafTicksAtReady + the two rAF
+     * timestamps), read from the __c2mFader fixture; null when the page is not loaded or
+     * carries no fixture (prod boots without ?e2e=1). */
+    page: { rafTicksAtReady: number; readyRafAt: number[] } | null;
   }>;
   /** C3 STEP 1 — the status layer's `status:measure` landed (ipcMain in index.ts forwards
    * here): remember the natural content width and re-assert the exact chip room. */
@@ -415,6 +439,10 @@ export interface CloudController {
     attemptFailed: boolean;
     /** C3-hotfix-4 — phantom finishes vetoed (a finish after a stamp = the ERROR document). */
     phantomFinishes: number;
+    /** PAC-2 FIX D — THE KNOCK's live truth: null = not yet judged, false = the net flag was
+     * a LIE (misses at threshold — the degraded chip came from the probe, not the flag). */
+    probeHealthy: boolean | null;
+    probeMisses: number;
     reloadCount: number;
     lastSavePath: string | null;
   }>;
@@ -437,6 +465,10 @@ export interface CloudController {
   /** C3 STEP 4 — test seam for netStatus(): boolean override (null = real net.isOnline()).
    * DEV-gated; the battery drives the offline transitions deterministically. */
   setNetOverride(v: boolean | null): void;
+  /** PAC-2 FIX D — test seam for the knock: injects probe OUTCOMES ('alive' | 'dead'); null =
+   * the real net.request probe. DEV-gated; same seam point and family as setNetOverride —
+   * the verdict machinery the battery tests is the REAL one. */
+  setReachProbeOverride(fn: null | (() => Promise<'alive' | 'dead'>)): void;
   /** C3 STEP 4 — the shared site load-failure path (the factored did-fail-load log + the
    * offline verdict). The real event handler and the battery both land here. */
   onSiteLoadFailed(code: number, isMainFrame: boolean, url: string, desc?: string): void;
@@ -466,7 +498,50 @@ export interface CloudController {
     checkMediaSite: boolean;
     checkMediaEvil: boolean;
     checkNotifications: boolean;
+    /** PAC-2 FIX C — the notifications gate opens (origin-gated like media): the CHECK path
+     * for the evil origin, plus REQUEST-path truth in both directions. */
+    notificationsEvil: boolean;
+    notificationsSite: boolean;
+    notificationsEvilReq: boolean;
   }>;
+  // ==== PAC-2 FIX B — the share picker =======================================================
+  /** The picker page's handshake/relay targets (registered ONCE in index.ts's registerIpc —
+   * the card:click house pattern). NOT DEV-gated: production path. */
+  pickerReady(): void;
+  pickerPick(id: unknown, audio: unknown): void;
+  pickerCancel(): void;
+  /** DEV-gated: invoke the REAL openSharePicker with a synthetic request (defaults: our
+   * origin, video+audio requested, userGesture; fields override — the evil-origin leg
+   * passes securityOrigin). PAC-5: `assumeWin32` is a DEV-only opt that forces the loopback
+   * verdict branch on non-win32 dev machines; the mock callback captures the verdict's
+   * own-property keys into shareProbe().lastVerdictKeys. */
+  sharePickerTest(request?: {
+    securityOrigin?: string;
+    userGesture?: boolean;
+    audioRequested?: boolean;
+    videoRequested?: boolean;
+    assumeWin32?: boolean;
+  }): Promise<void>;
+  /** DEV-gated: drive the REAL pick relay (the same internals the picker:pick ipc lands on). */
+  sharePickerPick(id: string, audio: boolean): void;
+  /** DEV-gated: drive the REAL cancel relay. */
+  sharePickerCancel(): void;
+  /** DEV-gated: the picker's live truth (settle-once evidence = settleCount). */
+  shareProbe(): {
+    open: boolean;
+    sourcesSent: number;
+    lastVideoId: string | null;
+    lastAudio: boolean | null;
+    lastVerdictAudio: 'loopback' | undefined;
+    /** PAC-5 FIX D — the verdict object's own-property keys as the DEV mock callback saw
+     * them (null when the request was denied/cancelled without a pick). */
+    lastVerdictKeys: string[] | null;
+    settleCount: number;
+    canLoopback: boolean;
+  };
+  /** DEV-gated: evaluate JS in the PICKER page (our own page — the statusEval precedent;
+   * the site view is NEVER touched). */
+  pickerEval<T = unknown>(expr: string): Promise<T>;
 }
 
 /** https-only external handoff (I2). Returns true when handed off. */
@@ -597,11 +672,13 @@ function cardPageUrl(): string {
 }
 
 /** C2m — where the FADER page lives (cloned from cardPageUrl): dev server in dev, built
- * multi-page output in production. No query params — the fader carries no persisted state. */
+ * multi-page output in production. PAC-3 FIX A — `?e2e=1` arms the page's __c2mFader
+ * submission-ack fixture, only under DROPSYNC_CLOUD_DEV (the C2g FIX 5 pill precedent). */
 function faderPageUrl(): string {
   const devRoot = process.env.ELECTRON_RENDERER_URL;
-  if (devRoot) return `${devRoot}/fader/fader.html`;
-  return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/fader/fader.html');
+  const suffix = process.env.DROPSYNC_CLOUD_DEV === '1' ? '?e2e=1' : '';
+  if (devRoot) return `${devRoot}/fader/fader.html${suffix}`;
+  return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/fader/fader.html') + suffix;
 }
 
 /** C3 — where the STATUS page lives (cloned from faderPageUrl): dev server in dev, built
@@ -611,6 +688,16 @@ function statusPageUrl(): string {
   const devRoot = process.env.ELECTRON_RENDERER_URL;
   if (devRoot) return `${devRoot}/status/status.html`;
   return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/status/status.html');
+}
+
+/** PAC-2 FIX B — where the PICKER page lives (statusPageUrl clone): dev server in dev, built
+ * multi-page output in production. No query params — the picker carries no persisted state
+ * (theme + sources ride the picker:sources payload; only the audio checkbox persists, in the
+ * page's own localStorage). */
+function pickerPageUrl(): string {
+  const devRoot = process.env.ELECTRON_RENDERER_URL;
+  if (devRoot) return `${devRoot}/picker/picker.html`;
+  return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/picker/picker.html');
 }
 
 export function initCloud(mainWindow: BrowserWindow, opts?: {
@@ -631,15 +718,12 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   let pillView: WebContentsView | null = null;
   let pillLoaded = false;
   let pillModeQueued: PillMode | null = null; // setPillMode before the pill page finished loading
-  // C2g — style + bloom state live in MAIN (single source of truth): bounds math, persistence
-  // and the battery probes all read these; the pill layer mirrors them via IPC.
+  // C2g — style state lives in MAIN (single source of truth): bounds math, persistence and
+  // the battery probes all read it; the pill layer mirrors it via IPC.
+  // PAC-5 — the room-swap state flags (pillBlooming / pillCollapseHold / pillFlipPending /
+  // pillFlipHold) are DELETED with the machinery that used them: both stages are permanent,
+  // nothing resizes at runtime, so there is nothing to arm, hold, or cancel.
   let pillStyle: PillStyle = loadPillStyle();
-  let pillBlooming = false;
-  // C2g-hotfix-5 FIX 2 — armed while the collapse room must WAIT for the CSS shrink to finish.
-  let pillCollapseHold: ReturnType<typeof setTimeout> | null = null;
-  // C2g-hotfix-6 FIX 2 — mirror pair for Style A's flip room (knob overshoot breathing space).
-  let pillFlipPending = false;
-  let pillFlipHold: ReturnType<typeof setTimeout> | null = null;
   const pillConsole: string[] = []; // C2g-hotfix-1 §5 — layer console ring buffer
   // C2m — the fader layer is created EAGERLY at boot (card recipe) and NEVER removed; it is
   // collapsed 0×0 + hidden at rest, so it paints nothing and catches nothing until a melt.
@@ -706,6 +790,36 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   // and isLoading() is unreliable — both fix directions are dead per the probes.
   let attemptFailed = false;
   let phantomFinishes = 0;
+  // PAC-2 FIX D — THE KNOCK's state. probeHealthy: null = never judged (no verdict yet);
+  // false = the net flag is a LIE (misses at threshold); true = the origin answers. The poll
+  // arms with the SAME shape as armOfflinePoll and its condition mirrors offlineTick's
+  // connecting/veil clause — the probe can never fight a veil. reachProbeOverride is the
+  // battery seam (injects OUTCOMES; the real net.request probe below stays the product path —
+  // the exact netOverride/netStatus() shape).
+  let probeHealthy: boolean | null = null;
+  let probeMisses = 0;
+  let reachProbeInterval: ReturnType<typeof setInterval> | null = null;
+  let reachProbeOverride: null | (() => Promise<'alive' | 'dead'>) = null;
+  // PAC-2 FIX B — OUR PICKER. One live request/window at a time; per-request settle-once.
+  let pickerWin: BrowserWindow | null = null;
+  let pickerSettled = true;
+  let pickerSettleCount = 0; // battery evidence: EVERY request settles EXACTLY once
+  let pickerSources: Electron.DesktopCapturerSource[] = []; // the EXACT whitelist sent this session
+  let pickerCanLoopback = false;
+  let pickerCallback: ((streams: Electron.Streams) => void) | null = null;
+  let pickerLastVideoId: string | null = null; // the verdict's video source id (null = denied)
+  let pickerLastAudio: boolean | null = null; // the audio flag the pick relay carried
+  let pickerLastVerdictAudio: 'loopback' | undefined = undefined; // the verdict handed to the site
+  // PAC-5 FIX D — DEV evidence: the verdict object's OWN PROPERTY keys as the mock callback
+  // received them (sharePickerTest's callback captures them). THE e2e truth: `{ video }`
+  // ⇒ ['video']; the old `{ video, audio: undefined }` ⇒ ['video','audio'] (an own property
+  // with an undefined value — the exact shape Electron 43's validator chokes on).
+  let pickerLastVerdictKeys: string[] | null = null;
+  let pickerPayload: {
+    theme: unknown;
+    canLoopback: boolean;
+    sources: Array<{ id: string; name: string; isScreen: boolean; thumbnail: string; appIcon: string | null }>;
+  } | null = null; // the EXACT payload sent this session (pickerReady sends it on handshake)
   // C3 STEP 2 — downloads. One chip, latest-active-wins (D2); a download outlives a flip.
   interface DownloadRec { path: string; name: string }
   const activeDownloads = new Map<Electron.DownloadItem, DownloadRec>();
@@ -727,35 +841,42 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   };
 
   /** C2d self-heal, generalized (FIX 1): the site view is TRUE FULL WINDOW {0,0,w,h}; the pill
-   * is glued TOP-CENTER (C2g), style/bloom-aware in width. Pure functions of the window. */
+   * is glued TOP-CENTER (C2g). Pure functions of the window. */
   const siteBounds = (): Electron.Rectangle => {
     const b = mainWindow.getContentBounds();
     return { x: 0, y: 0, width: b.width, height: b.height };
   };
-  const pillWidth = (): number => (pillStyle === 'A' || pillBlooming ? PILL_W : PILL_B_REST_W);
-  /** C2g-hotfix-4 FIX 2 — the native ROOM for the current style/bloom state. Style A: exactly
-   * the 112 × 28 pill. B at rest: exactly the 28 × 28 footprint (zero-miss rule untouched).
-   * B bloomed: pill + symmetric skirt (`PILL_BLOOM_PAD_*`) so the elastic overshoot and the
-   * shadow halo paint INSIDE the page instead of against a clipping wall. Room-center arithmetic
-   * that makes this safe for the center-anchored page (#pillB uses left/top 50% + translate):
-   * rest center y = 10+14 = 24; bloomed room center y = (10−8)+22 = 24 ✓; x is centered in both
-   * ✓ ⇒ the painted circle NEVER moves when the room swaps. syncBounds, the watchdog and every
-   * resize/fullscreen handler read bounds through here, so they all inherit the room. */
+  // PAC-5 — PERMANENT STAGES. The room is sized once per style and NEVER changes at runtime:
+  // no width/height swaps, no origin moves — the twitch mechanism's required ingredient is
+  // gone entirely (stronger than PAC-4's origin-fixed growth). All animation is in-page CSS.
+  // A: 140 × 28 — the 112 × 28 pill centered with 14 px breathing room each side, so the
+  // knob's ~5 px elastic overshoot (+ its shadow) paints free on BOTH ends (the B2 clip is
+  // dead). Vertical stays tight: the pill's top/bottom shadow has ALWAYS been clipped at rest
+  // (28-tall rooms since C2g) — unchanged on purpose.
+  // B: 132 × 44 at y = PILL_TOP − 8 — the 28 × 28 rest circle sits centered (room 52..80 ×
+  // 8..36 → window center−14..+14 × PILL_TOP..PILL_TOP+28, byte-identical to every older
+  // layout) and the bloomed 112 × 28 pill ALSO fits centered (room 10..122 × 8..36 → window
+  // center±56 × PILL_TOP..+28 — the pre-PAC-4 look, no down-settle). Pads: 10 px sides /
+  // 8 px top+bottom cover the ~7 px shadow halo. The room's bottom (PILL_TOP+36 = 46) clears
+  // the status chip (STATUS_TOP = 50) by 4 px — verified.
+  // The page anchors its content inside these constants (pill.html PAC-5: #pillA left 14;
+  // #pillB left 52/top 8 rest → left 10/width 112 bloomed — middle-out, no vertical move).
+  // syncBounds, the 1 s watchdog and every resize/fullscreen handler read bounds through
+  // here, so they all inherit the room (they become trivial re-asserts).
   const pillBounds = (): Electron.Rectangle => {
     const b = mainWindow.getContentBounds();
-    // C2g-hotfix-6 FIX 2 — Style A FLIP room: only while the knob's elastic transform is
-    // animating or on hold. Rest stays exactly 112 × 28 centered (zero-miss sacred).
-    if (pillStyle === 'A' && (pillFlipPending || pillFlipHold !== null)) {
-      const w = PILL_W + PILL_A_FLIP_PAD_X * 2; // 124
+    if (pillStyle === 'A') {
+      const w = PILL_W + PILL_A_ROOM_PAD_X * 2; // 140
       return { x: Math.round((b.width - w) / 2), y: PILL_TOP, width: w, height: PILL_H };
     }
-    if (pillStyle === 'B' && (pillBlooming || pillCollapseHold !== null)) {
-      const w = PILL_W + PILL_BLOOM_PAD_X * 2; // 132
-      const h = PILL_H + PILL_BLOOM_PAD_Y * 2; // 44
-      return { x: Math.round((b.width - w) / 2), y: PILL_TOP - PILL_BLOOM_PAD_Y, width: w, height: h };
-    }
-    const w = pillWidth();
-    return { x: Math.round((b.width - w) / 2), y: PILL_TOP, width: w, height: PILL_H };
+    const w = PILL_W + PILL_BLOOM_PAD_X * 2; // 132
+    const h = PILL_H + PILL_BLOOM_PAD_Y * 2; // 44
+    return {
+      x: Math.round((b.width - w) / 2),
+      y: PILL_TOP - PILL_BLOOM_PAD_Y, // 2
+      width: w,
+      height: h,
+    };
   };
 
   /** Idempotent bounds assertion: writes (and logs) ONLY on real drift, so the resize handlers,
@@ -854,72 +975,30 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       return;
     }
     pillView?.webContents.send('pill:setMode', mode);
-    // C2g-hotfix-6 — every DELIVERED mode can start the knob's elastic slide (boot-time slide
-    // included), so arm the flip room here too. A same-mode push runs no transition and a
-    // re-arm is harmless (620 ms later, syncBounds finds no drift). Early-returns inside
-    // beginPillFlip for non-A styles.
+    // PAC-5 — beginPillFlip is an honest no-op stub (the stage never moves; kept so the
+    // `pill:flip` relay in index.ts stays untouched). Every DELIVERED mode still runs the
+    // knob's elastic slide purely in-page.
     beginPillFlip();
   };
 
-  // C2g-hotfix-6 FIX 2 — Style A flip room: called from the `pill:flip` relay BEFORE the
-  // renderer even starts its guarded switch (room big before the knob's class lands) and from
-  // setPillMode's delivery path. Re-flips re-arm idempotently (a rapid storm holds the room;
-  // ONE snap PILL_A_FLIP_ROOM_HOLD_MS after the last flip, onto the settled pixel-identical
-  // pill). Style B is unaffected: its bloom/collapse room logic owns bounds while style B.
-  const beginPillFlip = (): void => {
-    if (!pillView || pillStyle !== 'A') return;
-    pillFlipPending = true;
-    if (pillFlipHold !== null) clearTimeout(pillFlipHold);
-    pillFlipHold = setTimeout(() => {
-      pillFlipHold = null;
-      pillFlipPending = false; // room returns to the exact rest footprint
-      syncBounds();
-    }, PILL_A_FLIP_ROOM_HOLD_MS);
-    syncBounds(); // grow NOW (before the knob's class lands)
-  };
+  // PAC-5 — HONEST NO-OP STUB. The `pill:flip` relay (index.ts:6634) and setPillMode still
+  // call this for bridge compatibility; the stage never moves, so there is nothing to arm.
+  // The knob's overshoot breathes inside the PERMANENT 140 × 28 room (PILL_A_ROOM_PAD_X);
+  // no hold timers exist anymore.
+  const beginPillFlip = (): void => {};
 
-  // C2g FIX 3 — bloom coupling. Idempotent + validated: Style A never blooms, and a request for
-  // the state we're already in is a no-op (rapid hover storms collapse to nothing). The bounds
-  // re-assert runs in the SAME tick the layer starts its CSS transition (the layer adds its
-  // class before sending this IPC), so bloom/collapse looks seamless.
-  const setPillBloom = (bloomed: boolean): void => {
-    if (!pillView || pillStyle !== 'B') return; // A has no bloom; nothing to resize
-    if (bloomed) {
-      // C2g-hotfix-5 — re-hover DURING a collapse hold: the room must never shrink under a
-      // returning cursor. Cancel the hold, then grow exactly like a fresh bloom.
-      if (pillCollapseHold !== null) { clearTimeout(pillCollapseHold); pillCollapseHold = null; }
-      if (!pillBlooming) {
-        pillBlooming = true;
-        syncBounds();
-      }
-      return;
-    }
-    // C2g-hotfix-5 FIX 2 — collapse request: the pill's LOGICAL state collapses immediately
-    // (dots return, knob state correct), but the ROOM HOLDS at 132 × 44 for
-    // PILL_COLLAPSE_ROOM_HOLD_MS while the CSS shrink plays outside every clipping wall; the
-    // delayed syncBounds() then snaps to the tight 28 × 28 rest room onto an already-28-wide,
-    // centered pill — an invisible change. Idempotence: a second bloom(false) while already
-    // collapsing on hold does not push the deadline out.
-    if (!pillBlooming && pillCollapseHold === null) return;
-    pillBlooming = false;
-    if (pillCollapseHold !== null) clearTimeout(pillCollapseHold);
-    pillCollapseHold = setTimeout(() => {
-      pillCollapseHold = null;
-      syncBounds();
-    }, PILL_COLLAPSE_ROOM_HOLD_MS);
-  };
+  // PAC-5 — HONEST NO-OP STUB (log-silent). The pill page still reports hover enter/leave
+  // and this stays on the controller/bridge for compatibility, but the bloom is now PURE
+  // in-page CSS inside the PERMANENT 132 × 44 B room — no bounds work happens here.
+  const setPillBloom = (_bloomed: boolean): void => {};
 
-  // C2g FIX 4 — right-click toggle: flip, PERSIST, re-assert bounds for the new footprint.
+  // C2g FIX 4 — right-click toggle: flip state, PERSIST, re-assert bounds for the new style's
+  // PERMANENT stage (PAC-5: the two rooms are constants per style — this is a trivial
+  // re-assert; no hold timers exist to cancel anymore).
   const setPillStyle = (style: PillStyle): void => {
     if (style !== 'A' && style !== 'B') return;
     if (pillStyle === style) return;
     pillStyle = style;
-    if (style === 'A') pillBlooming = false; // A's footprint is always the full pill
-    // C2g-hotfix-5/6 — a right-click mid-collapse or mid-flip must leave NO stale room-hold
-    // timer behind (the new style's footprint is asserted right below).
-    if (pillCollapseHold !== null) { clearTimeout(pillCollapseHold); pillCollapseHold = null; }
-    if (pillFlipHold !== null) { clearTimeout(pillFlipHold); pillFlipHold = null; }
-    pillFlipPending = false;
     savePillStyle(style);
     console.log('[pill] style persisted:', style);
     syncBounds();
@@ -1067,7 +1146,8 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
 
   /** C2m-hotfix-1 — PHASE 1 of the covered swap: inflate the fader and hand it the outgoing
    * world's still frame (`png`, captured BEFORE the swap by index.ts), then WAIT for the
-   * page's `fader:ready` (curtain painted) PLUS the hotfix-2 swap pad (presented pixels).
+   * page's `fader:ready` (the curtain frame SUBMITTED — PAC-3's two-rAF ack) PLUS the
+   * hotfix-2 swap pad (headroom on top).
    * Resolves true ⇒ the caller may swap the world beneath the curtain; false ⇒ fail-open
    * instant flip (deadline, page not loaded, or a cancel). A new flip while a melt is in
    * flight collapses instantly (cancel — owner decision 4) and proceeds. The settle grace is
@@ -1099,8 +1179,9 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
 
   /** C2m-hotfix-1 — the page's `fader:ready` landed (ipcMain in index.ts forwards here):
    * C2m-hotfix-2 — do NOT resolve the awaiter directly: arm the MELT_SWAP_PAD_MS pad so the
-   * curtain's first frames reach the SCREEN before the caller swaps the world (ready = layout
-   * commit, not presented pixels). A stray ready with none pending = no-op. */
+   * curtain's first frames reach the SCREEN before the caller swaps the world (ready = the
+   * page's submission ack since PAC-3 FIX A — two rAF past the layout commit — plus this pad
+   * as pure headroom). A stray ready with none pending = no-op. */
   const faderReady = (): void => {
     if (faderReadyTimer !== null) {
       clearTimeout(faderReadyTimer);
@@ -1464,6 +1545,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     connectingUp = false;
     collapseStatus();
     armOfflinePoll();
+    armReachProbe(); // PAC-2 FIX D — a healthy page is exactly when the knock should listen
   };
 
   /** The poll: ONLY while cloud is shown or a non-OK state is active (zero cost otherwise).
@@ -1498,14 +1580,21 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
         void view?.webContents.loadURL(CLOUD_URL);
         armConnectWatchdog(); // FIX B(h2) — a fresh recovery reload is watchdog-covered too
         armOfflinePoll();
+        armReachProbe(); // PAC-2 FIX D — pairing; the connecting veil below disarms it
       }
       return;
     }
     if (offlineState === 'degraded') {
-      if (online) {
+      // PAC-2 FIX D — the flag alone can NEVER declare recovery while the knock says dead:
+      // net.isOnline() tracks adapters, not the internet (the owner sat "online" with a dead
+      // pipe and watched nothing happen). probeHealthy === false holds the chip; the probe's
+      // own ALIVE verdict re-opens the gate (probeHealthy true, misses reset).
+      if (online && probeHealthy !== false) {
+        probeMisses = 0; // PAC-2 FIX D — recovery resets the miss streak
         offlineState = 'ok';
         statusHide('✓ Back online'); // flash; NO reload mid-cloud (D6)
         armOfflinePoll();
+        armReachProbe();
       }
       return;
     }
@@ -1528,6 +1617,81 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     }
   };
 
+  // ==== PAC-2 FIX D — THE KNOCK ==============================================================
+  // A reachability probe that cannot lie. net.isOnline() reads ADAPTERS; this HEADs the site
+  // origin itself. ANY http response ⇒ ALIVE (any status, redirects included — a 404 still
+  // proves the pipe reaches the server); transport error/timeout ⇒ MISS.
+  const reachProbeOnce = async (): Promise<'alive' | 'dead'> => {
+    if (reachProbeOverride) return reachProbeOverride(); // battery seam injects the outcome
+    return await new Promise<'alive' | 'dead'>((resolve) => {
+      let settled = false;
+      const done = (v: 'alive' | 'dead'): void => {
+        if (settled) return;
+        settled = true;
+        resolve(v);
+      };
+      let req: Electron.ClientRequest;
+      try {
+        req = net.request({ method: 'HEAD', url: new URL('/favicon.ico', CLOUD_URL).toString() });
+      } catch {
+        done('dead');
+        return;
+      }
+      const timer = setTimeout(() => {
+        try { req.abort(); } catch { /* already gone */ }
+        done('dead'); // timeout = a MISS (the adapter may be up; the internet is not)
+      }, REACH_PROBE_TIMEOUT_MS);
+      req.on('response', () => {
+        clearTimeout(timer);
+        done('alive');
+      });
+      req.on('error', () => {
+        clearTimeout(timer);
+        done('dead');
+      });
+      req.end();
+    });
+  };
+
+  /** The knock's tick. The run-condition mirrors offlineTick's connecting/veil clause — the
+   * probe runs ONLY while the presentation is quiet enough to hear a verdict (cloud shown,
+   * no connecting veil, no status veil, state 'ok' or 'degraded'); re-checked at fire time
+   * so a veil that appeared mid-interval is never fought. */
+  const reachTick = async (): Promise<void> => {
+    if (mainWindow.isDestroyed()) return;
+    if (!shown || connectingUp || statusVeilUp) return;
+    if (offlineState !== 'ok' && offlineState !== 'degraded') return;
+    const verdict = await reachProbeOnce();
+    if (verdict === 'dead') {
+      probeMisses += 1;
+      if (probeMisses >= REACH_PROBE_MISS_THRESHOLD) {
+        if (probeHealthy !== false) {
+          console.log('[cloud] reach probe DEAD ×' + probeMisses + ' while the net flag claims online — flag lie caught, degraded chip up');
+        }
+        probeHealthy = false;
+        if (offlineState === 'ok') setOfflineState('degraded'); // the EXISTING chip path — never 'entry-failed', never a veil, never a reload
+      }
+      return;
+    }
+    probeHealthy = true;
+    probeMisses = 0;
+  };
+
+  /** Arm/disarm the reach poll — SAME shape as armOfflinePoll, and a LEADING probe on the
+   * disarmed→armed transition (a fresh arm answers within one timeout, not one interval). */
+  const armReachProbe = (): void => {
+    const needed = shown && !connectingUp && !statusVeilUp
+      && (offlineState === 'ok' || offlineState === 'degraded');
+    if (needed && reachProbeInterval === null) {
+      reachProbeInterval = setInterval(() => { void reachTick(); }, REACH_PROBE_INTERVAL_MS);
+      void reachTick(); // leading edge — the first verdict lands now, not in 5 s
+    } else if (!needed && reachProbeInterval !== null) {
+      clearInterval(reachProbeInterval);
+      reachProbeInterval = null;
+    }
+  };
+  // ==== END PAC-2 FIX D ======================================================================
+
   const setOfflineState = (next: OfflineState): void => {
     if (offlineState === next) return;
     offlineState = next;
@@ -1547,6 +1711,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       statusShow({ kind: 'offline', label: 'Waiting for internet…', pulse: true, action: 'switch-local' });
     }
     armOfflinePoll();
+    armReachProbe(); // PAC-2 FIX D — the knock listens while 'ok' or 'degraded', never under a veil
   };
 
   /** Mode change to local: the veil is cloud-only — clear EVERYTHING offline (edge case).
@@ -1554,11 +1719,18 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
    * 'ok' while the connecting card is up — never early-return past it). */
   const clearOfflineState = (): void => {
     clearConnectWatchdog();
+    // PAC-2 FIX D — the knock belongs to the cloud presentation: a mode change resets it
+    // entirely (null = never judged) and disarms. BEFORE the early return — the reset is
+    // unconditional housekeeping; the veil-clear below is the conditional part.
+    probeHealthy = null;
+    probeMisses = 0;
+    armReachProbe(); // shown is false in local ⇒ disarms; re-arms by condition if ever not
     if (offlineState === 'ok' && !connectingUp) return;
     offlineState = 'ok';
     connectingUp = false;
     collapseStatus();
     armOfflinePoll();
+    armReachProbe(); // PAC-2 FIX D — pairing; disarms in local (shown false)
   };
 
   /** C3 STEP 4 — the SHARED load-failure path: the C1 did-fail-load log + the offline
@@ -1629,9 +1801,11 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   // STEP 3 (D3) — the DOORMAN handlers, hoisted to controller scope so doormanProbe can
   // invoke them DIRECTLY (the only deterministic allow-path proof). Registered on the site
   // partition session ONLY — our tiny layers keep their deny-all handlers on the default
-  // session. Allow ONLY 'media' (mic + camera) AND only from the site origin; everything
-  // else denies with a one-line log. The CHECK handler is what makes the site's own
-  // Permissions-API gate report "granted" (un-deads the voice buttons).
+  // session. Allow ONLY 'media' (mic + camera) AND 'notifications' (PAC-2 FIX C — the site's
+  // own Notification.permission read 'denied' forever, so its code skipped every fire; grant
+  // is silent, origin-gated, same posture as mic/camera: our site, our shell) — and only from
+  // the site origin; everything else denies with a one-line log. The CHECK handler is what
+  // makes the site's own Permissions-API gate report "granted" (un-deads the voice buttons).
   // electron.d.ts verified: details.requestingUrl exists (PermissionRequest, REQUIRED);
   // wc.mainFrameUrl does NOT exist on this build — the verified fallback is wc.mainFrame.url
   // (flagged in the report; see the correction comment in sitePermissionRequest).
@@ -1652,7 +1826,9 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     // wc.mainFrameUrl" — that method does NOT exist on Electron 43 (electron.d.ts verified).
     // The verified equivalent is `wc.mainFrame.url` (WebFrameMain.url: string, d.ts:19189).
     const source = details.requestingUrl ?? (wc.isDestroyed() ? '' : wc.mainFrame.url);
-    const ok = permission === 'media' && originOf(source) === CLOUD_ORIGIN;
+    // PAC-2 FIX C — 'notifications' joins the allowlist (still strictly origin-gated below):
+    // the site gates its own toasts on Notification.permission, which read 'denied' forever.
+    const ok = (permission === 'media' || permission === 'notifications') && originOf(source) === CLOUD_ORIGIN;
     // FIX C — EVERY verdict is loud, grants included (the mic bug taught us: an invisible
     // refusal path is undebuggable; the request log shows the EXACT permission string the
     // site sent, which is the evidence the allowlist must match).
@@ -1664,7 +1840,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     permission: string,
     requestingOrigin: string,
   ): boolean => {
-    const ok = permission === 'media' && originOf(requestingOrigin) === CLOUD_ORIGIN;
+    const ok = (permission === 'media' || permission === 'notifications') && originOf(requestingOrigin) === CLOUD_ORIGIN;
     // FIX C — log EVERY invocation: what the site's Permissions-API query asked us, and what
     // we answered. If the query never consults this handler, the silence is itself evidence.
     console.log('[cloud] permission-check', permission, requestingOrigin, ok ? '→ granted' : '→ denied');
@@ -1713,9 +1889,17 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     // STEP 2 (D2) — native Save As EVERY time; chip rides the copy phase; Cancel/interrupt
     // leaves NO partial file. BUILD-SPECIFIC FINDING (standalone probe, 2026-08-29): on this
     // Electron, `event.preventDefault()` makes ANY downloadURL-initiated item fire
-    // done('cancelled') @ 0 bytes — even with a later setSavePath — so the e2e seam uses the
-    // documented no-dialog pattern (sync setSavePath, NO preventDefault) instead, and the
-    // real user path keeps the order's letter (preventDefault → OUR dialog → setSavePath).
+    // done('cancelled') @ 0 bytes — even with a later setSavePath. The owner's packaged-Windows
+    // diary (2026-09-01) proved that finding was never downloadURL-specific: the REAL user
+    // path was dead on the installed app — preventDefault → OUR
+    // showSaveDialog, and by the time the pick came back the DownloadItem was already
+    // done('cancelled') @ 0 bytes, so the `item.getState() !== 'progressing'` guard silently
+    // ate the user's pick: no chip, no file, no error (dev never saw it — battery/dev runs
+    // ride the e2e seam, no dialog). THE CURE (order 1.0.5 FIX A): do NOT preventDefault —
+    // Electron then shows its OWN native Save-As dialog and the item SURVIVES the dialog by
+    // design — and never setSavePath on this path; the chip wires from the first 'updated'
+    // whose getSavePath() is non-empty. A dialog cancel fires done('cancelled') with no save
+    // path ⇒ no chip is ever wired, nothing to clean — silent by design.
     partitionSession.on('will-download', (event, item) => {
       const name = item.getFilename();
       if (e2eSeamArmed) {
@@ -1730,15 +1914,17 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
         wireDownloadChip(item, savePath, name);
         return;
       }
-      event.preventDefault(); // we own the save path (never Electron's implicit dialog)
-      void dialog.showSaveDialog(mainWindow, { defaultPath: name }).then((r) => {
-        if (r.canceled || !r.filePath) {
-          item.cancel(); // the user said no — nothing was written yet
-          return;
+      // REAL USER PATH (1.0.5 FIX A) — the native flow: NO preventDefault (Electron's own
+      // Save-As runs; the item survives it), NO setSavePath (the user's pick IS the save
+      // path). The chip wires exactly once, on the first 'updated' that reports one.
+      let chipWired = false;
+      item.on('updated', () => {
+        if (chipWired) return;
+        const savePath = item.getSavePath();
+        if (savePath.length > 0) {
+          chipWired = true;
+          wireDownloadChip(item, savePath, name);
         }
-        if (item.getState() !== 'progressing') return; // interrupted while the dialog was open
-        item.setSavePath(r.filePath);
-        wireDownloadChip(item, r.filePath, name);
       });
     });
 
@@ -1748,15 +1934,233 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     partitionSession.setPermissionCheckHandler((wc, permission, requestingOrigin) =>
       sitePermissionCheck(wc, permission, requestingOrigin));
 
-    // STEP 3 (D4) — screen share: Windows' own picker where it exists (useSystemPicker);
-    // this body runs ONLY where no system picker exists (this WSL dev box) — deny loudly.
-    // electron.d.ts verified: Streams' fields are all optional ⇒ callback({}) denies.
-    partitionSession.setDisplayMediaRequestHandler((_request, callback) => {
-      console.error('[cloud] screen-share DENIED (no system picker on this platform — dev/WSL; the real Windows build gets the native "choose what to share" picker)');
-      callback({});
-    }, { useSystemPicker: true });
+    // PAC-2 FIX B — screen share: OUR picker, everywhere. The C3-era handler trusted
+    // `useSystemPicker` — macOS-experimental per electron.d.ts (:13324-13348), ABSENT on
+    // Windows — so on the owner's real Windows this body ran and DENIED: the share button
+    // did nothing. The opts are GONE (default false; our picker runs identically on every
+    // platform) and the body hands the request to the picker we own.
+    partitionSession.setDisplayMediaRequestHandler((request, callback) => {
+      void openSharePicker(request, callback);
+    });
   };
   attachC3SessionHandlers();
+
+  // ==== PAC-2 FIX B — OUR PICKER =============================================================
+  // The share dialog WE own (owner decision: "the picker is OURS — no system picker anywhere").
+  // A CHILD BrowserWindow (modal, parent = mainWindow) over our own picker page — NEVER a
+  // contentView layer: the z-law (site < fader < card < status < pill) and every childViews
+  // count assertion stay untouched. Same trusted-page recipe as the card: sandboxed
+  // least-privilege preload, strict CSP, zero remote assets, textContent-only labels. EVERY
+  // path is loud-logged and settles the request EXACTLY once — a double call is a bug.
+  const pickerLog = (...parts: unknown[]): void => { console.log('[picker]', ...parts); };
+
+  /** Close the picker window (idempotent). Its 'closed' event clears the ref and settles an
+   * unsettled request as a cancel-deny. */
+  const closePickerWindow = (): void => {
+    if (pickerWin && !pickerWin.isDestroyed()) pickerWin.close();
+    pickerWin = null;
+  };
+
+  /** The ONE settle gate — exactly once per request on EVERY path (pick / cancel / Esc /
+   * window closed / parent closed). Closes the window, then hands the verdict to the site. */
+  const settlePicker = (verdict: Electron.Streams, why: string): void => {
+    if (pickerSettled) return; // settle-once — PAC-2 FIX B rule 8
+    pickerSettled = true;
+    pickerSettleCount += 1;
+    pickerLastVerdictAudio = verdict.audio === 'loopback' ? 'loopback' : undefined;
+    closePickerWindow();
+    pickerLog('settled:', why, JSON.stringify({ video: pickerLastVideoId, audio: pickerLastVerdictAudio ?? null }));
+    const cb = pickerCallback;
+    pickerCallback = null;
+    // PAC-4 FIX A — silent deny: Electron 43's `callback({})` THROWS
+    // `TypeError: Video was requested, but no video stream was provided` when the site asked
+    // for video and the verdict is an empty stream (every deny AND every cancel). The page
+    // still receives its clean DOMException rejection (owner diary: the site rejected
+    // cleanly), so deny/cancel WORK — noisily. Swallow the main-side throw; page semantics
+    // unchanged. (A real pick passes a video stream and cannot hit this.)
+    // PAC-5 FIX C — log the REAL error: the old fixed string mislabeled every throw as
+    // "empty streams" noise, which is exactly what hid the undefined-audio-key bug for a
+    // round (the real message names the true shape).
+    try {
+      cb?.(verdict);
+    } catch (e) {
+      pickerLog('callback threw (swallowed — deny/empty verdicts throw by design):', (e as Error)?.message ?? String(e));
+    }
+  };
+
+  const cancelPicker = (why: string): void => {
+    pickerLastVideoId = null;
+    settlePicker({}, 'cancel — ' + why);
+  };
+
+  /** Deny WITHOUT ever opening anything (guard rejects): still settles EXACTLY once, empty. */
+  const denyPicker = (why: string, callback: (streams: Electron.Streams) => void): void => {
+    pickerLog('deny:', why);
+    pickerSettled = true;
+    pickerSettleCount += 1;
+    pickerLastVideoId = null;
+    pickerLastAudio = null;
+    pickerLastVerdictAudio = undefined;
+    // PAC-4 FIX A — the same silent-deny swallow as settlePicker (this IS the deny path:
+    // callback({}) is the exact empty-stream invocation Electron 43 throws on).
+    // PAC-5 FIX C — log the REAL error (see settlePicker).
+    try {
+      callback({});
+    } catch (e) {
+      pickerLog('callback threw (swallowed — deny/empty verdicts throw by design):', (e as Error)?.message ?? String(e));
+    }
+  };
+
+  const openSharePicker = async (
+    request: Electron.DisplayMediaRequestHandlerHandlerRequest,
+    callback: (streams: Electron.Streams) => void,
+  ): Promise<void> => {
+    // Guards, IN ORDER (rule 1). Every reject settles exactly once, empty, never opens a window.
+    if (mainWindow.isDestroyed()) {
+      denyPicker('main window destroyed', callback);
+      return;
+    }
+    // PAC-4 FIX A — the guard reads an ADDRESS, not a typing. The owner's diary caught the
+    // real-site share dying as `[picker] deny: foreign securityOrigin
+    // https://drag-drop-app.vercel.app/` — real Chromium's securityOrigin carries a TRAILING
+    // SLASH while CLOUD_ORIGIN (cloud.ts top) has none, so this raw-string comparison refused
+    // OUR OWN SITE on every real share click (twice in the diary, 9 s apart; the dev battery
+    // always passed the exact constant, which is why only real hardware could reveal it).
+    // originOf() is the SAME normalization the media-permission checks above already use
+    // (new URL(...).origin strips paths/trailing slashes) — exactly why mic/camera kept
+    // working while share died. The deny LOG below keeps the RAW string for evidence.
+    if (originOf(request.securityOrigin) !== CLOUD_ORIGIN) {
+      denyPicker('foreign securityOrigin ' + String(request.securityOrigin), callback);
+      return;
+    }
+    if (!request.userGesture) {
+      denyPicker('no user gesture — a share must come from a real click', callback);
+      return;
+    }
+    if (pickerWin !== null) {
+      denyPicker('picker already open — one at a time (the NEW request is refused)', callback);
+      return;
+    }
+    pickerSettled = false;
+    pickerLastVideoId = null;
+    pickerLastAudio = null;
+    pickerLastVerdictAudio = undefined;
+    pickerLastVerdictKeys = null; // PAC-5 — fresh per request; the DEV mock callback fills it
+    pickerCallback = callback;
+    // Loopback = system audio into the call. Windows-only supported (electron.d.ts :23740) —
+    // and only meaningful when the site actually asked for audio.
+    pickerCanLoopback = process.platform === 'win32' && request.audioRequested;
+    const sources = await desktopCapturer.getSources({
+      types: ['screen', 'window'],
+      thumbnailSize: { width: 320, height: 180 },
+      fetchWindowIcons: true,
+    });
+    pickerSources = sources; // the pick is whitelist-validated against EXACTLY this list
+    pickerPayload = {
+      theme: currentTheme?.(),
+      canLoopback: pickerCanLoopback,
+      sources: sources.map((s) => ({
+        id: s.id,
+        name: s.name,
+        isScreen: s.id.startsWith('screen:'),
+        thumbnail: `data:image/png;base64,${s.thumbnail.toPNG().toString('base64')}`,
+        appIcon: s.appIcon && !s.appIcon.isEmpty()
+          ? `data:image/png;base64,${s.appIcon.toPNG().toString('base64')}`
+          : null,
+      })),
+    };
+    pickerWin = new BrowserWindow({
+      width: 720,
+      height: 540,
+      modal: true,
+      parent: mainWindow,
+      frame: false,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      show: false,
+      backgroundColor: voidColor(), // themed void — the same family as the offline veil canvas
+      webPreferences: {
+        preload: join(fileURLToPath(new URL('.', import.meta.url)), '../preload/pickerPreload.cjs'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+    const win = pickerWin; // this request's window — the 'closed' binding below reads it
+    // Trusted-page lockdown (pill/card recipe): no navigation, no window.open. The DEFAULT
+    // session's deny-all permission handlers already cover this window — register NOTHING new.
+    pickerWin.webContents.on('will-navigate', (e) => {
+      e.preventDefault();
+      pickerLog('nav-denied (picker page never navigates)');
+    });
+    pickerWin.webContents.setWindowOpenHandler(({ url }) => {
+      pickerLog('window-open-denied', url.slice(0, 120));
+      return { action: 'deny' };
+    });
+    pickerWin.on('closed', () => {
+      // Bind to THIS window instance: a slow close()'s 'closed' event can land after a NEW
+      // request already opened its own window — it must never null the new window's ref or
+      // cancel the new request (the owner's real repro: pick ⇒ immediately share again).
+      if (pickerWin === win) {
+        pickerWin = null;
+        if (!pickerSettled) cancelPicker('picker window closed');
+      }
+    });
+    // Center on the parent's CONTENT bounds (not the screen), load, and show on the page's
+    // picker:ready handshake — it never flashes empty.
+    const b = mainWindow.getContentBounds();
+    pickerWin.setPosition(b.x + Math.round((b.width - 720) / 2), b.y + Math.round((b.height - 540) / 2));
+    void pickerWin.loadURL(pickerPageUrl());
+    pickerLog('open:', pickerPayload.sources.length, 'sources; canLoopback', pickerCanLoopback);
+  };
+
+  // The REAL relay (the picker page's IPC lands here via index.ts's single registration — the
+  // card:click house pattern). NOT DEV-gated: this is the production path.
+  const pickerReady = (): void => {
+    if (!pickerWin || pickerWin.isDestroyed() || !pickerPayload) return;
+    pickerWin.webContents.send('picker:sources', pickerPayload);
+    pickerWin.show(); // content is queued — the window can surface without flashing empty
+    pickerLog('sources sent:', pickerPayload.sources.length);
+  };
+
+  const pickerPick = (id: unknown, audio: unknown): void => {
+    if (typeof id !== 'string' || typeof audio !== 'boolean') {
+      pickerLog('pick rejected: bad relay shape');
+      return;
+    }
+    const source = pickerSources.find((s) => s.id === id);
+    if (!source) {
+      pickerLog('pick rejected: id not in this session\'s source list', String(id).slice(0, 40));
+      return;
+    }
+    if (pickerSettled) {
+      pickerLog('pick ignored: request already settled');
+      return;
+    }
+    pickerLastVideoId = id;
+    pickerLastAudio = audio;
+    // PAC-5 FIX C — OMIT the audio key when there is no loopback answer. Electron 43's reply
+    // validator (electron_browser_context.cc DisplayMediaDeviceChosen) runs its audio check on
+    // `result_dict.Has("audio")` — an OWN PROPERTY with value undefined HAS the key, fails all
+    // three accepted shapes, and throws `TypeError: audio must be a WebFrameMain, "loopback"
+    // or "loopbackWithMute"` synchronously out of callback(). The old
+    // `{ video, audio: <undefined> }` verdict therefore killed every unticked share on real
+    // Windows (owner diary 2026-08-31: "deny-noise swallowed" + page AbortError, 3×), while the
+    // dev battery missed it because the seam's mock callback accepts anything. Probe-proven
+    // (/tmp/opencode/shareprobe mode D): {video, audio: undefined} THROWS, {video} resolves.
+    const verdict: Electron.Streams = audio && pickerCanLoopback
+      ? { video: source, audio: 'loopback' }
+      : { video: source };
+    settlePicker(verdict, 'pick');
+  };
+
+  const pickerCancel = (): void => {
+    if (pickerSettled) return;
+    cancelPicker('picker page cancel (✕ / Esc / nothing to share)');
+  };
+  // ==== END PAC-2 FIX B ======================================================================
 
   /** The chip's [Cancel] ⇒ cancel the item the chip currently shows; its done handler does
    * the cleanup (partial deleted + chip hidden). */
@@ -1871,6 +2275,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     v.setVisible(true);
     v.webContents.focus();
     armOfflinePoll(); // cloud shown ⇒ the degraded-outage poll may be needed
+    armReachProbe(); // PAC-2 FIX D — cloud shown and (below) presentation quiet ⇒ the knock listens
   };
 
   const hide = (): void => {
@@ -1881,6 +2286,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     // The pill is NEVER removed (C2f contract) — it keeps floating over Local too.
     if (mainWindow.isFocused()) mainWindow.webContents.focus();
     armOfflinePoll(); // cloud hidden ⇒ the poll is only needed while a non-OK state lingers
+    armReachProbe(); // PAC-2 FIX D — cloud hidden ⇒ the knock disarms (nothing to protect)
   };
 
   // Bounds watchdog (C2d pattern, generalized): ONE 1 s tick re-asserts BOTH targets — the site
@@ -1995,7 +2401,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     },
     pillProbe: async () => {
       const expected = pillBounds();
-      if (!pillView) return { bounds: { x: 0, y: 0, width: 0, height: 0 }, expected, visible: false, loaded: false, bodyBackgroundColor: 'no-view', style: pillStyle, blooming: pillBlooming };
+      if (!pillView) return { bounds: { x: 0, y: 0, width: 0, height: 0 }, expected, visible: false, loaded: false, bodyBackgroundColor: 'no-view', style: pillStyle };
       const bodyBackgroundColor = (await pillView.webContents.executeJavaScript(
         'getComputedStyle(document.body).backgroundColor'
       )) as string;
@@ -2006,23 +2412,33 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
         loaded: pillLoaded,
         bodyBackgroundColor,
         style: pillStyle,
-        blooming: pillBlooming,
       };
     },
     // C2g FIX 5 — battery-only layer access (I6: env-gated like every other probe).
+    // PAC-5 — mouseenter/mouseleave now dispatch on #pillB, the element that OWNS the hover
+    // listeners (the hover target moved onto the painted element); contextmenu stays on #root
+    // (the whole-layer style toggle). Dispatching on the owner element drives the REAL
+    // listeners exactly as a user's pointer would.
     pillDrive: async (event) => {
       if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('pillDrive is DROPSYNC_CLOUD_DEV-only');
       if (!pillView) throw new Error('pill layer missing');
       // Dispatch through the REAL DOM listeners in the REAL layer (no state is poked).
       await pillView.webContents.executeJavaScript(
-        `(function(){ var r = document.getElementById('root'); if (!r) return false;
-           r.dispatchEvent(new Event(${JSON.stringify(event)})); return true; })()`
+        `(function(){ var el = document.getElementById(${event === 'contextmenu' ? "'root'" : "'pillB'"});
+           if (!el) return false;
+           el.dispatchEvent(new Event(${JSON.stringify(event)})); return true; })()`
       );
     },
     pillEval: async <T>(expr: string): Promise<T> => {
       if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('pillEval is DROPSYNC_CLOUD_DEV-only');
       if (!pillView) throw new Error('pill layer missing');
       return (await pillView.webContents.executeJavaScript(expr)) as T;
+    },
+    pillCapture: async (): Promise<string> => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('pillCapture is DROPSYNC_CLOUD_DEV-only');
+      if (!pillView) throw new Error('pill layer missing');
+      const img = await pillView.webContents.capturePage();
+      return img.toDataURL();
     },
     // C2h FIX 6 — battery-only site gesture driver (I6: no script enters the page; this only
     // synthesizes a raw input event through Electron's own pipeline, which the C2h activity
@@ -2042,11 +2458,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       // would push a stale in-memory style over the layer's disk-derived boot (the exact
       // divergence the cleared-store leg exercises).
       pillStyle = loadPillStyle();
-      pillBlooming = false; // a fresh layer always boots at rest
-      // C2g-hotfix-5/6 — battery relaunch must boot with no stale room-hold timers.
-      if (pillCollapseHold !== null) { clearTimeout(pillCollapseHold); pillCollapseHold = null; }
-      if (pillFlipHold !== null) { clearTimeout(pillFlipHold); pillFlipHold = null; }
-      pillFlipPending = false;
+      // PAC-5 — a fresh layer always boots at rest (page-CSS state; the room is permanent).
       syncBounds();
       pillLoaded = false;
       await pillView.webContents.loadURL(pillPageUrl(loadPillStyle()));
@@ -2123,14 +2535,27 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     captureViewPng,
     faderProbe: async () => {
       if (!faderView || mainWindow.isDestroyed()) {
-        return { attached: false, inFlight: false, bounds: null, collapsed: true };
+        return { attached: false, inFlight: false, bounds: null, collapsed: true, page: null };
       }
       const b = faderView.getBounds();
+      // PAC-3 FIX A — the page-side submission-ack truth (the __c2mFader fixture lives only
+      // under DROPSYNC_CLOUD_DEV's ?e2e=1). Read-only; a not-yet-loaded page parses to null.
+      let page: { rafTicksAtReady: number; readyRafAt: number[] } | null = null;
+      try {
+        page = JSON.parse(await faderView.webContents.executeJavaScript(
+          'JSON.stringify(window.__c2mFader'
+          + ' ? { rafTicksAtReady: window.__c2mFader.rafTicksAtReady, readyRafAt: window.__c2mFader.readyRafAt }'
+          + ' : null)'
+        )) as { rafTicksAtReady: number; readyRafAt: number[] } | null;
+      } catch {
+        page = null; // page mid-navigation/destroyed — the probe stays honest
+      }
       return {
         attached: mainWindow.contentView.children.includes(faderView),
         inFlight: faderInFlight,
         bounds: b,
         collapsed: b.x === 0 && b.y === 0 && b.width === 0 && b.height === 0,
+        page,
       };
     },
     statusMeasured,
@@ -2149,6 +2574,10 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     setNetOverride: (v: boolean | null): void => {
       if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('setNetOverride is DROPSYNC_CLOUD_DEV-only');
       netOverride = v;
+    },
+    setReachProbeOverride: (fn: null | (() => Promise<'alive' | 'dead'>)): void => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('setReachProbeOverride is DROPSYNC_CLOUD_DEV-only');
+      reachProbeOverride = fn;
     },
     downloadTestArm: (hold: boolean): void => {
       if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('downloadTestArm is DROPSYNC_CLOUD_DEV-only');
@@ -2192,6 +2621,8 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
         siteLoadOk,
         attemptFailed,
         phantomFinishes,
+        probeHealthy,
+        probeMisses,
         reloadCount: offlineReloadCount,
         lastSavePath: downloadLastSavePath,
       };
@@ -2259,7 +2690,71 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
         checkMediaSite: sitePermissionCheck(null, 'media', CLOUD_ORIGIN),
         checkMediaEvil: sitePermissionCheck(null, 'media', 'https://evil.example'),
         checkNotifications: sitePermissionCheck(null, 'notifications', CLOUD_ORIGIN),
+        // PAC-2 FIX C — the notifications gate opens: CHECK-path evil origin (false), and the
+        // REQUEST path in both directions (site true, evil false).
+        notificationsEvil: sitePermissionCheck(null, 'notifications', 'https://evil.example'),
+        notificationsSite: await ask('notifications', CLOUD_URL),
+        notificationsEvilReq: await ask('notifications', 'https://evil.example/'),
       };
+    },
+    // ==== PAC-2 FIX B — the share picker =====================================================
+    pickerReady: (): void => {
+      pickerReady();
+    },
+    pickerPick: (id: unknown, audio: unknown): void => {
+      pickerPick(id, audio);
+    },
+    pickerCancel: (): void => {
+      pickerCancel();
+    },
+    sharePickerTest: async (request?): Promise<void> => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('sharePickerTest is DROPSYNC_CLOUD_DEV-only');
+      await openSharePicker(
+        {
+          // frame: null — the d.ts type allows null ("accessed after the frame has either
+          // navigated or been destroyed"); the picker reads only the four fields below.
+          frame: null,
+          securityOrigin: request?.securityOrigin ?? CLOUD_ORIGIN,
+          videoRequested: request?.videoRequested ?? true,
+          audioRequested: request?.audioRequested ?? true,
+          userGesture: request?.userGesture ?? true,
+        },
+        // PAC-5 FIX D — the mock callback CAPTURES the verdict's own-property keys (the e2e
+        // shape Electron 43 validates against). The production callback's evidence still
+        // lands in the picker state (settlePicker).
+        (streams) => { pickerLastVerdictKeys = Object.keys(streams); },
+      );
+      // PAC-5 FIX D — DEV-only opt (f_pac5_shareVerdictOmitsAudioKey): force the loopback
+      // verdict shape on non-win32 dev machines so the ticked branch is provable in the
+      // battery. The NEXT request recomputes pickerCanLoopback from the platform (the
+      // production truth) inside openSharePicker, so this cannot stick.
+      if (request?.assumeWin32) pickerCanLoopback = true;
+    },
+    sharePickerPick: (id: string, audio: boolean): void => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('sharePickerPick is DROPSYNC_CLOUD_DEV-only');
+      pickerPick(id, audio);
+    },
+    sharePickerCancel: (): void => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('sharePickerCancel is DROPSYNC_CLOUD_DEV-only');
+      pickerCancel();
+    },
+    shareProbe: () => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('shareProbe is DROPSYNC_CLOUD_DEV-only');
+      return {
+        open: pickerWin !== null && !pickerWin.isDestroyed() && pickerWin.isVisible(),
+        sourcesSent: pickerPayload?.sources.length ?? 0,
+        lastVideoId: pickerLastVideoId,
+        lastAudio: pickerLastAudio,
+        lastVerdictAudio: pickerLastVerdictAudio,
+        lastVerdictKeys: pickerLastVerdictKeys, // PAC-5 FIX D — the verdict's own-property keys
+        settleCount: pickerSettleCount,
+        canLoopback: pickerCanLoopback,
+      };
+    },
+    pickerEval: async <T>(expr: string): Promise<T> => {
+      if (process.env.DROPSYNC_CLOUD_DEV !== '1') throw new Error('pickerEval is DROPSYNC_CLOUD_DEV-only');
+      if (!pickerWin || pickerWin.isDestroyed()) throw new Error('picker window missing');
+      return (await pickerWin.webContents.executeJavaScript(expr)) as T;
     },
   };
 

@@ -23,6 +23,11 @@
  * One show at a time; the showId guard governs BOTH phases — a second show REPLACES the first
  * (stale decodes/runs of a replaced show are discarded). Fail-open: a decode failure reports
  * done immediately — a cosmetic layer must never hold the window hostage (owner decision 5).
+ *
+ * PAC-3 FIX A — THE PRESENTATION-CONFIRMED CURTAIN: the page reports ready only after TWO
+ * consecutive requestAnimationFrame callbacks past the decode + layout commit (both timestamps
+ * recorded) — a SUBMISSION-level ack (per-compositor-frame), not just a layout commit. See the
+ * ack block in onShow for the full rationale and the honest platform limit.
  */
 
 interface FaderBridge {
@@ -53,6 +58,19 @@ let showMs = 0; // the fade duration the CURRENT show was handed (main always pa
 let safetyTimer: ReturnType<typeof setTimeout> | null = null;
 let doneDelayTimer: ReturnType<typeof setTimeout> | null = null; // hotfix-2 delayed done
 
+// PAC-3 FIX A — the submission-ack record for the CURRENT show, read by the battery probe
+// (faderProbe → the __c2mFader fixture): how many compositor frames the page waited through
+// before reporting ready (2 = the full two-rAF ack; 0 = an immediate reportReady — the
+// pre-PAC-3 shape the RED pair restores) plus both rAF timestamps (performance.now()).
+let readyRafTicks = 0;
+let readyRafAt: [number, number] = [0, 0];
+
+/** PAC-3 FIX A — ONE compositor frame, resolved with its rAF timestamp. */
+const nextFrame = (): Promise<number> =>
+  new Promise((resolve) => {
+    requestAnimationFrame((t) => resolve(t));
+  });
+
 const finish = (myShow: number): void => {
   if (myShow !== showId) return; // replaced mid-flight — only the CURRENT show may settle
   if (safetyTimer !== null) {
@@ -71,6 +89,8 @@ window.dropsyncFader.onShow(({ image, ms }) => {
   showId += 1;
   const myShow = showId;
   showMs = ms;
+  readyRafTicks = 0; // a fresh show restarts the ack record (the probe never reads a stale one)
+  readyRafAt = [0, 0];
   if (safetyTimer !== null) {
     clearTimeout(safetyTimer);
     safetyTimer = null;
@@ -93,7 +113,24 @@ window.dropsyncFader.onShow(({ image, ms }) => {
       return;
     }
     if (myShow !== showId) return; // a newer show replaced this one mid-decode
-    void img.offsetWidth; // commit the opaque frame BEFORE reporting the curtain ready
+    void img.offsetWidth; // commit the opaque frame (a LAYOUT commit — see the ack below)
+    // PAC-3 FIX A — THE PRESENTATION-CONFIRMED CURTAIN. The twitch investigation proved the
+    // gap this closes: decode() + offsetWidth is a LAYOUT commit, NOT presented pixels
+    // (P1d's wrong frame; the fixed 50 ms swap pad was a guess riding on that layout
+    // moment). requestAnimationFrame callbacks are produced per compositor frame, so
+    // awaiting TWO consecutive ones means the painted curtain frame has been SUBMITTED to
+    // the presentation pipeline — the tightest page-side signal that exists. Honest limit
+    // (per the order): still not a DWM present receipt — nothing on this platform is — but
+    // main's swap now waits for a submission ack, with MELT_SWAP_PAD_MS (50) riding on top.
+    // No new timer: rAF always fires on a live compositor (a hidden/occluded window is not
+    // a flip moment), and main's MELT_READY_TIMEOUT_MS deadline still bounds the whole
+    // handshake fail-open.
+    readyRafAt[0] = await nextFrame(); // tick 1 — the painted curtain frame is submitted
+    if (myShow !== showId) return; // replaced between ticks — the stale ack is discarded
+    readyRafTicks = 1;
+    readyRafAt[1] = await nextFrame(); // tick 2 — one full compositor frame of headroom
+    if (myShow !== showId) return;
+    readyRafTicks = 2;
     // CURTAIN IS UP — stop here (hotfix-1). Main swaps the world beneath the identical
     // pixels, then fires `fader:run`; only THAT starts the fade.
     window.dropsyncFader.reportReady();
@@ -127,3 +164,13 @@ window.dropsyncFader.onRun(() => {
     });
   });
 });
+
+// PAC-3 FIX A — dev probe fixture (?e2e=1, which MAIN appends only under DROPSYNC_CLOUD_DEV):
+// the battery reads the submission-ack truth (the C2g FIX 5 __c2gPill pattern — read-only;
+// every action still rides the real bridge paths).
+if (new URLSearchParams(window.location.search).get('e2e') === '1') {
+  (window as unknown as Record<string, unknown>).__c2mFader = {
+    get rafTicksAtReady(): number { return readyRafTicks; },
+    get readyRafAt(): number[] { return readyRafAt; },
+  };
+}

@@ -104,53 +104,62 @@
          its knob half and each half is fully clickable. Vertical padding untouched. */
       .mode-pill button { flex: 1 1 0; min-width: 0; padding: 7.5px 0; }
       .mode-pill .knob { top: 2px; left: 2px; height: calc(100% - 4px); width: calc(50% - 2px); }
-      /* ---- A's own footprint. C2g-hotfix-6 FIX 2 — CENTER-ANCHORED exactly like #pillB
-         (left/top 50% + static translate(-50%,-50%)): when main grows the room to the flip-time
-         124 × 28 skirt (cloud.ts PILL_A_FLIP_PAD_X) so the knob's elastic overshoot paints
-         instead of clipping, both rooms share ONE center ⇒ the painted pill NEVER moves during
-         the swap. Rest room is still exactly 112 ⇒ centered = flush 0..112, pixel-identical to
-         the old inset:0 layout. No entry choreography for A — no blink mask exists here; the
-         accepted micro-residual is a ≤2-frame ≤6 px settle twitch when a knife-edge room
-         swap overlaps a click (documented in cloud.ts). */
+      /* ---- A's own footprint. PAC-5 FIX A — FIXED 14 px INSIDE THE PERMANENT STAGE:
+         the native room is a PERMANENT 140 × 28 (cloud.ts PILL_A_ROOM_PAD_X — sized once,
+         never moved or resized at runtime), and #pillA paints at [14,0,112,28] in room
+         coordinates — window center−56..+56, PIXEL-IDENTICAL to every earlier layout.
+         ANCHOR HISTORY: center-anchored (C2f..hotfix-4) → PAC-4 top-left [0,0] with the
+         origin-fixed 124-wide flip skirt (12 px pad on the right; the Cloud-ward overshoot
+         still clipped at the LEFT wall — the owner's 1.0.3 "knob sliced flat" verdict) →
+         PAC-5: 14 px of breathing room EACH SIDE inside the permanent room, so the knob's
+         ~5 px elastic overshoot + shadow paint free on BOTH ends (the B2 clip is dead).
+         No entry choreography for A — no blink mask exists here; no room swap ever happens.
+         The inherited .pill shadow's left/right halo is now VISIBLE at rest for the first
+         time (demo-true: the demo page never clipped it) — owner-judged at hands-on. */
       #pillA {
         position: absolute;
-        left: 50%;
-        top: 50%;
-        transform: translate(-50%, -50%);
+        left: 14px;
+        top: 0;
         width: 112px;
         height: 28px;
       }
-      /* ---- demo Variant B "micro bloom", VERBATIM (explainer :68-79). The bloom is JS-DRIVEN
-         (class `bloomed`), not :hover — the layer must tell main to resize the native view in
-         the same tick the CSS starts (§1 ZERO-MISS + FIX 3 same-tick rule). Timings are the
-         demo's exact values: width .55s elastic · dots .18s ease · inner reveal .25s ease .12s.
-         C2g-hotfix-4 FIX 1 — CENTER-ANCHORED bloom, replicating the demo's `.pos-tc-b`
-         (left:50%; transform:translateX(-50%)) middle-out growth: the percentage translate is
-         STATIC and re-resolves against the animating width every frame, so the circle grows
-          symmetrically around a screen-stable center. The old `inset:0` nailed the circle to the
-         page's LEFT edge while main re-centers the native room in one instant step on hover —
-         the painted circle rode that edge and teleported sideways ("comes from the left").
-         Main supplies BLOOM-TIME breathing room around the 112 × 28 pill (cloud.ts
-         PILL_BLOOM_PAD_*: 132 × 44) so neither the elastic overshoot nor the shadow halo is
-         clipped by the room rectangle; at REST this page is exactly 28 × 28 and the centered
-         circle sits flush at 0..28 — pixel-identical to before. Nothing here animates except
-         width (and the dots/inner rules below). */
+      /* ---- demo Variant B "micro bloom", VERBATIM timings (explainer :68-79), with PAC-5
+         FIX B's PERMANENT STAGE anchoring. The bloom is JS-DRIVEN (class `bloomed`), not
+         :hover — the layer tells main the bloom state in the same tick the CSS class lands
+         (main's room work is a no-op stub now; the report keeps the bridge contract).
+         Timings are the demo's exact values: width .55s elastic · dots .18s ease · inner
+         reveal .25s ease .12s.
+         ANCHOR HISTORY: the C2f original was `inset:0` (left-nailed — the painted circle
+         teleported with the room swap, "comes from the left"); C2g-hotfix-4 made it
+         CENTER-ANCHORED (left/top 50% + static translate(-50%,-50%), the demo's `.pos-tc-b`
+         middle-out pattern); PAC-4 FIX B3 pinned it TOP-LEFT with a rightward unfurl +
+         down-settle (bloomed pill at room 0..112 × 8..36) — OWNER REJECTED at the 1.0.3
+         hands-on ("sprouts rightward, ends ~42 px right of center, 8 px down-settle").
+         PAC-5 FIX B — FIXED ROOM COORDINATES, MIDDLE-OUT, NO SETTLE: the room is a
+         PERMANENT 132 × 44 (cloud.ts PILL_BLOOM_PAD_*), the rest circle paints at
+         [52,8,28,28] — window center−14..+14 × PILL_TOP..+28, byte-identical to every
+         older layout — and the bloomed pill lands at [10,8,112,28] — window center±56,
+         the SAME height band as the circle (the 8 px down-settle is deleted), DEAD
+         CENTERED. `left` rides the SAME .55s elastic as `width` (52→10 while 28→112),
+         so the pill grows symmetrically around its own center — the hotfix-4 middle-out
+         bloom restored, ending dead centered on the window. `top` NEVER animates. Nothing
+         else animates except width/left (and the dots/inner rules below). */
       #pillB {
         position: absolute;
-        left: 50%;
-        top: 50%;
-        transform: translate(-50%, -50%);
+        left: 52px;   /* room 52..80 → window center−14..+14 (the circle's eternal position) */
+        top: 8px;     /* room 8..36 → window PILL_TOP..PILL_TOP+28 */
         width: 28px;
         height: 28px;
         border-radius: 100px;
         background: #1a1a1a;
         cursor: pointer;
         box-shadow: 0 1px 6px rgba(26, 26, 26, 0.25);
-        transition: width 0.55s cubic-bezier(0.34, 1.56, 0.64, 1); /* CONTRACT: .55s elastic */
+        transition: width 0.55s cubic-bezier(0.34, 1.56, 0.64, 1),
+          left 0.55s cubic-bezier(0.34, 1.56, 0.64, 1); /* CONTRACT: .55s elastic (width); left rides it → middle-out */
         overflow: hidden;
         box-sizing: border-box;
       }
-      #pillB.bloomed { width: 112px; }
+      #pillB.bloomed { width: 112px; left: 10px; } /* centered pill: room 10..122 → window center±56 */
       /* C2g-hotfix-1 FIX 1 — at rest the WHOLE circle is the button (#pillB's own click handler
          flips); the hidden inner pill must not swallow those clicks, so it is pointer-transparent
          until bloomed. When bloomed the words handle their sides and the circle handler no-ops —
