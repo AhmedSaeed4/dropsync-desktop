@@ -54,6 +54,9 @@ const api: DropsyncBridge = {
       invoke('drop:createFileFromBytes', bytes, displayName, mimeType, meta),
     updateContent: (dropId: string, updates: unknown) => invoke('drop:updateContent', dropId, updates),
     updateMeta: (dropId: string, patch: unknown) => invoke('drop:updateMeta', dropId, patch),
+    // Round 107 (repair-order-107 §4 FIX B) — same unknown-args convention as createText/updateMeta;
+    // the typed surface lives in apiTypes (DropTransferArgs/DropTransferResult).
+    transfer: (args: unknown) => invoke('drop:transfer', args),
   },
   youtube: {
     refreshTitles: (spaceId: string) => invoke('youtube:refreshTitles', spaceId),

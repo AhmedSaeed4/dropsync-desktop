@@ -145,6 +145,29 @@ export interface RefreshTitlesResultDTO {
   updatedDrops?: DropDTO[];
 }
 
+/** Round 107 — move/copy drops between spaces (repair-order-107 §4 FIX A). One call per
+ * batch; the target is 'personal' or a workspace id. */
+export interface DropTransferArgs {
+  mode: 'move' | 'copy';
+  dropIds: string[];
+  targetSpaceId: string; // 'personal' | workspace id
+}
+
+/** One entry per requested id, same order as DropTransferArgs.dropIds. */
+export interface DropTransferResultItem {
+  id: string;        // source drop id
+  newId?: string;    // set on success in copy mode
+  success: boolean;
+  error?: string;
+}
+
+/** ok:false = pre-flight failure (target missing, category prep failed) — no results. */
+export interface DropTransferResult {
+  ok: boolean;                // false = pre-flight failure (target missing, category prep failed)
+  error?: string;             // set when ok === false
+  results?: DropTransferResultItem[]; // set when ok === true (one per requested id, same order)
+}
+
 /** Export-back summary (M5) — mirrors main's ExportSummary. */
 export interface ExportSummaryDTO {
   included: number;
@@ -194,6 +217,8 @@ export interface DropsyncBridge {
     createFileFromBytes(bytes: Uint8Array, displayName: string, mimeType: string | undefined, meta: CreateFileMetaDTO): Promise<DropDTO | null>;
     updateContent(dropId: string, updates: UpdateContentArgsDTO): Promise<DropDTO | null>;
     updateMeta(dropId: string, patch: UpdateMetaPatchDTO): Promise<DropDTO | null>;
+    /** Round 107 — move/copy a batch of drops to another space (repair-order-107 §4 FIX A). */
+    transfer: (args: DropTransferArgs) => Promise<DropTransferResult>;
   };
   youtube: {
     refreshTitles(spaceId: string): Promise<RefreshTitlesResultDTO>;

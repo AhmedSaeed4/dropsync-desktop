@@ -4,6 +4,7 @@ import { DndContext, PointerSensor, useSensor, useSensors, closestCenter, type D
 import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import type { Category, Drop } from '../../lib/types';
 import { EditorialDropItem } from './EditorialDropItem';
+import { EditorialMoveDropModal } from './EditorialMoveDropModal';
 import { UndoToast } from '../shared/UndoToast';
 import { Toast } from '../shared/Toast';
 import { isReminderFiredShared, isReminderGlowingForViewer, sortUnpinned, type DropSortMode } from '../../lib/dropsHelpers';
@@ -100,6 +101,11 @@ export function EditorialDropList({
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
   const bulkDeleteRef = useRef<HTMLButtonElement>(null);
   const [deleting, setDeleting] = useState(false);
+  // Round 107 (order §4 FIX G) — bulk move/copy: the modal's drops, the in-modal error banner
+  // (web's alert() has no desktop counterpart, D16) and the busy flag the modal's close paths veto on.
+  const [bulkMoveDrops, setBulkMoveDrops] = useState<Drop[] | null>(null);
+  const [moveError, setMoveError] = useState<string | null>(null);
+  const [bulkMoving, setBulkMoving] = useState(false);
   const { pending: pendingDeletions, tombstone: deletedDropIds } = usePendingDeletions();
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -185,6 +191,42 @@ export function EditorialDropList({
     setSelectedIds(new Set());
     setSelectionMode(false);
     setConfirmBulkDelete(false);
+  };
+
+  // Round 107 (order §4 FIX G) — bulk move/copy. THIN by design: main owns category
+  // pre-resolution and per-drop isolation (transferDrops); this mirrors web W4's post-op
+  // contract (EditorialDropList.tsx:1356-1360/:1385-1389) — failures keep the modal open with
+  // web's exact alert wording (banner instead, D16); full success closes the modal, clears the
+  // selection, exits selection mode; moved ids leave the list silently (removeDropInPlace, D9).
+  const runBulkTransfer = async (mode: 'move' | 'copy', targetSpaceId: string) => {
+    if (!bulkMoveDrops?.length) return;
+    setBulkMoving(true);
+    try {
+      const out = await window.dropsync.drop.transfer({
+        mode, targetSpaceId, dropIds: bulkMoveDrops.map((d) => d.id),
+      });
+      if (!out.ok || !out.results) {
+        setMoveError(out.error ?? 'Failed to prepare categories. Please try again.');
+        return; // modal stays open (web parity, W4)
+      }
+      const failures = out.results.filter((r) => !r.success);
+      if (failures.length > 0) {
+        setMoveError(`${failures.length}/${out.results.length} drops failed to ${mode}: ${failures[0].error}`);
+        return;
+      }
+      // full success — web :1356-1360
+      const movedIds = mode === 'move' ? out.results.map((r) => r.id) : [];
+      setBulkMoveDrops(null);
+      setMoveError(null);
+      setSelectedIds(new Set());
+      setSelectionMode(false);
+      if (movedIds.length > 0) removeDropInPlace(movedIds); // silent in-place removal (D9)
+      onDelete();
+    } catch (error) {
+      setMoveError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBulkMoving(false);
+    }
   };
 
   // FIX 13: the behind-the-curtain commit of the undo flow — tombstone already hid the card,
@@ -723,14 +765,27 @@ export function EditorialDropList({
                   Cancel
                 </button>
                 {selectedIds.size > 0 && (
-                  <button
-                    ref={bulkDeleteRef}
-                    onClick={handleBulkDeleteClick}
-                    disabled={deleting}
-                    className={`text-xs ${font} px-3 py-1.5 ml-auto ${tc.roundedClass} bg-red-500 text-white hover:bg-red-600 transition-colors disabled:opacity-50 flex items-center gap-1`}
-                  >
-                    {deleting ? 'Deleting...' : confirmBulkDelete ? `Confirm delete ${selectedIds.size}` : `Delete ${selectedIds.size}`}
-                  </button>
+                  <>
+                    {/* Round 107 — bulk Move pill (web EditorialDropList.tsx:1032-1042 placement:
+                        ml-auto on Move, Delete follows plain) */}
+                    <button
+                      onClick={() => {
+                        const selectedDrops = filteredDrops.filter(d => selectedIds.has(d.id));
+                        setBulkMoveDrops(selectedDrops);
+                      }}
+                      className={`text-xs ${font} px-3 py-1.5 ml-auto ${tc.roundedClass} ${tc.activePillBg} ${tc.activePillText} hover:opacity-90 transition-opacity flex items-center gap-1`}
+                    >
+                      Move {selectedIds.size}
+                    </button>
+                    <button
+                      ref={bulkDeleteRef}
+                      onClick={handleBulkDeleteClick}
+                      disabled={deleting}
+                      className={`text-xs ${font} px-3 py-1.5 ${tc.roundedClass} bg-red-500 text-white hover:bg-red-600 transition-colors disabled:opacity-50 flex items-center gap-1`}
+                    >
+                      {deleting ? 'Deleting...' : confirmBulkDelete ? `Confirm delete ${selectedIds.size}` : `Delete ${selectedIds.size}`}
+                    </button>
+                  </>
                 )}
               </div>
             )}
@@ -908,6 +963,19 @@ export function EditorialDropList({
           theme={theme}
           editorial
           onDone={() => setPinLimitToast(false)}
+        />
+      )}
+
+      {/* Bulk move/copy modal (round 107) — hosted at the component tail, mirroring the web's
+          placement (EditorialDropList.tsx:1330-1397). Close paths veto while a transfer runs. */}
+      {bulkMoveDrops && bulkMoveDrops.length > 0 && (
+        <EditorialMoveDropModal
+          drops={bulkMoveDrops}
+          onMove={(t) => runBulkTransfer('move', t)}
+          onCopy={(t) => runBulkTransfer('copy', t)}
+          onClose={() => { if (!bulkMoving) setBulkMoveDrops(null); }}
+          error={moveError}
+          theme={theme}
         />
       )}
     </div>

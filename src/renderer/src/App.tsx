@@ -11,6 +11,7 @@ import { EditorialStatusPanel } from './components/editorial/EditorialStatusPane
 import { EditorialThemeSelector } from './components/editorial/EditorialThemeSelector';
 import { EditorialDropList } from './components/editorial/EditorialDropList';
 import { EditorialPreviewModal } from './components/editorial/EditorialPreviewModal';
+import { EditorialMoveDropModal } from './components/editorial/EditorialMoveDropModal';
 import { EditorialDropZone } from './components/editorial/EditorialDropZone';
 import { EditorialTextModal, type TextModalCreatePayload, type TextModalEditUpdates } from './components/editorial/EditorialTextModal';
 import { getEditorialThemeColors } from './lib/editorialTheme';
@@ -179,6 +180,14 @@ function AppBody() {
   // FIX 8: the parent no longer fakes preview loading (the hardcoded 400 ms timer is gone).
   // The modal owns REAL loading while a cache-miss payload fetch is in flight.
   const [previewTrail, setPreviewTrail] = useState<Drop[]>([]);
+  // Round 107 (order §4 FIX H.1) — the single-drop move/copy flow: the modal's drops, the
+  // preview-return context (a CANCEL re-opens the preview; a move success does NOT — web W3),
+  // the in-modal error banner text (web's alert wording, D16) and the busy flag that vetoes
+  // every close path.
+  const [moveDrops, setMoveDrops] = useState<Drop[] | null>(null);
+  const [moveReturnDrop, setMoveReturnDrop] = useState<Drop | null>(null);
+  const [moveError, setMoveError] = useState<string | null>(null);
+  const [moveBusy, setMoveBusy] = useState(false);
   // Edit modal — holds the drop being edited. Text drops are hydrated with their full payload
   // BEFORE mount (the mention editor seeds from editDrop.content).
   const [editDrop, setEditDrop] = useState<Drop | null>(null);
@@ -302,6 +311,61 @@ function AppBody() {
     setPreviewDrop(null);
     setPreviewTrail([]);
   }, []);
+
+  // Round 107 (order §4 FIX H.4) — the single-drop transfer; mirrors the web's W3 post-op
+  // contract EXACTLY (EditorialLayout.tsx handleMoveDrop :288-296 / handleCopyDrop :322-328):
+  // pre-flight or per-drop failures keep the modal open with web's alert wording (banner, D16);
+  // MOVE success closes the modal and clears the return drop (the drop left this space — the
+  // preview does NOT return) and removes the card silently (removeDropInPlace, D9's
+  // zero-visual-event contract; NO refreshDrops needed); COPY success closes the modal and
+  // re-opens the ORIGINAL's preview (the original still exists here, web :322-328) — the
+  // current list gains NOTHING (the copy landed elsewhere): no append, no refresh. The copy's
+  // created categories live in the TARGET space; current-space categories are untouched by
+  // both verbs (belt: main already refuses same-space transfers).
+  const runSingleTransfer = useCallback(async (mode: 'move' | 'copy', targetSpaceId: string) => {
+    if (!moveDrops?.length) return;
+    setMoveBusy(true);
+    try {
+      const out = await window.dropsync.drop.transfer({ mode, targetSpaceId, dropIds: moveDrops.map((d) => d.id) });
+      if (!out.ok || !out.results) {
+        setMoveError(out.error ?? 'Failed to prepare categories. Please try again.');
+        return; // modal stays open (web parity, W3)
+      }
+      const failures = out.results.filter((r) => !r.success);
+      if (failures.length > 0) {
+        setMoveError(`${failures.length}/${out.results.length} drops failed to ${mode}: ${failures[0].error}`);
+        return;
+      }
+      if (mode === 'move') {
+        setMoveDrops(null);
+        setMoveError(null);
+        setMoveReturnDrop(null); // the drop left this space — no preview return (web :291)
+        removeDropInPlace(out.results.map((r) => r.id));
+      } else {
+        const returnDrop = moveReturnDrop;
+        setMoveDrops(null);
+        setMoveError(null);
+        setMoveReturnDrop(null);
+        if (returnDrop) openPreview(returnDrop);
+      }
+    } catch (error) {
+      setMoveError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMoveBusy(false);
+    }
+  }, [moveDrops, moveReturnDrop, openPreview, removeDropInPlace]);
+
+  // Round 107 (order §4 FIX H.5) — close = web's handleCloseMoveModal (:260-266): vetoed while
+  // busy; otherwise clear the modal + error, and a preview-originated open RETURNS to the
+  // preview (a CANCEL means the drop is still here). Bulk/list flow has no return memory.
+  const handleCloseMoveModal = useCallback(() => {
+    if (moveBusy) return;
+    const returnDrop = moveReturnDrop;
+    setMoveDrops(null);
+    setMoveError(null);
+    setMoveReturnDrop(null);
+    if (returnDrop) openPreview(returnDrop);
+  }, [moveBusy, moveReturnDrop, openPreview]);
 
   // Edit entry point — two origins (FIX 18 study finding):
   // - Preview-originated (the preview's Edit button; the web's ONLY live edit entry): hold the
@@ -810,7 +874,27 @@ function AppBody() {
           allDrops={drops}
           onPreview={(drop) => openPreview(drop)}
           onEdit={(drop) => void openEditModal(drop)}
+          // Round 107 (order §4 FIX H.2) — store the return context, open the move modal with
+          // this drop, and close the preview with the SAME primitive the FIX 18 edit flow uses
+          // to close/reopen safely (D10). The freshest viewed version rides along (web :521).
+          onMove={(drop) => {
+            setMoveReturnDrop(drop);
+            setMoveDrops([drop]);
+            closePreview();
+          }}
           onChanged={handlePreviewDismissed}
+        />
+      )}
+
+      {/* Move/Copy Modal (round 107, order §4 FIX H.3) — hosted next to the preview host. */}
+      {moveDrops && moveDrops.length > 0 && (
+        <EditorialMoveDropModal
+          drops={moveDrops}
+          onMove={(t) => runSingleTransfer('move', t)}
+          onCopy={(t) => runSingleTransfer('copy', t)}
+          onClose={handleCloseMoveModal}
+          error={moveError}
+          theme={theme}
         />
       )}
 
