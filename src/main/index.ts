@@ -6957,8 +6957,8 @@ function createWindow(): void {
                   const pwCopy = await copyOne(pwText.id);
                   const drawCopy = await copyOne(drawing.id);
                   const foreverOk = !!foreverCopy && foreverCopy.expiresAt === null && foreverCopy.expirationOption === 'forever'
-                    && foreverCopy.reminderAt === null && foreverCopy.reminderSetByUid === null
-                    && foreverCopy.reminderDismissedBy === null && foreverCopy.reminderFiredAt === null
+                    && foreverCopy.reminderAt === foreverText.reminderAt && foreverCopy.reminderSetByUid === foreverText.reminderSetByUid
+                    && foreverCopy.reminderDismissedBy === foreverText.reminderDismissedBy && foreverCopy.reminderFiredAt === null
                     && foreverCopy.locked === false && foreverCopy.pinned === false
                     && (foreverCopy.youtubeVideoLabels?.length ?? 0) === 1
                     && foreverCopy.createdAt !== foreverText.createdAt;
@@ -7006,6 +7006,238 @@ function createWindow(): void {
                     && partialOut.results?.[1]?.success === false && partialOut.results?.[1]?.error === 'Drop not found.'
                     && goodAfter.spaceId === target.id;
                   console.log('[f107-partialFailure]', JSON.stringify({ f_t107_partialFailure, out: partialOut }));
+
+                  // ---------- f_t107b_copyBatchOrderPreserved (repair-order-107b §4.4) ----------
+                  // Bulk COPY must land in the caller's display order, not reversed. Fresh
+                  // spaces (sA source / sB target — sB EMPTY so the target list is EXACTLY the
+                  // batch); three sequential creates in sA; copy the observed newest-first
+                  // `order` 1:1; the target list must deep-equal it and all three copies must
+                  // carry ONE shared createdAt (vault.ts:638 sorts newest-first with NO
+                  // tie-breaker; JS sorts are stable — equal stamps keep loop order).
+                  const sA = await manager.createSpace('t107b BatchSrc');
+                  const sB = await manager.createSpace('t107b BatchTgt');
+                  const batch1 = await createTextDrop(manager, {
+                    spaceId: sA.id, name: 't107-Batch1', content: 'batch body 1',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  const batch2 = await createTextDrop(manager, {
+                    spaceId: sA.id, name: 't107-Batch2', content: 'batch body 2',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  const batch3 = await createTextDrop(manager, {
+                    spaceId: sA.id, name: 't107-Batch3', content: 'batch body 3',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  const order = manager.listDrops(sA.id).map((d) => d.id); // newest-first display order
+                  const batchOut = await transferDrops(manager, { mode: 'copy', dropIds: order, targetSpaceId: sB.id });
+                  const targetOrder = manager.listDrops(sB.id).map((d) => d.id);
+                  const newRecs: VaultDropRecord[] = [];
+                  for (const r of batchOut.results ?? []) {
+                    const rec = r.newId ? manager.peekDrop(r.newId) : undefined;
+                    if (rec) newRecs.push(rec);
+                  }
+                  // §4.4 says the target id list "deep-equals `order`" — but `order` holds SOURCE
+                  // ids while sB holds COPIES (fresh UUIDs, dropOps.ts:670), so the literal
+                  // comparison is unsatisfiable by construction (green-run-1 evidence: names and
+                  // stamps aligned, orderPreserved false). The batch's order is carried by the
+                  // results array — one entry per dropId in loop order — so the target list must
+                  // equal the newId SEQUENCE (position i ↔ order[i]). Same mechanism §8.3's RED
+                  // pair flips: per-copy fresh stamps push the last-copied drop to the top.
+                  const newIdsInLoopOrder = (batchOut.results ?? []).map((r) => r.newId ?? null);
+                  const orderPreserved = JSON.stringify(targetOrder) === JSON.stringify(newIdsInLoopOrder);
+                  const sameStamp = newRecs.length === 3 && new Set(newRecs.map((r) => r.createdAt)).size === 1;
+                  const sourceListUnchanged = JSON.stringify(manager.listDrops(sA.id).map((d) => d.id)) === JSON.stringify(order);
+                  const f_t107b_copyBatchOrderPreserved = order.length === 3 && batchOut.ok === true
+                    && orderPreserved && sameStamp && sourceListUnchanged;
+                  console.log('[f107b-copyBatchOrder]', JSON.stringify({
+                    f_t107b_copyBatchOrderPreserved,
+                    matrix: {
+                      guardOrderLen3: order.length === 3, ok: batchOut.ok, orderPreserved, sameStamp, sourceListUnchanged,
+                      tgtIds: targetOrder,
+                      newIdsInLoopOrder,
+                      srcCreatedAts: order.map((id) => manager.peekDrop(id)?.createdAt ?? null),
+                      tgtCreatedAts: targetOrder.map((id) => manager.peekDrop(id)?.createdAt ?? null),
+                      srcNames: order.map((id) => manager.peekDrop(id)?.name ?? null),
+                      tgtNames: targetOrder.map((id) => manager.peekDrop(id)?.name ?? null),
+                    },
+                  }));
+                  // leg-end cleanup — the fixed-name hygiene loops above/below can't match these
+                  // two spaces (the vault persists across runs); the t107-Batch* drop names ARE
+                  // covered by both hygiene loops, this is just belt-and-suspenders.
+                  for (const r of newRecs) await manager.deleteDropQuiet(r.id);
+                  for (const id of [batch1.id, batch2.id, batch3.id]) await manager.deleteDropQuiet(id);
+                  await manager.deleteSpaceQuiet(sB.id);
+                  await manager.deleteSpaceQuiet(sA.id);
+
+                  // ---------- f_t107c_reminderRides (repair-order-107c §4.5; upgraded 107d §4.3) ----------
+                  // Reminders RIDE on copy (owner 2026-09-03 — carry EVERYTHING, like move):
+                  // reminderAt + reminderSetByUid verbatim, and (107d) reminderDismissedBy verbatim
+                  // too — a dismissal is the user's "done with this reminder" decision and must
+                  // travel with the copy, else a copied drop re-notifies about something already
+                  // closed; reminderFiredAt is the ONLY reset (an UNdismissed past reminderAt
+                  // surfaces once via the missed queue — C2j keys on reminderAt ≤ now && !dismissed
+                  // && !fired). 107d §8.3's RED pair restores ONLY the dismissal line
+                  // (`reminderDismissedBy: null,` — the 107c behavior): then dismissedRides goes
+                  // FALSE (copy reads null vs 'local') while futureRides/pastRides/controlStaysNull/
+                  // sourcesUnchanged/moveStillRides stay TRUE — the precise signature.
+                  const remSrc = await manager.createSpace('t107c RemSrc');
+                  const remTgt = await manager.createSpace('t107c RemTgt'); // EMPTY — the batch IS the whole target
+                  const remFuture = await createTextDrop(manager, {
+                    spaceId: remSrc.id, name: 't107-RemFuture', content: 'future reminder body',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() + 3600_000).toISOString(),
+                  });
+                  const remPast = await createTextDrop(manager, {
+                    spaceId: remSrc.id, name: 't107-RemPast', content: 'past reminder body',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() - 3600_000).toISOString(),
+                  });
+                  const remCtrl = await createTextDrop(manager, {
+                    spaceId: remSrc.id, name: 't107-RemCtrl', content: 'no reminder body',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  // 107d: the fourth seed — an already-DISMISSED past reminder; the dismissal is
+                  // seeded via patchDropMeta (vault.ts Pick list carries reminderDismissedBy and
+                  // sets ONLY the patched fields) exactly like a user's dismiss action.
+                  const remDismissed = await createTextDrop(manager, {
+                    spaceId: remSrc.id, name: 't107-RemDismissed', content: 'dismissed reminder body',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() - 3600_000).toISOString(),
+                  });
+                  await manager.patchDropMeta(remDismissed.id, { reminderDismissedBy: 'local' });
+                  // snap AFTER the patch — the dismissed seed's snapshot must carry 'local'; peeked
+                  // fresh (the createTextDrop return predates the patch).
+                  const remDismissedPatched = manager.peekDrop(remDismissed.id) ?? remDismissed;
+                  const remSnap = [remFuture, remPast, remDismissedPatched, remCtrl].map((d) => ({
+                    reminderAt: d.reminderAt, reminderSetByUid: d.reminderSetByUid,
+                    reminderDismissedBy: d.reminderDismissedBy, reminderFiredAt: d.reminderFiredAt ?? null,
+                  }));
+                  const remCopyOut = await transferDrops(manager, {
+                    mode: 'copy', dropIds: [remFuture.id, remPast.id, remDismissed.id, remCtrl.id], targetSpaceId: remTgt.id,
+                  });
+                  const remResults = remCopyOut.results ?? [];
+                  const remCopies = remResults.map((r) => (r.newId ? manager.peekDrop(r.newId) ?? null : null));
+                  const [futCopy, pastCopy, dismissedCopy, ctrlCopy] = remCopies; // results are in loop order — position i ↔ i-th requested drop
+                  const futureRides = !!futCopy
+                    && futCopy.reminderAt === remSnap[0].reminderAt          // string equality — VERBATIM ride
+                    && futCopy.reminderSetByUid === remSnap[0].reminderSetByUid
+                    && futCopy.reminderDismissedBy === remSnap[0].reminderDismissedBy // dismissal rides verbatim (107d)
+                    && futCopy.reminderFiredAt === null;
+                  const pastRides = !!pastCopy
+                    && pastCopy.reminderAt === remSnap[1].reminderAt
+                    && pastCopy.reminderSetByUid === remSnap[1].reminderSetByUid
+                    && pastCopy.reminderDismissedBy === remSnap[1].reminderDismissedBy // verbatim (107d)
+                    && pastCopy.reminderFiredAt === null;
+                  const controlStaysNull = !!ctrlCopy && ctrlCopy.reminderAt === null && ctrlCopy.reminderSetByUid === null;
+                  // 107d's new assert — the DISMISSED copy: the dismissal RIDES ('local'), the
+                  // reminderAt rides verbatim, and reminderFiredAt is STILL the only reset — a
+                  // dismissed reminder never fires on the copy (the owner's re-notification bug,
+                  // asserted at field level).
+                  const dismissedRides = !!dismissedCopy
+                    && dismissedCopy.reminderDismissedBy === remSnap[2].reminderDismissedBy // 'local' — RIDES
+                    && dismissedCopy.reminderAt === remSnap[2].reminderAt   // verbatim
+                    && dismissedCopy.reminderFiredAt === null;
+                  const sourcesUnchanged = [remFuture, remPast, remDismissed, remCtrl].every((d, i) => {
+                    const after = manager.peekDrop(d.id);
+                    const b = remSnap[i];
+                    return !!after && after.reminderAt === b.reminderAt
+                      && after.reminderSetByUid === b.reminderSetByUid
+                      && (after.reminderDismissedBy ?? null) === b.reminderDismissedBy
+                      && (after.reminderFiredAt ?? null) === b.reminderFiredAt;
+                  });
+                  // THEN move the past-reminder drop to the target — move's ONE meta patch carries
+                  // the reminder by construction (dropOps.ts:587-591); the asymmetry story is fixed
+                  // on BOTH verbs.
+                  const remMoveOut = await transferDrops(manager, { mode: 'move', dropIds: [remPast.id], targetSpaceId: remTgt.id });
+                  const pastAfterMove = manager.peekDrop(remPast.id);
+                  const moveStillRides = remMoveOut.ok === true && remMoveOut.results?.[0]?.success === true
+                    && !!pastAfterMove && pastAfterMove.reminderAt === remSnap[1].reminderAt
+                    && pastAfterMove.spaceId === remTgt.id;
+                  const f_t107c_reminderRides = remCopyOut.ok === true && remResults.length === 4
+                    && remResults.every((r) => r.success)
+                    && futureRides && pastRides && dismissedRides && controlStaysNull && sourcesUnchanged && moveStillRides;
+                  console.log('[f107c-reminderRides]', JSON.stringify({
+                    f_t107c_reminderRides,
+                    matrix: {
+                      ok: remCopyOut.ok, allSuccess: remResults.every((r) => r.success),
+                      futureRides, pastRides, dismissedRides, controlStaysNull, sourcesUnchanged, moveStillRides,
+                      futureSrcReminderAt: remSnap[0].reminderAt, futureCopyReminderAt: futCopy?.reminderAt ?? null,
+                      pastSrcReminderAt: remSnap[1].reminderAt, pastCopyReminderAt: pastCopy?.reminderAt ?? null,
+                      dismissedSrcReminderAt: remSnap[2].reminderAt, dismissedCopyReminderAt: dismissedCopy?.reminderAt ?? null,
+                      dismissedSrcDismissedBy: remSnap[2].reminderDismissedBy,
+                      dismissedCopyDismissedBy: dismissedCopy?.reminderDismissedBy ?? null,
+                      futureSrcSetBy: remSnap[0].reminderSetByUid, futureCopySetBy: futCopy?.reminderSetByUid ?? null,
+                      pastSrcSetBy: remSnap[1].reminderSetByUid, pastCopySetBy: pastCopy?.reminderSetByUid ?? null,
+                      copyDismissedFired: [futCopy, pastCopy, dismissedCopy, ctrlCopy].map((c) => (c ? [c.reminderDismissedBy, c.reminderFiredAt] : null)),
+                      moveReminderAt: pastAfterMove?.reminderAt ?? null,
+                    },
+                  }));
+                  // leg-end cleanup — the spaces' names are NOT in the hygiene loops' exact-name
+                  // list ('t107 Target'/'t107 Empty'); the t107-Rem* drop names ARE covered by the
+                  // t107- loops, this is belt-and-suspenders like the f_t107b leg's.
+                  for (const c of remCopies) if (c) await manager.deleteDropQuiet(c.id);
+                  for (const d of [remFuture, remPast, remDismissed, remCtrl]) await manager.deleteDropQuiet(d.id);
+                  await manager.deleteSpaceQuiet(remTgt.id);
+                  await manager.deleteSpaceQuiet(remSrc.id);
+
+                  // ---------- f_t107e_dismissalSilencesSweeper (repair-order-107e §4.2) ----------
+                  // The REAL engine is exercised — no synthetic fires. The sweeper's
+                  // reminderEligible never checked reminderDismissedBy, so 107d's
+                  // dismissed-but-not-fired COPIES re-notified (owner-found on candidate 4: toast +
+                  // themed card on a copied drop whose reminder was dismissed pre-copy); 107e adds
+                  // the dismissal check to the shared predicate, so ALL notification paths (toast,
+                  // themed card, missed queue) AND the unlock-time marking honor it. The spy rides
+                  // setNotifier — the engine's own seam (index.ts:8219) — and is installed BEFORE
+                  // any past-due seed exists, so no real toast escapes into the run and every fire
+                  // lands in the spy. The spy is NOT restored afterward (107e §6): later legs don't
+                  // depend on toasts, and stray captures are harmless.
+                  const spyFires: string[] = [];
+                  manager.setNotifier((title: string) => { spyFires.push(title); });
+                  const sweepSrc = await manager.createSpace('t107e Sweep');
+                  const sweepUndismissed = await createTextDrop(manager, {
+                    spaceId: sweepSrc.id, name: 't107e-Undismissed', content: 'past-due, never dismissed',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() - 60_000).toISOString(),
+                  });
+                  const sweepDismissed = await createTextDrop(manager, {
+                    spaceId: sweepSrc.id, name: 't107e-Dismissed', content: 'past-due, dismissed before the tick',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() - 60_000).toISOString(),
+                  });
+                  await manager.patchDropMeta(sweepDismissed.id, { reminderDismissedBy: 'local' });
+                  // ≥35s guarantees a 30s sweeper tick lands regardless of loop phase (107e §5).
+                  await new Promise((r) => setTimeout(r, 35_000));
+                  const sweepUndismissedAfter = manager.peekDrop(sweepUndismissed.id) ?? sweepUndismissed;
+                  const sweepDismissedAfter = manager.peekDrop(sweepDismissed.id) ?? sweepDismissed;
+                  // Name-scoped asserts (107e §4.2 note): UNRELATED past-due undismissed drops
+                  // lingering in the battery vault may also fire through the spy — harmless.
+                  // reminderFiredAt is read through the record's own "null/absent = not yet fired"
+                  // rule (vaultTypes.ts) — a fresh unstamped record holds ABSENT, not null.
+                  const undismissedFired = spyFires.includes('t107e-Undismissed')
+                    && (sweepUndismissedAfter.reminderFiredAt ?? null) !== null; // the engine fired it AND stamped it
+                  const dismissedSilent = !spyFires.includes('t107e-Dismissed')
+                    && (sweepDismissedAfter.reminderFiredAt ?? null) === null;   // skipped ENTIRELY — no notify, no stamp
+                  const dismissedStillRides = (sweepDismissedAfter.reminderDismissedBy ?? null) === 'local'; // the loop never mutated it
+                  const f_t107e_dismissalSilencesSweeper = undismissedFired && dismissedSilent && dismissedStillRides;
+                  console.log('[f107e-dismissalSilence]', JSON.stringify({
+                    f_t107e_dismissalSilencesSweeper,
+                    matrix: {
+                      undismissedFired, dismissedSilent, dismissedStillRides,
+                      spyFires,
+                      undismissedFiredAt: sweepUndismissedAfter.reminderFiredAt ?? null,
+                      dismissedFiredAt: sweepDismissedAfter.reminderFiredAt ?? null,
+                      dismissedBy: sweepDismissedAfter.reminderDismissedBy ?? null,
+                    },
+                  }));
+                  // leg-end cleanup — both seeds + the space are deleted HERE explicitly. FLAGGED
+                  // to the owner (107e order said the t107e- names "join the hygiene families"):
+                  // 't107e-' does NOT startsWith('t107-'), so the fixed-name hygiene loops and the
+                  // [f107-hygiene] residue probe never see these names — this explicit deletion is
+                  // the actual cleanup; a mid-leg crash would leave t107e-* residue invisible to
+                  // the probe (the order's name-scoping note covers such strays as harmless).
+                  await manager.deleteDropQuiet(sweepUndismissed.id);
+                  await manager.deleteDropQuiet(sweepDismissed.id);
+                  await manager.deleteSpaceQuiet(sweepSrc.id);
 
                   // ---------- f_t107_sameSpaceGuard ----------
                   const sameMoveOut = await transferDrops(manager, { mode: 'move', dropIds: [partGood.id], targetSpaceId: target.id });

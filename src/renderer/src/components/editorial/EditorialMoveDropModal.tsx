@@ -184,7 +184,10 @@ export function EditorialMoveDropModal({ drops, onMove, onCopy, onClose, theme =
           {!isSameLocation && (
             <div className={`border ${tc.border} ${tc.bg} rounded-lg px-3 py-2.5 ${tc.fontClass} space-y-1`}>
               {mode === 'copy' ? (
-                <p className={`text-xs ${tc.muted}`}>A copy will be created in {targetName}. The original stays in {currentSpaceName}.</p>
+                <>
+                  <p className={`text-xs ${tc.muted}`}>A copy will be created in {targetName}. The original stays in {currentSpaceName}.</p>
+                  <p className={`text-xs ${tc.muted}`}>Reminders carry over to the copy.</p>
+                </>
               ) : (
                 <p className={`text-xs ${tc.muted}`}>
                   {isBulk

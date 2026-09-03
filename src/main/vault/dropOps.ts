@@ -507,11 +507,20 @@ export async function updateTextDropMeta(
  * (blobStore.ts:4-8) — byte-copying a .vblob would clone the nonce under the same vault DEK =
  * AES-GCM nonce reuse, FORBIDDEN. This also satisfies the path-ownership rule: deleteDrop
  * unlinks blob files BY PATH (vault.ts:766-774), so two records sharing one path would corrupt
- * each other on delete. Fresh createdAt; expiresAt recomputed from the source's
+ * each other on delete. createdAt = the batch's ONE shared stamp (`batchCreatedAt` — a copy
+ * action is one creation moment; equal stamps preserve the caller's display order under the
+ * newest-first stable sort, vault.ts:638 — owner decision 2026-09-02, deliberately different
+ * from the web's per-copy serverTimestamp); expiresAt recomputed from the source's
  * expirationOption ('forever' → null — forever stays forever; the web's tier downgrade is
  * account-tier logic and the desktop has no tiers, §3.5); unpinned; UNlocked ("a copy always
- * starts open — the lock never transfers", drops.ts:1813); NO reminder fields at all (W6);
- * labels carried only for text drops whose resolved categories are NOT password categories
+ * starts open — the lock never transfers", drops.ts:1813); the reminder RIDES (reminderAt +
+ * reminderSetByUid verbatim — owner decision 2026-09-03, deliberately different from the web's
+ * reminder-less copy: web workspaces are shared so its reminders are user-coupled,
+ * drops.ts:311-313; the desktop is single-user; reminderDismissedBy RIDES too — a dismissal is
+ * the user's "done with this reminder" decision and must travel with the copy, else a copied
+ * drop re-notifies about something already closed (owner-found on candidate 3, ruling
+ * 2026-09-03)) while only reminderFiredAt resets to null — the copy hasn't fired on its own id
+ * yet; labels carried only for text drops whose resolved categories are NOT password categories
  * (W6, drops.ts:1895-1898). importedFromArchiveId does NOT transfer (import provenance — the
  * web copy has no such field). drawingScene rides by reference: same PNG bytes ⇒ the editor's
  * zero-fetch scene cache stays valid.
@@ -559,6 +568,15 @@ export async function transferDrops(
   }
 
   const results: { id: string; newId?: string; success: boolean; error?: string }[] = [];
+  // ONE creation moment for the whole batch (owner decision 2026-09-02 — bulk-copy order fix):
+  // every copy made by THIS transferDrops call shares one createdAt. The target list sorts
+  // newest-first with NO tie-breaker (vault.ts:638) and JS sorts are stable, so equal stamps
+  // keep the loop order — which is the display order the caller passed
+  // (EditorialDropList.tsx:773) — and the batch lands in its source order instead of reversed.
+  // Per-copy fresh stamps (the old behavior; web drops.ts:1807 parity) reversed every
+  // multi-copy batch — owner-found defect on the installed 1.0.7, fixed deliberately better
+  // than the web (web copyDrop fires concurrent Promise.all and scrambles; NEVER edit the web).
+  const batchCreatedAt = new Date().toISOString();
   // SEQUENTIAL on purpose: the journal is a serialized chain anyway, and per-drop isolation
   // means one bad id never aborts the batch (web W3/W4; the web's Promise.all is concurrent,
   // outcomes are identical, ordering here is deterministic — order §6).
@@ -676,13 +694,19 @@ export async function transferDrops(
       pinned: false,                   // web: copy starts unpinned (drops.ts:1812)
       locked: false,                   // web: "a copy always starts open — the lock never transfers" (drops.ts:1813)
       isDrawing: src.isDrawing,
-      createdAt: new Date().toISOString(),
+      createdAt: batchCreatedAt, // the batch's ONE shared stamp — see batchCreatedAt above
       expiresAt: copyExpiresAt,        // recomputed from the source's option — clock restarts (W6)
       expirationOption: copyOption,
-      reminderAt: null,                // web: the copy has NO reminder (W6 — no reminder fields at all)
-      reminderSetByUid: null,
-      reminderDismissedBy: null,
-      reminderFiredAt: null,
+      reminderAt: src.reminderAt,      // RIDES verbatim (owner decision 2026-09-03 — reminders ride on
+      reminderSetByUid: src.reminderSetByUid, // copy like move). Deliberately different from the web,
+      // whose SHARED workspaces make reminders user-coupled (web drops.ts:311-313) — the single-user
+      // desktop has no one to impose a reminder on. Past reminderAt surfaces via the missed queue.
+      reminderDismissedBy: src.reminderDismissedBy, // RIDES verbatim (owner ruling 2026-09-03): a
+      // dismissal is the user's "I'm DONE with this reminder" decision and must travel with the
+      // copy — else a copied drop re-notifies about something already closed (owner-found on
+      // candidate 3: 10 drops copied, 5 dismissed, all 5 copies re-notified).
+      reminderFiredAt: null,           // the ONLY reset — the copy hasn't fired on its own id yet:
+      // an UNdismissed past reminder surfaces once via the missed queue; a dismissed one never fires.
       fileSize: src.fileSize,
       mimeType: src.mimeType,
       imageSize: newImageRef?.bytes ?? src.imageSize,
