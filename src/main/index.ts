@@ -16,6 +16,9 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 
 import { VaultManager } from './vault/vault.ts';
+// Round 107 battery (§8.3) — the f_t107_* legs read REAL records main-side; the ride-keys
+// helper types its parameter with the record type itself.
+import type { VaultDropRecord } from './vault/vaultTypes.ts';
 import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_ROOM_PAD_X, CLOUD_ORIGIN, CAPTURE_DEADLINE_MS, ENTRY_CONNECT_TIMEOUT_MS, STATUS_TOP, STATUS_H, CLOUD_URL, type CloudController } from './cloud';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
@@ -26,6 +29,7 @@ import {
   updateTextDropContent,
   updateTextDropMeta,
   refreshYouTubeTitles,
+  transferDrops,
   type CreateTextArgs,
   type CreateMetaBase,
   type UpdateContentArgs,
@@ -6761,6 +6765,744 @@ function createWindow(): void {
                 win.webContents.send('pill:flipRequested', 'local');
                 await sleep(1500);
                 try { await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw'); } catch { /* already open or gone */ }
+
+                // ================== f_t107_* — MOVE & COPY DROPS (round 107) ==================
+                // repair-order-107 §8.3. Placed after the C2h cleanup (Local + unlocked) and
+                // before the 92 s C2l Off watch. The DATA legs drive the exported product code
+                // paths main-side (createTextDrop/createFileDropFromBytes — the exact functions
+                // the drop:create* handlers call — then transferDrops itself) so the asserts can
+                // read the REAL VaultDropRecord (blob paths/sha256s never cross the bridge). The
+                // UI leg (f_t107_uiWiring) drives the REAL renderer path: reload → real clicks
+                // (elementFromPoint-gated) → preview Move button / bulk Move pill / the move
+                // modal → the bridge (FIX B) → the drop:transfer handler (FIX D) → the FIX H
+                // post-op flows. Fixtures are namespaced t107-* and cleaned up at BOTH ends (the
+                // battery vault persists across runs). waitFor is (5e)-scoped (see the C2h note)
+                // — this sibling block polls with waitFor107, same precedent.
+                {
+                  const waitFor107 = async (cond: () => Promise<boolean> | boolean, timeoutMs: number, step = 50): Promise<boolean> => {
+                    const t0 = Date.now();
+                    for (;;) {
+                      if (await cond()) return true;
+                      if (Date.now() - t0 > timeoutMs) return false;
+                      await sleep(step);
+                    }
+                  };
+                  if (manager.status().state !== 'unlocked') {
+                    await manager.unlock('/tmp/ds-c2f-vault', 'c2f-vault-pw');
+                  }
+
+                  // ---------- hygiene: a previous run's fixtures must never leak into this one ----------
+                  for (const rec of manager.allRecords()) {
+                    if (rec.name.startsWith('t107-')) await manager.deleteDropQuiet(rec.id);
+                  }
+                  for (const cat of manager.listCategories('personal')) {
+                    if (cat.name.startsWith('t107 ')) await manager.deleteCategoryQuiet(cat.id);
+                  }
+                  for (const space of manager.listSpaces()) {
+                    if (space.name === 't107 Target' || space.name === 't107 Empty') await manager.deleteSpaceQuiet(space.id);
+                  }
+                  // run-8 probe: VERIFY the hygiene emptied the namespace — a leftover t107-*
+                  // record would keep a same-named card alive after the UI move (cardByName
+                  // matches by NAME), faking a cardRemoved failure; listCardTotal grew 43→50
+                  // across green5→7, so residue (or non-t107 fixture growth) must be visible.
+                  console.log('[f107-hygiene]', JSON.stringify({
+                    residue: manager.allRecords().filter((r) => r.name.startsWith('t107-')).map((r) => r.name),
+                    personalRecords: manager.listDrops('personal').length,
+                    spaces: manager.listSpaces().map((s) => s.name),
+                  }));
+
+                  // ---------- fixtures (the product create paths) ----------
+                  const labelSeed = [{ videoId: 'jNQXAC9IVRw', title: 't107 Seed Title', channel: 't107 Channel' }];
+                  const seedLabels = (id: string) => manager.mutatePublic({ op: 'drop.meta', id, patch: { youtubeVideoLabels: labelSeed } });
+
+                  const moveMe = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-MoveMe', content: 'move body https://youtu.be/jNQXAC9IVRw',
+                    categories: ['t107 Shared', 't107 Alpha'], expirationOption: '6h', locked: true,
+                    reminderAt: new Date(Date.now() + 3600_000).toISOString(),
+                  });
+                  await seedLabels(moveMe.id);
+
+                  const fileBytes = new Uint8Array(64 * 1024);
+                  for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 31 + 7) & 0xff;
+                  const fileSeed = await createFileDropFromBytes(manager, fileBytes, 't107-file.bin', 'application/octet-stream', { spaceId: 'personal', expirationOption: '24h', locked: false });
+
+                  const foreverText = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-ForeverText', content: 'eternal body',
+                    categories: ['t107 Shared'], expirationOption: 'forever', locked: true,
+                    reminderAt: new Date(Date.now() + 3600_000).toISOString(),
+                  });
+                  await seedLabels(foreverText.id);
+
+                  const sixHText = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-SixH', content: 'six hour body',
+                    categories: [], expirationOption: '6h', locked: false, reminderAt: null,
+                  });
+                  await seedLabels(sixHText.id);
+
+                  const pwText = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-PwText', content: 'secret body',
+                    categories: ['password'], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  await seedLabels(pwText.id);
+
+                  const bulk2 = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-Bulk2', content: 'bulk body',
+                    categories: ['t107 Shared'], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+
+                  const drawPng = new Uint8Array(137);
+                  for (let i = 0; i < drawPng.length; i++) drawPng[i] = (i * 13 + 5) & 0xff;
+                  const drawing = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-Draw', content: '', expirationOption: '24h',
+                    categories: [], locked: false, reminderAt: null, pngBytes: drawPng,
+                  });
+
+                  // UI-flow seeds (the uiWiring leg reloads the renderer so its store hydrates these)
+                  const uiMove = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-UI-Move', content: 'ui move body',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  const uiCopy = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-UI-Copy', content: 'copy preview body',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  const uiFail = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-UI-Fail', content: 'ui fail body',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+
+                  const target = await manager.createSpace('t107 Target');
+                  const empty = await manager.createSpace('t107 Empty');
+
+                  // ---------- f_t107_moveFields ----------
+                  const rideKeys = (r: VaultDropRecord) => ({
+                    reminderAt: r.reminderAt,
+                    reminderSetByUid: r.reminderSetByUid ?? null,
+                    reminderDismissedBy: r.reminderDismissedBy ?? null,
+                    reminderFiredAt: r.reminderFiredAt ?? null,
+                    expiresAt: r.expiresAt,
+                    expirationOption: r.expirationOption ?? null,
+                    labels: JSON.stringify(r.youtubeVideoLabels ?? []),
+                    locked: r.locked,
+                  });
+                  const moveBefore = rideKeys(manager.findDrop(moveMe.id)); // FRESH read — seedLabels patched the index after createTextDrop returned
+                  const moveOut = await transferDrops(manager, { mode: 'move', dropIds: [moveMe.id], targetSpaceId: target.id });
+                  const movedRec = manager.findDrop(moveMe.id);
+                  const moveAfter = rideKeys(movedRec);
+                  const moveRideOk = JSON.stringify(moveBefore) === JSON.stringify(moveAfter);
+                  const targetCats = manager.listCategories(target.id);
+                  const f_t107_moveFields = moveOut.ok === true && moveOut.results?.[0]?.success === true
+                    && movedRec.spaceId === target.id && movedRec.pinned === false
+                    && JSON.stringify(movedRec.categories) === JSON.stringify(['t107 Shared', 't107 Alpha'])
+                    && targetCats.some((c) => c.name.toLowerCase() === 't107 shared')
+                    && targetCats.some((c) => c.name.toLowerCase() === 't107 alpha')
+                    && moveRideOk;
+                  console.log('[f107-moveFields]', JSON.stringify({
+                    f_t107_moveFields,
+                    matrix: { ok: moveOut.ok, perDrop: moveOut.results?.[0] ?? null, spaceIdOk: movedRec.spaceId === target.id, unpinned: movedRec.pinned === false, catsOk: JSON.stringify(movedRec.categories), targetRows: targetCats.map((c) => c.name), rideOk: moveRideOk },
+                    raw: { before: moveBefore, after: moveAfter },
+                  }));
+
+                  // ---------- f_t107_moveListRemoval ----------
+                  const f_t107_moveListRemoval = !manager.listDrops('personal').some((d) => d.id === moveMe.id)
+                    && manager.listDrops(target.id).some((d) => d.id === moveMe.id);
+                  console.log('[f107-moveListRemoval]', JSON.stringify({
+                    f_t107_moveListRemoval,
+                    raw: { inPersonal: manager.listDrops('personal').some((d) => d.id === moveMe.id), inTarget: manager.listDrops(target.id).some((d) => d.id === moveMe.id) },
+                  }));
+
+                  // ---------- f_t107_copyIndependence ----------
+                  const { createHash } = await import('node:crypto');
+                  const sha107 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
+                  const srcFileRec = manager.findDrop(fileSeed.record.id);
+                  const srcFileJson = JSON.stringify(srcFileRec);
+                  const copyOut = await transferDrops(manager, { mode: 'copy', dropIds: [fileSeed.record.id], targetSpaceId: target.id });
+                  const copyItem = copyOut.results?.[0] ?? null;
+                  const copyRec = copyItem?.newId ? manager.peekDrop(copyItem.newId) ?? null : null;
+                  const pathIndependent = !!copyRec && !!copyRec.blobRefs.file && !!srcFileRec.blobRefs.file
+                    && copyRec.id !== srcFileRec.id
+                    && copyRec.blobRefs.file.path !== srcFileRec.blobRefs.file.path
+                    && copyRec.blobRefs.file.sha256 === srcFileRec.blobRefs.file.sha256
+                    && copyRec.blobRefs.file.bytes === srcFileRec.blobRefs.file.bytes;
+                  const sourceUnchanged = JSON.stringify(manager.findDrop(fileSeed.record.id)) === srcFileJson;
+                  let sourceSurvivesCopyDelete = false;
+                  if (copyRec) {
+                    await manager.deleteDrop(copyRec.id); // delete the COPY …
+                    const bytes = await manager.getBlobBytes(fileSeed.record.id, 'file');
+                    sourceSurvivesCopyDelete = !!bytes && sha107(bytes) === srcFileRec.contentSha256s.file; // … the source still previews
+                  }
+                  let reMadeCopySurvivesSourceDelete = false;
+                  const copy2Out = await transferDrops(manager, { mode: 'copy', dropIds: [fileSeed.record.id], targetSpaceId: target.id });
+                  const copy2Id = copy2Out.results?.[0]?.newId ?? null;
+                  if (copy2Id) {
+                    await manager.deleteDrop(fileSeed.record.id); // delete the SOURCE …
+                    const bytes = await manager.getBlobBytes(copy2Id, 'file');
+                    reMadeCopySurvivesSourceDelete = !!bytes && sha107(bytes) === srcFileRec.contentSha256s.file; // … the re-made copy still previews
+                  }
+                  const f_t107_copyIndependence = copyOut.ok === true && pathIndependent && sourceUnchanged
+                    && sourceSurvivesCopyDelete && reMadeCopySurvivesSourceDelete;
+                  console.log('[f107-copyIndependence]', JSON.stringify({
+                    f_t107_copyIndependence,
+                    matrix: { ok: copyOut.ok, pathIndependent, sourceUnchanged, sourceSurvivesCopyDelete, reMadeCopySurvivesSourceDelete },
+                    raw: { srcPath: srcFileRec.blobRefs.file?.path ?? null, copyPath: copyRec?.blobRefs.file?.path ?? null, srcSha: srcFileRec.contentSha256s.file ?? null, copySha: copyRec?.blobRefs.file?.sha256 ?? null, srcBytes: srcFileRec.blobRefs.file?.bytes ?? null, copyBytes: copyRec?.blobRefs.file?.bytes ?? null },
+                  }));
+
+                  // ---------- f_t107_copySemantics ----------
+                  const copyOne = async (id: string) => {
+                    const out = await transferDrops(manager, { mode: 'copy', dropIds: [id], targetSpaceId: target.id });
+                    return out.results?.[0]?.newId ? manager.peekDrop(out.results[0].newId!) ?? null : null;
+                  };
+                  const foreverCopy = await copyOne(foreverText.id);
+                  const sixHCopy = await copyOne(sixHText.id);
+                  const pwCopy = await copyOne(pwText.id);
+                  const drawCopy = await copyOne(drawing.id);
+                  const foreverOk = !!foreverCopy && foreverCopy.expiresAt === null && foreverCopy.expirationOption === 'forever'
+                    && foreverCopy.reminderAt === foreverText.reminderAt && foreverCopy.reminderSetByUid === foreverText.reminderSetByUid
+                    && foreverCopy.reminderDismissedBy === foreverText.reminderDismissedBy && foreverCopy.reminderFiredAt === null
+                    && foreverCopy.locked === false && foreverCopy.pinned === false
+                    && (foreverCopy.youtubeVideoLabels?.length ?? 0) === 1
+                    && foreverCopy.createdAt !== foreverText.createdAt;
+                  const sixHOk = !!sixHCopy && !!sixHCopy.expiresAt
+                    && Math.abs(new Date(sixHCopy.expiresAt).getTime() - (Date.now() + 6 * 3600_000)) < 60_000;
+                  const pwOk = !!pwCopy && (pwCopy.youtubeVideoLabels?.length ?? 0) === 0;
+                  const drawOk = !!drawCopy && drawCopy.isDrawing === true
+                    && !!drawCopy.blobRefs.file && !!drawing.blobRefs.file
+                    && drawCopy.blobRefs.file.path !== drawing.blobRefs.file.path
+                    && drawCopy.blobRefs.file.sha256 === drawing.blobRefs.file.sha256;
+                  const f_t107_copySemantics = foreverOk && sixHOk && pwOk && drawOk;
+                  console.log('[f107-copySemantics]', JSON.stringify({
+                    f_t107_copySemantics,
+                    matrix: { foreverOk, sixHOk, pwOk, drawOk },
+                    raw: {
+                      forever: foreverCopy ? { expiresAt: foreverCopy.expiresAt, option: foreverCopy.expirationOption ?? null, reminderAt: foreverCopy.reminderAt, locked: foreverCopy.locked, pinned: foreverCopy.pinned, labels: foreverCopy.youtubeVideoLabels?.length ?? 0, createdAtFresh: foreverCopy.createdAt !== foreverText.createdAt } : null,
+                      sixHExpiresAt: sixHCopy?.expiresAt ?? null, pwLabels: pwCopy ? (pwCopy.youtubeVideoLabels?.length ?? 0) : null,
+                      drawCopyPath: drawCopy?.blobRefs.file?.path ?? null, drawSrcPath: drawing.blobRefs.file?.path ?? null,
+                    },
+                  }));
+
+                  // ---------- f_t107_bulkCategoryEnsure ----------
+                  const bulkOut = await transferDrops(manager, { mode: 'move', dropIds: [foreverText.id, bulk2.id], targetSpaceId: empty.id });
+                  const emptyCats = manager.listCategories(empty.id);
+                  const foreverInEmpty = manager.findDrop(foreverText.id);
+                  const bulk2InEmpty = manager.findDrop(bulk2.id);
+                  const f_t107_bulkCategoryEnsure = bulkOut.ok === true && (bulkOut.results?.every((r) => r.success) ?? false)
+                    && emptyCats.length === 1 && emptyCats[0]?.name === 't107 Shared'
+                    && foreverInEmpty.categories.includes('t107 Shared') && bulk2InEmpty.categories.includes('t107 Shared')
+                    && foreverInEmpty.spaceId === empty.id && bulk2InEmpty.spaceId === empty.id;
+                  console.log('[f107-bulkCategoryEnsure]', JSON.stringify({
+                    f_t107_bulkCategoryEnsure,
+                    raw: { results: bulkOut.results ?? [], emptyCategories: emptyCats.map((c) => c.name), foreverCats: foreverInEmpty.categories, bulk2Cats: bulk2InEmpty.categories },
+                  }));
+
+                  // ---------- f_t107_partialFailure ----------
+                  const partGood = await createTextDrop(manager, {
+                    spaceId: 'personal', name: 't107-PartGood', content: 'good body', categories: [],
+                    expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  const partialOut = await transferDrops(manager, { mode: 'move', dropIds: [partGood.id, 't107-bogus-nonexistent'], targetSpaceId: target.id });
+                  const goodAfter = manager.findDrop(partGood.id);
+                  const f_t107_partialFailure = partialOut.ok === true && (partialOut.results?.length ?? 0) === 2
+                    && partialOut.results?.[0]?.success === true
+                    && partialOut.results?.[1]?.success === false && partialOut.results?.[1]?.error === 'Drop not found.'
+                    && goodAfter.spaceId === target.id;
+                  console.log('[f107-partialFailure]', JSON.stringify({ f_t107_partialFailure, out: partialOut }));
+
+                  // ---------- f_t107b_copyBatchOrderPreserved (repair-order-107b §4.4) ----------
+                  // Bulk COPY must land in the caller's display order, not reversed. Fresh
+                  // spaces (sA source / sB target — sB EMPTY so the target list is EXACTLY the
+                  // batch); three sequential creates in sA; copy the observed newest-first
+                  // `order` 1:1; the target list must deep-equal it and all three copies must
+                  // carry ONE shared createdAt (vault.ts:638 sorts newest-first with NO
+                  // tie-breaker; JS sorts are stable — equal stamps keep loop order).
+                  const sA = await manager.createSpace('t107b BatchSrc');
+                  const sB = await manager.createSpace('t107b BatchTgt');
+                  const batch1 = await createTextDrop(manager, {
+                    spaceId: sA.id, name: 't107-Batch1', content: 'batch body 1',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  const batch2 = await createTextDrop(manager, {
+                    spaceId: sA.id, name: 't107-Batch2', content: 'batch body 2',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  const batch3 = await createTextDrop(manager, {
+                    spaceId: sA.id, name: 't107-Batch3', content: 'batch body 3',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  const order = manager.listDrops(sA.id).map((d) => d.id); // newest-first display order
+                  const batchOut = await transferDrops(manager, { mode: 'copy', dropIds: order, targetSpaceId: sB.id });
+                  const targetOrder = manager.listDrops(sB.id).map((d) => d.id);
+                  const newRecs: VaultDropRecord[] = [];
+                  for (const r of batchOut.results ?? []) {
+                    const rec = r.newId ? manager.peekDrop(r.newId) : undefined;
+                    if (rec) newRecs.push(rec);
+                  }
+                  // §4.4 says the target id list "deep-equals `order`" — but `order` holds SOURCE
+                  // ids while sB holds COPIES (fresh UUIDs, dropOps.ts:670), so the literal
+                  // comparison is unsatisfiable by construction (green-run-1 evidence: names and
+                  // stamps aligned, orderPreserved false). The batch's order is carried by the
+                  // results array — one entry per dropId in loop order — so the target list must
+                  // equal the newId SEQUENCE (position i ↔ order[i]). Same mechanism §8.3's RED
+                  // pair flips: per-copy fresh stamps push the last-copied drop to the top.
+                  const newIdsInLoopOrder = (batchOut.results ?? []).map((r) => r.newId ?? null);
+                  const orderPreserved = JSON.stringify(targetOrder) === JSON.stringify(newIdsInLoopOrder);
+                  const sameStamp = newRecs.length === 3 && new Set(newRecs.map((r) => r.createdAt)).size === 1;
+                  const sourceListUnchanged = JSON.stringify(manager.listDrops(sA.id).map((d) => d.id)) === JSON.stringify(order);
+                  const f_t107b_copyBatchOrderPreserved = order.length === 3 && batchOut.ok === true
+                    && orderPreserved && sameStamp && sourceListUnchanged;
+                  console.log('[f107b-copyBatchOrder]', JSON.stringify({
+                    f_t107b_copyBatchOrderPreserved,
+                    matrix: {
+                      guardOrderLen3: order.length === 3, ok: batchOut.ok, orderPreserved, sameStamp, sourceListUnchanged,
+                      tgtIds: targetOrder,
+                      newIdsInLoopOrder,
+                      srcCreatedAts: order.map((id) => manager.peekDrop(id)?.createdAt ?? null),
+                      tgtCreatedAts: targetOrder.map((id) => manager.peekDrop(id)?.createdAt ?? null),
+                      srcNames: order.map((id) => manager.peekDrop(id)?.name ?? null),
+                      tgtNames: targetOrder.map((id) => manager.peekDrop(id)?.name ?? null),
+                    },
+                  }));
+                  // leg-end cleanup — the fixed-name hygiene loops above/below can't match these
+                  // two spaces (the vault persists across runs); the t107-Batch* drop names ARE
+                  // covered by both hygiene loops, this is just belt-and-suspenders.
+                  for (const r of newRecs) await manager.deleteDropQuiet(r.id);
+                  for (const id of [batch1.id, batch2.id, batch3.id]) await manager.deleteDropQuiet(id);
+                  await manager.deleteSpaceQuiet(sB.id);
+                  await manager.deleteSpaceQuiet(sA.id);
+
+                  // ---------- f_t107c_reminderRides (repair-order-107c §4.5; upgraded 107d §4.3) ----------
+                  // Reminders RIDE on copy (owner 2026-09-03 — carry EVERYTHING, like move):
+                  // reminderAt + reminderSetByUid verbatim, and (107d) reminderDismissedBy verbatim
+                  // too — a dismissal is the user's "done with this reminder" decision and must
+                  // travel with the copy, else a copied drop re-notifies about something already
+                  // closed; reminderFiredAt is the ONLY reset (an UNdismissed past reminderAt
+                  // surfaces once via the missed queue — C2j keys on reminderAt ≤ now && !dismissed
+                  // && !fired). 107d §8.3's RED pair restores ONLY the dismissal line
+                  // (`reminderDismissedBy: null,` — the 107c behavior): then dismissedRides goes
+                  // FALSE (copy reads null vs 'local') while futureRides/pastRides/controlStaysNull/
+                  // sourcesUnchanged/moveStillRides stay TRUE — the precise signature.
+                  const remSrc = await manager.createSpace('t107c RemSrc');
+                  const remTgt = await manager.createSpace('t107c RemTgt'); // EMPTY — the batch IS the whole target
+                  const remFuture = await createTextDrop(manager, {
+                    spaceId: remSrc.id, name: 't107-RemFuture', content: 'future reminder body',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() + 3600_000).toISOString(),
+                  });
+                  const remPast = await createTextDrop(manager, {
+                    spaceId: remSrc.id, name: 't107-RemPast', content: 'past reminder body',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() - 3600_000).toISOString(),
+                  });
+                  const remCtrl = await createTextDrop(manager, {
+                    spaceId: remSrc.id, name: 't107-RemCtrl', content: 'no reminder body',
+                    categories: [], expirationOption: '24h', locked: false, reminderAt: null,
+                  });
+                  // 107d: the fourth seed — an already-DISMISSED past reminder; the dismissal is
+                  // seeded via patchDropMeta (vault.ts Pick list carries reminderDismissedBy and
+                  // sets ONLY the patched fields) exactly like a user's dismiss action.
+                  const remDismissed = await createTextDrop(manager, {
+                    spaceId: remSrc.id, name: 't107-RemDismissed', content: 'dismissed reminder body',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() - 3600_000).toISOString(),
+                  });
+                  await manager.patchDropMeta(remDismissed.id, { reminderDismissedBy: 'local' });
+                  // snap AFTER the patch — the dismissed seed's snapshot must carry 'local'; peeked
+                  // fresh (the createTextDrop return predates the patch).
+                  const remDismissedPatched = manager.peekDrop(remDismissed.id) ?? remDismissed;
+                  const remSnap = [remFuture, remPast, remDismissedPatched, remCtrl].map((d) => ({
+                    reminderAt: d.reminderAt, reminderSetByUid: d.reminderSetByUid,
+                    reminderDismissedBy: d.reminderDismissedBy, reminderFiredAt: d.reminderFiredAt ?? null,
+                  }));
+                  const remCopyOut = await transferDrops(manager, {
+                    mode: 'copy', dropIds: [remFuture.id, remPast.id, remDismissed.id, remCtrl.id], targetSpaceId: remTgt.id,
+                  });
+                  const remResults = remCopyOut.results ?? [];
+                  const remCopies = remResults.map((r) => (r.newId ? manager.peekDrop(r.newId) ?? null : null));
+                  const [futCopy, pastCopy, dismissedCopy, ctrlCopy] = remCopies; // results are in loop order — position i ↔ i-th requested drop
+                  const futureRides = !!futCopy
+                    && futCopy.reminderAt === remSnap[0].reminderAt          // string equality — VERBATIM ride
+                    && futCopy.reminderSetByUid === remSnap[0].reminderSetByUid
+                    && futCopy.reminderDismissedBy === remSnap[0].reminderDismissedBy // dismissal rides verbatim (107d)
+                    && futCopy.reminderFiredAt === null;
+                  const pastRides = !!pastCopy
+                    && pastCopy.reminderAt === remSnap[1].reminderAt
+                    && pastCopy.reminderSetByUid === remSnap[1].reminderSetByUid
+                    && pastCopy.reminderDismissedBy === remSnap[1].reminderDismissedBy // verbatim (107d)
+                    && pastCopy.reminderFiredAt === null;
+                  const controlStaysNull = !!ctrlCopy && ctrlCopy.reminderAt === null && ctrlCopy.reminderSetByUid === null;
+                  // 107d's new assert — the DISMISSED copy: the dismissal RIDES ('local'), the
+                  // reminderAt rides verbatim, and reminderFiredAt is STILL the only reset — a
+                  // dismissed reminder never fires on the copy (the owner's re-notification bug,
+                  // asserted at field level).
+                  const dismissedRides = !!dismissedCopy
+                    && dismissedCopy.reminderDismissedBy === remSnap[2].reminderDismissedBy // 'local' — RIDES
+                    && dismissedCopy.reminderAt === remSnap[2].reminderAt   // verbatim
+                    && dismissedCopy.reminderFiredAt === null;
+                  const sourcesUnchanged = [remFuture, remPast, remDismissed, remCtrl].every((d, i) => {
+                    const after = manager.peekDrop(d.id);
+                    const b = remSnap[i];
+                    return !!after && after.reminderAt === b.reminderAt
+                      && after.reminderSetByUid === b.reminderSetByUid
+                      && (after.reminderDismissedBy ?? null) === b.reminderDismissedBy
+                      && (after.reminderFiredAt ?? null) === b.reminderFiredAt;
+                  });
+                  // THEN move the past-reminder drop to the target — move's ONE meta patch carries
+                  // the reminder by construction (dropOps.ts:587-591); the asymmetry story is fixed
+                  // on BOTH verbs.
+                  const remMoveOut = await transferDrops(manager, { mode: 'move', dropIds: [remPast.id], targetSpaceId: remTgt.id });
+                  const pastAfterMove = manager.peekDrop(remPast.id);
+                  const moveStillRides = remMoveOut.ok === true && remMoveOut.results?.[0]?.success === true
+                    && !!pastAfterMove && pastAfterMove.reminderAt === remSnap[1].reminderAt
+                    && pastAfterMove.spaceId === remTgt.id;
+                  const f_t107c_reminderRides = remCopyOut.ok === true && remResults.length === 4
+                    && remResults.every((r) => r.success)
+                    && futureRides && pastRides && dismissedRides && controlStaysNull && sourcesUnchanged && moveStillRides;
+                  console.log('[f107c-reminderRides]', JSON.stringify({
+                    f_t107c_reminderRides,
+                    matrix: {
+                      ok: remCopyOut.ok, allSuccess: remResults.every((r) => r.success),
+                      futureRides, pastRides, dismissedRides, controlStaysNull, sourcesUnchanged, moveStillRides,
+                      futureSrcReminderAt: remSnap[0].reminderAt, futureCopyReminderAt: futCopy?.reminderAt ?? null,
+                      pastSrcReminderAt: remSnap[1].reminderAt, pastCopyReminderAt: pastCopy?.reminderAt ?? null,
+                      dismissedSrcReminderAt: remSnap[2].reminderAt, dismissedCopyReminderAt: dismissedCopy?.reminderAt ?? null,
+                      dismissedSrcDismissedBy: remSnap[2].reminderDismissedBy,
+                      dismissedCopyDismissedBy: dismissedCopy?.reminderDismissedBy ?? null,
+                      futureSrcSetBy: remSnap[0].reminderSetByUid, futureCopySetBy: futCopy?.reminderSetByUid ?? null,
+                      pastSrcSetBy: remSnap[1].reminderSetByUid, pastCopySetBy: pastCopy?.reminderSetByUid ?? null,
+                      copyDismissedFired: [futCopy, pastCopy, dismissedCopy, ctrlCopy].map((c) => (c ? [c.reminderDismissedBy, c.reminderFiredAt] : null)),
+                      moveReminderAt: pastAfterMove?.reminderAt ?? null,
+                    },
+                  }));
+                  // leg-end cleanup — the spaces' names are NOT in the hygiene loops' exact-name
+                  // list ('t107 Target'/'t107 Empty'); the t107-Rem* drop names ARE covered by the
+                  // t107- loops, this is belt-and-suspenders like the f_t107b leg's.
+                  for (const c of remCopies) if (c) await manager.deleteDropQuiet(c.id);
+                  for (const d of [remFuture, remPast, remDismissed, remCtrl]) await manager.deleteDropQuiet(d.id);
+                  await manager.deleteSpaceQuiet(remTgt.id);
+                  await manager.deleteSpaceQuiet(remSrc.id);
+
+                  // ---------- f_t107e_dismissalSilencesSweeper (repair-order-107e §4.2) ----------
+                  // The REAL engine is exercised — no synthetic fires. The sweeper's
+                  // reminderEligible never checked reminderDismissedBy, so 107d's
+                  // dismissed-but-not-fired COPIES re-notified (owner-found on candidate 4: toast +
+                  // themed card on a copied drop whose reminder was dismissed pre-copy); 107e adds
+                  // the dismissal check to the shared predicate, so ALL notification paths (toast,
+                  // themed card, missed queue) AND the unlock-time marking honor it. The spy rides
+                  // setNotifier — the engine's own seam (index.ts:8219) — and is installed BEFORE
+                  // any past-due seed exists, so no real toast escapes into the run and every fire
+                  // lands in the spy. The spy is NOT restored afterward (107e §6): later legs don't
+                  // depend on toasts, and stray captures are harmless.
+                  const spyFires: string[] = [];
+                  manager.setNotifier((title: string) => { spyFires.push(title); });
+                  const sweepSrc = await manager.createSpace('t107e Sweep');
+                  const sweepUndismissed = await createTextDrop(manager, {
+                    spaceId: sweepSrc.id, name: 't107e-Undismissed', content: 'past-due, never dismissed',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() - 60_000).toISOString(),
+                  });
+                  const sweepDismissed = await createTextDrop(manager, {
+                    spaceId: sweepSrc.id, name: 't107e-Dismissed', content: 'past-due, dismissed before the tick',
+                    categories: [], expirationOption: '24h', locked: false,
+                    reminderAt: new Date(Date.now() - 60_000).toISOString(),
+                  });
+                  await manager.patchDropMeta(sweepDismissed.id, { reminderDismissedBy: 'local' });
+                  // ≥35s guarantees a 30s sweeper tick lands regardless of loop phase (107e §5).
+                  await new Promise((r) => setTimeout(r, 35_000));
+                  const sweepUndismissedAfter = manager.peekDrop(sweepUndismissed.id) ?? sweepUndismissed;
+                  const sweepDismissedAfter = manager.peekDrop(sweepDismissed.id) ?? sweepDismissed;
+                  // Name-scoped asserts (107e §4.2 note): UNRELATED past-due undismissed drops
+                  // lingering in the battery vault may also fire through the spy — harmless.
+                  // reminderFiredAt is read through the record's own "null/absent = not yet fired"
+                  // rule (vaultTypes.ts) — a fresh unstamped record holds ABSENT, not null.
+                  const undismissedFired = spyFires.includes('t107e-Undismissed')
+                    && (sweepUndismissedAfter.reminderFiredAt ?? null) !== null; // the engine fired it AND stamped it
+                  const dismissedSilent = !spyFires.includes('t107e-Dismissed')
+                    && (sweepDismissedAfter.reminderFiredAt ?? null) === null;   // skipped ENTIRELY — no notify, no stamp
+                  const dismissedStillRides = (sweepDismissedAfter.reminderDismissedBy ?? null) === 'local'; // the loop never mutated it
+                  const f_t107e_dismissalSilencesSweeper = undismissedFired && dismissedSilent && dismissedStillRides;
+                  console.log('[f107e-dismissalSilence]', JSON.stringify({
+                    f_t107e_dismissalSilencesSweeper,
+                    matrix: {
+                      undismissedFired, dismissedSilent, dismissedStillRides,
+                      spyFires,
+                      undismissedFiredAt: sweepUndismissedAfter.reminderFiredAt ?? null,
+                      dismissedFiredAt: sweepDismissedAfter.reminderFiredAt ?? null,
+                      dismissedBy: sweepDismissedAfter.reminderDismissedBy ?? null,
+                    },
+                  }));
+                  // leg-end cleanup — both seeds + the space are deleted HERE explicitly. FLAGGED
+                  // to the owner (107e order said the t107e- names "join the hygiene families"):
+                  // 't107e-' does NOT startsWith('t107-'), so the fixed-name hygiene loops and the
+                  // [f107-hygiene] residue probe never see these names — this explicit deletion is
+                  // the actual cleanup; a mid-leg crash would leave t107e-* residue invisible to
+                  // the probe (the order's name-scoping note covers such strays as harmless).
+                  await manager.deleteDropQuiet(sweepUndismissed.id);
+                  await manager.deleteDropQuiet(sweepDismissed.id);
+                  await manager.deleteSpaceQuiet(sweepSrc.id);
+
+                  // ---------- f_t107_sameSpaceGuard ----------
+                  const sameMoveOut = await transferDrops(manager, { mode: 'move', dropIds: [partGood.id], targetSpaceId: target.id });
+                  const sameCopyOut = await transferDrops(manager, { mode: 'copy', dropIds: [partGood.id], targetSpaceId: target.id });
+                  const invalidOut = await transferDrops(manager, { mode: 'nope' as 'move' | 'copy', dropIds: [partGood.id], targetSpaceId: target.id });
+                  const f_t107_sameSpaceGuard = sameMoveOut.ok === true && sameMoveOut.results?.[0]?.success === false
+                    && sameMoveOut.results?.[0]?.error === 'Already in that space.'
+                    && sameCopyOut.ok === true && sameCopyOut.results?.[0]?.success === false
+                    && sameCopyOut.results?.[0]?.error === 'Already in that space.'
+                    && invalidOut.ok === false && invalidOut.error === 'Invalid move/copy request.';
+                  console.log('[f107-sameSpaceGuard]', JSON.stringify({ f_t107_sameSpaceGuard, move: sameMoveOut, copy: sameCopyOut, invalid: invalidOut }));
+
+                  // ---------- f_t107_uiWiring (REAL renderer path; elementFromPoint-gated clicks) ----------
+                  win.webContents.reload(); // the store boot-hydrates the t107 seeds; memory rule = local (last relay flip)
+                  await sleep(3500);
+                  for (let i = 0; i < 30 && (await countDropCards()) === 0; i++) await sleep(500);
+                  const uiScript = `
+(async () => {
+  const out = {};
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const clickGate = (node) => {
+    if (!node) return 'MISSING';
+    // human-click rule part 1: a human SCROLLS the card into view (the list is a 500px
+    // scrollable box) — run-1 lesson: without this the off-viewport cards read NO-HIT.
+    node.scrollIntoView({ block: 'center', inline: 'center' });
+    const r = node.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return 'ZERO-RECT';
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    if (!hit) return 'NO-HIT';
+    if (!(node === hit || node.contains(hit) || hit.contains(node))) {
+      // name the culprit — run-5/6 lesson: bulk-step OCCLUDED by a modal overlay/footer that
+      // should not exist; name the hit AND whatever modal headers are in the DOM.
+      const cls = (hit.className && String(hit.className).slice(0, 90)) || '';
+      const moveHdr = document.querySelector('div.max-w-md h2');
+      const prevHdr = document.querySelector('div.max-w-3xl h2');
+      return 'OCCLUDED<' + hit.tagName + (cls ? ' ' + cls : '') + '> M['
+        + (moveHdr ? moveHdr.textContent : '-') + '] P[' + (prevHdr ? prevHdr.textContent : '-') + ']';
+    }
+    node.click();
+    return 'CLICKED';
+  };
+  const cardByName = (name) => Array.from(document.querySelectorAll('div.select-none.cursor-pointer.group.overflow-hidden')).find((c) => (c.textContent || '').includes(name)) || null;
+  const cardCount = (name) => Array.from(document.querySelectorAll('div.select-none.cursor-pointer.group.overflow-hidden')).filter((c) => (c.textContent || '').includes(name)).length;
+  const modalRoot = () => document.querySelector('div.max-w-md');
+  const modalBtn = (text) => Array.from(document.querySelectorAll('div.max-w-md button')).find((b) => (b.textContent || '').trim() === text) || null;
+  // run-1 lesson: the mode TOGGLE owns the first 'Move'/'Copy' text in DOM order — the SUBMIT
+  // lives in the footer (the panel's only div.border-t row). Scope submit/cancel finds to it.
+  const footerBtn = (text) => Array.from(document.querySelectorAll('div.max-w-md div.border-t button')).find((b) => (b.textContent || '').trim() === text) || null;
+  const previewMoveBtn = () => document.querySelector('button[title="Move or copy to another space"]');
+  const wait = async (cond, ms, step = 100) => { const t0 = Date.now(); for (;;) { if (cond()) return true; if (Date.now() - t0 > ms) return false; await sleep(step); } };
+  const clicks = {};
+  try {
+    // preview Move button → move modal → current row disabled → target row → submit → modal
+    // closes + card removed with NO skeleton flash (FIX H move-success path)
+    clicks.card1 = clickGate(cardByName('t107-UI-Move'));
+    out.previewOpens = await wait(() => !!previewMoveBtn(), 5000);
+    clicks.moveBtn = clickGate(previewMoveBtn());
+    out.moveModalOpens = await wait(() => !!modalRoot(), 5000);
+    out.header = modalRoot() && modalRoot().querySelector('h2') ? modalRoot().querySelector('h2').textContent : null;
+    const personalOpt = Array.from(document.querySelectorAll('div.max-w-md button')).find((b) => (b.textContent || '').trim() === 'Personal');
+    // web-exact (:148): the current-location row is DISABLED — and while it is also the
+    // selected row it wears the ACTIVE pill, not the greyed style (greyed is the non-selected
+    // branch). Assert the disabled truth; carry the raw class for evidence.
+    out.currentRowDisabled = !!personalOpt && personalOpt.disabled === true;
+    out.personalOptRaw = personalOpt ? { disabled: personalOpt.disabled, className: personalOpt.className } : null;
+    clicks.targetRow = clickGate(modalBtn('t107 Target'));
+    // run-3 lesson: the row click and the submit click are in the SAME task — React defers the
+    // re-render that ENABLES the submit until the task ends, so without a yield the submit
+    // click lands on the still-disabled button (run-3 moveProbe: submitDisabled true, footer
+    // stayed 'Move', no banner). Yield to let React flush before measuring/clicking.
+    await sleep(250);
+    const moveSubmit = footerBtn('Move');
+    out.moveSubmitDisabled = moveSubmit ? moveSubmit.disabled : null;
+    clicks.moveSubmit = clickGate(moveSubmit);
+    out.moveModalClosed = await wait(() => !modalRoot(), 12000);
+    // run-2 diagnostics: if the modal stayed, the footer text tells WHY — 'Moving…' = the
+    // transfer promise is still pending; a banner = the transfer returned an error; 'Move' =
+    // handleSubmit never ran (disabled/guard).
+    out.moveFooterAfter = footerBtn('Move') ? footerBtn('Move').textContent : footerBtn('Moving...') ? 'Moving...' : null;
+    const moveBanner = document.querySelector('div.max-w-md p.text-red-500');
+    out.moveBanner = moveBanner ? moveBanner.textContent : null;
+    // run-8 diagnostics: cardRemoved flaked (green5 true / green7 false while the move
+    // committed main-side both times) — TIMELINE the card count/modal/skeleton at 150ms for
+    // 6s instead of an end-state poll, so a leave-and-reappear (an in-flight list response
+    // racing removeDropInPlace) is distinguishable from a never-left card.
+    out.moveTimeline = [];
+    let sawSkeleton = false;
+    const mT0 = Date.now();
+    while (Date.now() - mT0 < 6000) {
+      const skel = !!document.querySelector('[class*="skeleton-shimmer"]');
+      if (skel) sawSkeleton = true;
+      // run-9 additions: a count=1 that never drops (green9: count 1 through 6s while the
+      // record provably left personal main-side) needs the ghost's IDENTITY — computed
+      // position (framer-motion popLayout exits are position:absolute), opacity and text —
+      // to separate a stuck EXIT ghost from a genuinely live card.
+      const ghost = cardByName('t107-UI-Move');
+      out.moveTimeline.push([Date.now() - mT0, modalRoot() ? 1 : 0, cardCount('t107-UI-Move'), skel ? 1 : 0,
+        ghost ? getComputedStyle(ghost).position : null,
+        ghost ? (ghost.textContent || '').slice(0, 40) : null]);
+      await sleep(150);
+    }
+    out.cardRemoved = out.moveTimeline.length > 0 && out.moveTimeline[out.moveTimeline.length - 1][2] === 0;
+    out.moveCardCount = cardCount('t107-UI-Move');
+    out.listCardTotal = document.querySelectorAll('div.select-none.cursor-pointer.group.overflow-hidden').length;
+    out.noSkeleton = !sawSkeleton;
+    // copy flow: preview → Move → toggle Copy → submit → the ORIGINAL's preview re-opens,
+    // and the current list gains NOTHING (exactly one t107-UI-Copy card, the copy is in the target)
+    clicks.card2 = clickGate(cardByName('t107-UI-Copy'));
+    out.copyPreviewOpens = await wait(() => !!previewMoveBtn(), 5000);
+    clicks.moveBtn2 = clickGate(previewMoveBtn());
+    out.copyModalOpens = await wait(() => !!modalRoot(), 5000);
+    clicks.copyToggle = clickGate(modalBtn('Copy'));
+    // run-4 lesson: the fresh modal instance starts with the CURRENT location selected, so the
+    // copy submit is DISABLED until a target row is picked — same React-flush yield as the move.
+    clicks.copyTargetRow = clickGate(modalBtn('t107 Target'));
+    await sleep(250);
+    const copySubmit = footerBtn('Copy');
+    out.copySubmitDisabled = copySubmit ? copySubmit.disabled : null;
+    clicks.copySubmit = clickGate(copySubmit);
+    out.copyModalClosed = await wait(() => !modalRoot(), 12000);
+    const copyBanner = document.querySelector('div.max-w-md p.text-red-500');
+    out.copyBanner = copyBanner ? copyBanner.textContent : null;
+    out.copyReturnsToPreview = await wait(() => !!previewMoveBtn(), 5000);
+    out.copyPreviewBody = document.querySelector('pre') ? document.querySelector('pre').textContent : null;
+    out.copyCardCount = Array.from(document.querySelectorAll('div.select-none.cursor-pointer.group.overflow-hidden')).filter((c) => (c.textContent || '').includes('t107-UI-Copy')).length;
+    // run-8 trail probe: the ← Back button renders ONLY when previewTrail.length > 1
+    // (App.tsx:875 canBack; modal renders it at :211-221) — a live trail-length read without
+    // touching React state. TRUE here = the copy flow pushed TWO entries (the reopen suspect).
+    out.copyPreviewBackBtn = !!document.querySelector('div.max-w-3xl button[aria-label="Back"]');
+    // close the preview via its backdrop (target === currentTarget → onBack = previewBack,
+    // App.tsx:298-305 — pops ONE trail entry; the X button would be closePreview, clearing all).
+    // run-8 lesson: the editorial PAGE ROOT is itself div.fixed.inset-0 (bg-[#FAF7F2]) and it
+    // CONTAINS a div.max-w-3xl (the whole page, modals included), so the old first-match find()
+    // clicked THE PAGE ROOT — a node with no close handler — and the preview never closed
+    // (previewClosed false, deterministic across green5-8). Target the REAL preview backdrop:
+    // the DARK overlay (bg-[#1a1a1a]/60 — the move modal's backdrop is the same color but wraps
+    // max-w-md, not max-w-3xl).
+    const previewRoot = Array.from(document.querySelectorAll('div.fixed.inset-0')).find((d) => String(d.className).includes('bg-[#1a1a1a]/60') && !!d.querySelector('div.max-w-3xl'));
+    clicks.previewBackdrop = clickGate(previewRoot);
+    out.previewClosed = await wait(() => !previewMoveBtn(), 5000);
+    // run-6/7 mystery: the preview was OPEN again at bulk time (P[t107-UI-Copy]) although the
+    // backdrop reported CLICKED — TIMELINE the panel/panel-count/h2/overlays at 120ms for
+    // 3.2s to catch a close→reopen red-handed (or a never-closed), then re-read the trail
+    // probe on whatever is open.
+    out.previewTimeline = [];
+    const pT0 = Date.now();
+    while (Date.now() - pT0 < 3200) {
+      const panels = document.querySelectorAll('div.max-w-3xl');
+      out.previewTimeline.push([Date.now() - pT0, panels.length, panels[0] && panels[0].querySelector('h2') ? panels[0].querySelector('h2').textContent : null,
+        Array.from(document.querySelectorAll('div.fixed.inset-0')).map((d) => String(d.className).slice(0, 30)).join('|')]);
+      await sleep(120);
+    }
+    out.reopenBackBtn = !!document.querySelector('div.max-w-3xl button[aria-label="Back"]');
+    out.overlaySnapshot = JSON.stringify(Array.from(document.querySelectorAll('div.fixed.inset-0')).map((d) => ({ cls: String(d.className).slice(0, 44), h2: d.querySelector('h2') ? d.querySelector('h2').textContent : null })));
+    // bulk: Select → two cards → Move 2 pill → bulk modal → Cancel closes
+    clicks.selectBtn = clickGate(Array.from(document.querySelectorAll('button')).find((b) => (b.textContent || '').trim() === 'Select'));
+    // run-9 lesson (run-3 again): the selection-mode toggle and the first card click run in ONE
+    // task — React defers the mode re-render, so the card clicks landed as PREVIEW opens
+    // (P[t107-UI-Fail] occluded everything; clicks.cardCopy/cardFail "CLICKED" but opened
+    // previews). Yield, then VERIFY the mode flipped before touching the cards.
+    await sleep(250);
+    out.selectionModeOn = !!Array.from(document.querySelectorAll('button')).find((b) => ['Deselect', 'Select all'].includes((b.textContent || '').trim()));
+    clicks.cardCopy = clickGate(cardByName('t107-UI-Copy'));
+    await sleep(250); // each selection toggle re-renders the pill counts — keep every click in its own task
+    clicks.cardFail = clickGate(cardByName('t107-UI-Fail'));
+    await sleep(250);
+    out.bulkPillAppears = await wait(() => !!Array.from(document.querySelectorAll('button')).find((b) => (b.textContent || '').trim() === 'Move 2'), 5000);
+    clicks.bulkPill = clickGate(Array.from(document.querySelectorAll('button')).find((b) => (b.textContent || '').trim() === 'Move 2'));
+    out.bulkModalOpens = await wait(() => { const h = modalRoot() && modalRoot().querySelector('h2'); return !!h && h.textContent === 'Move 2 drops'; }, 5000);
+    clicks.bulkCancel = clickGate(footerBtn('Cancel'));
+    out.bulkModalCloses = await wait(() => !modalRoot(), 5000);
+    clicks.cancelSelection = clickGate(Array.from(document.querySelectorAll('button')).find((b) => (b.textContent || '').trim() === 'Cancel'));
+    // run-9: does the move-step ghost persist to script end? Live-vs-exit identity (computed
+    // position + opacity) for every card root still matching the moved drop's name.
+    out.ghostAtEnd = Array.from(document.querySelectorAll('div.select-none.cursor-pointer.group.overflow-hidden')).filter((c) => (c.textContent || '').includes('t107-UI-Move')).map((c) => ({ pos: getComputedStyle(c).position, op: getComputedStyle(c).opacity, txt: (c.textContent || '').slice(0, 30) }));
+  } catch (e) {
+    out.error = String(e && e.message ? e.message : e);
+  }
+  out.clicks = clicks;
+  return JSON.stringify(out);
+})()`;
+                  const uiRes = JSON.parse(await win.webContents.executeJavaScript(uiScript, true)) as Record<string, unknown>;
+                  // main-side ground truth: did the UI move actually commit (spaceId = target)?
+                  const uiMoveMetaAfter = manager.getDropMeta(uiMove.id);
+                  // forced failure: open the REAL preview via the c2f fixture, click Move, pick the
+                  // target, DELETE the drop main-side, then submit — the transfer must come back
+                  // with web's exact per-drop failure wording and the modal must STAY open.
+                  await win.webContents.executeJavaScript(`window.__c2fEditTest.openPreview(${JSON.stringify(uiFail.id)})`, true);
+                  await sleep(600);
+                  const clickJs = (finder: string): string => `(function(){ var b = ${finder}; if (!b) return 'MISSING'; b.scrollIntoView({ block: 'center' }); var r = b.getBoundingClientRect(); var hit = document.elementFromPoint(r.left + r.width/2, r.top + r.height/2); if (!hit || !(b === hit || b.contains(hit) || hit.contains(b))) return 'OCCLUDED'; b.click(); return 'CLICKED'; })()`;
+                  const failClick1 = await win.webContents.executeJavaScript(clickJs(`document.querySelector('button[title="Move or copy to another space"]')`), true);
+                  await sleep(700);
+                  const failClick2 = await win.webContents.executeJavaScript(clickJs(`Array.from(document.querySelectorAll('div.max-w-md button')).find(function(x){ return (x.textContent||'').trim() === 't107 Target'; })`), true);
+                  await sleep(250);
+                  await manager.deleteDropQuiet(uiFail.id);
+                  const failRes = JSON.parse(await win.webContents.executeJavaScript(`
+(async () => {
+  const out = {};
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const submit = Array.from(document.querySelectorAll('div.max-w-md div.border-t button')).find((b) => (b.textContent || '').trim() === 'Move');
+  out.submitFound = !!submit;
+  out.submitDisabled = submit ? submit.disabled : null;
+  if (submit && !submit.disabled) submit.click();
+  const t0 = Date.now();
+  out.bannerShown = false;
+  out.bannerText = null;
+  while (Date.now() - t0 < 8000) {
+    const p = document.querySelector('div.max-w-md p.text-red-500');
+    if (p && p.textContent) { out.bannerShown = true; out.bannerText = p.textContent; break; }
+    await sleep(100);
+  }
+  out.modalStillOpen = !!document.querySelector('div.max-w-md');
+  return JSON.stringify(out);
+})()`, true)) as { bannerShown: boolean; bannerText: string | null; modalStillOpen: boolean; submitFound: boolean; submitDisabled: boolean | null };
+                  const f_t107_uiWiring = uiRes.previewOpens === true && uiRes.moveModalOpens === true
+                    && uiRes.header === 'Move drop' && uiRes.currentRowDisabled === true
+                    && uiRes.moveModalClosed === true && uiRes.cardRemoved === true && uiRes.noSkeleton === true
+                    && uiRes.copyModalOpens === true && uiRes.copyModalClosed === true
+                    && uiRes.copyReturnsToPreview === true && uiRes.copyPreviewBody === 'copy preview body'
+                    && uiRes.copyCardCount === 1
+                    && uiRes.bulkPillAppears === true && uiRes.bulkModalOpens === true && uiRes.bulkModalCloses === true
+                    && failRes.bannerShown === true && failRes.bannerText === '1/1 drops failed to move: Drop not found.'
+                    && failRes.modalStillOpen === true;
+                  console.log('[f107-ui]', JSON.stringify({
+                    f_t107_uiWiring,
+                    matrix: {
+                      previewOpens: uiRes.previewOpens, moveModalOpens: uiRes.moveModalOpens, header: uiRes.header,
+                      currentRowDisabled: uiRes.currentRowDisabled, moveModalClosed: uiRes.moveModalClosed,
+                      cardRemoved: uiRes.cardRemoved, noSkeleton: uiRes.noSkeleton,
+                      copyModalOpens: uiRes.copyModalOpens, copyModalClosed: uiRes.copyModalClosed,
+                      copyReturnsToPreview: uiRes.copyReturnsToPreview, copyCardCount: uiRes.copyCardCount,
+                      bulkPillAppears: uiRes.bulkPillAppears, bulkModalOpens: uiRes.bulkModalOpens, bulkModalCloses: uiRes.bulkModalCloses,
+                      bannerShown: failRes.bannerShown, bannerText: failRes.bannerText, modalStillOpen: failRes.modalStillOpen,
+                    },
+                    raw: { clicks: uiRes.clicks, copyPreviewBody: uiRes.copyPreviewBody, failClicks: { move: failClick1, row: failClick2 }, submitDisabled: failRes.submitDisabled,
+                      moveProbe: { moveSubmitDisabled: uiRes.moveSubmitDisabled, moveFooterAfter: uiRes.moveFooterAfter, moveBanner: uiRes.moveBanner, personalOptRaw: uiRes.personalOptRaw, moveCardCount: uiRes.moveCardCount, listCardTotal: uiRes.listCardTotal, uiMoveSpaceIdAfter: uiMoveMetaAfter ? uiMoveMetaAfter.spaceId : null },
+                      copyProbe: { copySubmitDisabled: uiRes.copySubmitDisabled, copyBanner: uiRes.copyBanner, copyTargetRow: (uiRes.clicks as Record<string, unknown>).copyTargetRow } },
+                  }));
+                  // run-8: the FULL in-page out (incl. moveTimeline/previewTimeline, the
+                  // previewClosed verdict, both trail probes and overlaySnapshot) plus main-side
+                  // name-count probes — the shaped line above stays for cross-run comparability.
+                  console.log('[f107-ui-full]', JSON.stringify({
+                    uiRes,
+                    mainProbe: {
+                      uiMoveSpaceIdAfter: uiMoveMetaAfter ? uiMoveMetaAfter.spaceId : null,
+                      uiMoveNamedInPersonal: manager.listDrops('personal').filter((d) => d.name === 't107-UI-Move').length,
+                      uiCopyNamedInPersonal: manager.listDrops('personal').filter((d) => d.name === 't107-UI-Copy').length,
+                    },
+                  }));
+
+                  // ---------- cleanup: leave NO t107 fixtures behind (the vault persists across runs) ----------
+                  for (const rec of manager.allRecords()) {
+                    if (rec.name.startsWith('t107-')) await manager.deleteDropQuiet(rec.id);
+                  }
+                  for (const cat of manager.listCategories('personal')) {
+                    if (cat.name.startsWith('t107 ')) await manager.deleteCategoryQuiet(cat.id);
+                  }
+                  for (const space of manager.listSpaces()) {
+                    if (space.name === 't107 Target' || space.name === 't107 Empty') await manager.deleteSpaceQuiet(space.id);
+                  }
+                  await manager.flushNow();
+                  win.webContents.reload(); // fresh mount so the C2l Off leg boots sane
+                  await sleep(4000);
+                }
+
                 // C2l (4b) — watchdog Off leg: with autoLockMinutes = null (explicit Off — legal
                 // per the engine validator) the starved watchdog must NEVER lock. Same no-feed
                 // discipline as the starve control above: sampling is DIRECT manager.status()
@@ -7328,6 +8070,15 @@ function registerIpc(): void {
     const record = await updateTextDropMeta(manager, dropId, patch);
     await manager.flushNow();
     return manager.getDropMeta(record.id);
+  });
+  // Round 107 (repair-order-107 §4 FIX D) — the ONE transfer handler, mirroring the
+  // drop:updateMeta shape exactly: await the op → flushNow → return the result. Category
+  // pre-flight + per-drop isolation live in transferDrops (dropOps.ts); ok:false rides back
+  // as a VALUE (not a throw) so the modal can show web's exact pre-flight wording.
+  handle('drop:transfer', async (_e, args: { mode: 'move' | 'copy'; dropIds: string[]; targetSpaceId: string }) => {
+    const out = await transferDrops(manager, args);
+    await manager.flushNow();
+    return out;
   });
 
   // ---- YouTube title refresh (the app's ONLY online call — main process, on demand)

@@ -894,9 +894,16 @@ export class VaultManager {
 
   private notifyFn: ((title: string, body: string) => void) | null = null;
 
-  /** True when the drop still has live time — expired drops never fire reminders (spec M6). */
+  /** True when the drop still has live time — expired drops never fire reminders (spec M6).
+   * A DISMISSED reminder is never eligible (107e): the dismissal is the user's "I'm done with
+   * this reminder" decision and stops EVERY notification path (toast, themed card, missed
+   * queue) plus the unlock-time marking. Before 107d's ride this was implicit — production
+   * dismissal implies a prior fire, so reminderFiredAt was always set; 107d created the
+   * dismissed-but-not-fired state on copies (dismissal rides, firedAt resets) and the sweeper
+   * re-notified them (owner-found on candidate 4). */
   private reminderEligible(drop: VaultDropRecord, now: number): boolean {
     if (!drop.reminderAt || drop.reminderFiredAt) return false;
+    if (drop.reminderDismissedBy) return false; // 107e — a dismissal silences the reminder
     if (new Date(drop.reminderAt).getTime() > now) return false;
     if (drop.expiresAt && new Date(drop.expiresAt).getTime() <= now) return false;
     return true;

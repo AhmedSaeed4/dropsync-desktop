@@ -24,6 +24,9 @@ interface EditorialPreviewModalProps {
   onPreview?: (drop: Drop) => void;
   /** Visible Edit affordance (M8) — routes into the same editor as right-click. */
   onEdit?: (drop: Drop) => void;
+  /** Round 107 (order §4 FIX F) — Move affordance, opens the move/copy modal (web placement:
+   * immediately before Edit; Copy is reachable via the in-modal toggle). */
+  onMove?: (drop: Drop) => void;
   /** FIX 10: fired after a reminder dismiss with the PATCHED record the engine returned, so
    * the parent patches the list in place (animated demotion, no reload). Called with no
    * argument only if the patched record was unavailable (parent falls back to a refresh). */
@@ -38,7 +41,7 @@ const SUPPORTED_VIDEO_TYPES = new Set(['video/mp4', 'video/webm', 'video/ogg']);
  * YouTube iframe are stripped — links render as text (offline-first); Download uses the
  * native Save As dialog every time.
  */
-export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 'light', isLoading = false, allDrops = [], onPreview, onEdit, onChanged }: EditorialPreviewModalProps) {
+export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 'light', isLoading = false, allDrops = [], onPreview, onEdit, onMove, onChanged }: EditorialPreviewModalProps) {
   useBodyScrollLock();
   // Esc routes through the same close path as the X (polish sweep #3).
   useEscapeClose(true, onClose);
@@ -523,6 +526,21 @@ export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 
                   <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
                 <span className="hidden sm:inline">Dismiss</span>
+              </button>
+            )}
+
+            {/* Move (round 107) — opens the move/copy modal (web PreviewModal.tsx:583-594 placement:
+                immediately before Edit; Copy is reachable via the in-modal toggle) */}
+            {onMove && (
+              <button
+                onClick={() => onMove(drop)}
+                className={`flex items-center gap-2 px-2 sm:px-4 py-2 rounded-md border ${tc.border} ${tc.text} hover:border-[#1a1a1a] transition-all text-sm ${tc.fontClass}`}
+                title="Move or copy to another space"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="1.5">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 7.5L7.5 3m0 0L12 7.5M7.5 3v13.5M12 16.5l4.5-4.5m0 0L21 16.5M16.5 12V3" />
+                </svg>
+                <span className="hidden sm:inline">Move</span>
               </button>
             )}
 

@@ -14,6 +14,10 @@ import fsp from 'node:fs/promises';
 import * as pathMod from 'node:path';
 import * as netMod from 'node:net';
 import { tmpdir } from 'node:os';
+// Round 107 (repair-order-107 §4 FIX C) — copy duplicates blobs by pumping manager.streamBlob
+// (a WEB ReadableStream, vault.ts:713-719) into readableToWritable (below), which pumps a NODE
+// Readable — Readable.fromWeb is the adapter (same conversion as the drop:saveAs handler).
+import { Readable } from 'node:stream';
 
 import type { VaultManager } from './vault.ts';
 import {
@@ -473,6 +477,263 @@ export async function updateTextDropMeta(
   if (Object.keys(journalPatch).length === 0) return record;
   await manager.mutatePublic({ op: 'drop.meta', id: dropId, patch: journalPatch });
   return manager.findDrop(dropId);
+}
+
+// ------------------------------------------------------------------ move & copy (round 107)
+
+/**
+ * repair-order-107 §4 FIX C — move/copy a batch of drops between spaces. Port of the web's
+ * moveDrop/copyDrop (drag-drop-app/src/lib/drops.ts:1277-1586 / :1597-1932) driven exactly the
+ * way EditorialLayout drives them (W3/W4): category pre-flight ONCE per batch, then the drops
+ * sequentially with per-drop isolation — one bad id never aborts the batch.
+ *
+ * Categories (W7): vault.ts createCategory is the ensure primitive — it dedupes
+ * case-insensitively per space and RETURNS the existing row (vault.ts:588-597). The map is
+ * keyed lowercased+trimmed name → the target row's name, so resolution matches the web's
+ * `.map(c => catMap.get(c.toLowerCase().trim())).filter(Boolean)` (drops.ts:1538-1540).
+ *
+ * Move writes EXACTLY three fields (W5, drops.ts:1462-1465 + :1530-1545): spaceId, pinned:false
+ * ("Unpin on move"), and the remapped categories. NO re-encryption exists on desktop (one vault
+ * DEK for all spaces — owner decision §3.3). Everything else RIDES UNTOUCHED: reminder fields
+ * (a move patch that doesn't touch them can never re-announce a reminder — vault.ts:898-903
+ * eligibility; the C2j fired-stamp-clearing rule lives in the EDIT path only, dropOps.ts:457-466),
+ * expiresAt/expirationOption (the clock is NOT restarted), youtubeVideoLabels (the stale-title
+ * clear lives in updateTextDropContent/updateTextDropMeta only — dropOps.ts:377-380/:469-471 —
+ * the web's move does not clear them either), locked, name, type.
+ *
+ * Copy builds a FRESH record per W6 (drops.ts:1794-1898) and NEVER mutates the source
+ * (drops.ts:1590). The copy ALWAYS owns its own storage: every blob slot is stream-decrypted →
+ * re-encrypted into a fresh vblob whose header carries its OWN fresh noncePrefix
+ * (blobStore.ts:4-8) — byte-copying a .vblob would clone the nonce under the same vault DEK =
+ * AES-GCM nonce reuse, FORBIDDEN. This also satisfies the path-ownership rule: deleteDrop
+ * unlinks blob files BY PATH (vault.ts:766-774), so two records sharing one path would corrupt
+ * each other on delete. createdAt = the batch's ONE shared stamp (`batchCreatedAt` — a copy
+ * action is one creation moment; equal stamps preserve the caller's display order under the
+ * newest-first stable sort, vault.ts:638 — owner decision 2026-09-02, deliberately different
+ * from the web's per-copy serverTimestamp); expiresAt recomputed from the source's
+ * expirationOption ('forever' → null — forever stays forever; the web's tier downgrade is
+ * account-tier logic and the desktop has no tiers, §3.5); unpinned; UNlocked ("a copy always
+ * starts open — the lock never transfers", drops.ts:1813); the reminder RIDES (reminderAt +
+ * reminderSetByUid verbatim — owner decision 2026-09-03, deliberately different from the web's
+ * reminder-less copy: web workspaces are shared so its reminders are user-coupled,
+ * drops.ts:311-313; the desktop is single-user; reminderDismissedBy RIDES too — a dismissal is
+ * the user's "done with this reminder" decision and must travel with the copy, else a copied
+ * drop re-notifies about something already closed (owner-found on candidate 3, ruling
+ * 2026-09-03)) while only reminderFiredAt resets to null — the copy hasn't fired on its own id
+ * yet; labels carried only for text drops whose resolved categories are NOT password categories
+ * (W6, drops.ts:1895-1898). importedFromArchiveId does NOT transfer (import provenance — the
+ * web copy has no such field). drawingScene rides by reference: same PNG bytes ⇒ the editor's
+ * zero-fetch scene cache stays valid.
+ */
+export async function transferDrops(
+  manager: VaultManager,
+  args: { mode: 'move' | 'copy'; dropIds: string[]; targetSpaceId: string }
+): Promise<{ ok: boolean; error?: string; results?: { id: string; newId?: string; success: boolean; error?: string }[] }> {
+  manager.assertUnlockedPublic();
+  if (
+    (args.mode !== 'move' && args.mode !== 'copy') ||
+    !Array.isArray(args.dropIds) || args.dropIds.length === 0 ||
+    !args.dropIds.every((id) => typeof id === 'string' && id.length > 0) ||
+    !(args.targetSpaceId === 'personal' || manager.listSpaces().some((s) => s.id === args.targetSpaceId))
+  ) {
+    return { ok: false, error: 'Invalid move/copy request.' };
+  }
+
+  // Category pre-flight — ONCE per batch (web W3 :271-284 pre-resolves the UNION of the batch's
+  // category names; W7). A missing drop contributes nothing here (guarded per drop); the
+  // per-drop loop below re-validates existence. createCategory ops are idempotent journal
+  // writes — a later failure leaves only harmless category rows, never broken drops.
+  const ensured = new Map<string, string>();
+  try {
+    const originals = new Map<string, string>(); // lower+trim key → first-seen original name
+    for (const id of args.dropIds) {
+      let categories: string[] = [];
+      try {
+        categories = manager.findDrop(id).categories ?? [];
+      } catch {
+        continue; // missing drop — contributes nothing to the union (per-drop failure below)
+      }
+      for (const c of categories) {
+        if (typeof c !== 'string') continue;
+        const key = c.toLowerCase().trim();
+        if (key && !originals.has(key)) originals.set(key, c);
+      }
+    }
+    for (const [key, original] of originals) {
+      const cat = await manager.createCategory(args.targetSpaceId, original);
+      ensured.set(key, cat.name);
+    }
+  } catch {
+    return { ok: false, error: 'Failed to prepare categories. Please try again.' }; // web's exact wording (W3)
+  }
+
+  const results: { id: string; newId?: string; success: boolean; error?: string }[] = [];
+  // ONE creation moment for the whole batch (owner decision 2026-09-02 — bulk-copy order fix):
+  // every copy made by THIS transferDrops call shares one createdAt. The target list sorts
+  // newest-first with NO tie-breaker (vault.ts:638) and JS sorts are stable, so equal stamps
+  // keep the loop order — which is the display order the caller passed
+  // (EditorialDropList.tsx:773) — and the batch lands in its source order instead of reversed.
+  // Per-copy fresh stamps (the old behavior; web drops.ts:1807 parity) reversed every
+  // multi-copy batch — owner-found defect on the installed 1.0.7, fixed deliberately better
+  // than the web (web copyDrop fires concurrent Promise.all and scrambles; NEVER edit the web).
+  const batchCreatedAt = new Date().toISOString();
+  // SEQUENTIAL on purpose: the journal is a serialized chain anyway, and per-drop isolation
+  // means one bad id never aborts the batch (web W3/W4; the web's Promise.all is concurrent,
+  // outcomes are identical, ordering here is deterministic — order §6).
+  for (const id of args.dropIds) {
+    // ---- MOVE ----
+    if (args.mode === 'move') {
+      let rec: VaultDropRecord;
+      try {
+        rec = manager.findDrop(id);
+      } catch {
+        results.push({ id, success: false, error: 'Drop not found.' });
+        continue;
+      }
+      if (rec.spaceId === args.targetSpaceId) {
+        results.push({ id, success: false, error: 'Already in that space.' });
+        continue;
+      }
+      // Resolve FIRST from the ensured map, THEN normalize (max-3 + dedupe — the same helper
+      // the create path uses, dropOps.ts:48-63). A name missing from the map filters out —
+      // the web's `.filter((n): n is string => !!n)` (drops.ts:1538-1540).
+      const resolved = normalizeCategories(
+        rec.categories.map((c) => ensured.get(c.toLowerCase().trim())).filter((n): n is string => !!n)
+      );
+      // That is the ENTIRE move (W5) — three fields, nothing else may enter the patch.
+      try {
+        await manager.mutatePublic({
+          op: 'drop.meta',
+          id,
+          patch: { spaceId: args.targetSpaceId, pinned: false, categories: resolved },
+        });
+      } catch {
+        results.push({ id, success: false, error: 'Failed to move drop. Please try again.' });
+        continue;
+      }
+      results.push({ id, success: true });
+      continue;
+    }
+
+    // ---- COPY ----
+    let src: VaultDropRecord;
+    try {
+      src = manager.findDrop(id);
+    } catch {
+      results.push({ id, success: false, error: 'Drop not found.' });
+      continue;
+    }
+    if (src.spaceId === args.targetSpaceId) {
+      results.push({ id, success: false, error: 'Already in that space.' });
+      continue;
+    }
+    const resolved = normalizeCategories(
+      src.categories.map((c) => ensured.get(c.toLowerCase().trim())).filter((n): n is string => !!n)
+    );
+
+    // Duplicate blobs FIRST (create invariant, dropOps.ts:5-8 — blobs fully written + hashed
+    // BEFORE the journal op that references them). Each slot: stream decrypt → re-encrypt into
+    // a fresh vblob (fresh noncePrefix — the anti-nonce-reuse rule in the header comment).
+    let newFileRef: VaultBlobRef | null = null;
+    let newImageRef: VaultBlobRef | null = null;
+    let newBodyRef: VaultBlobRef | null = null;
+    const unlinkNewRefs = async (): Promise<void> => {
+      for (const ref of [newFileRef, newImageRef, newBodyRef]) {
+        if (ref) await manager.unlinkBlobQuiet(ref.path);
+      }
+    };
+    const dupStream = async (kind: 'file' | 'image'): Promise<VaultBlobRef> => {
+      const stream = manager.streamBlob(id, kind);
+      if (!stream) throw new Error('Failed to read file content for copy');
+      const writer = manager.createVaultBlobWriter();
+      try {
+        await readableToWritable(
+          Readable.fromWeb(stream as unknown as import('node:stream/web').ReadableStream),
+          writer.writable
+        );
+      } catch (error) {
+        // Cancelled/failed mid-stream → remove the partial output (writer.abort cleans its .tmp).
+        await writer.abort().catch(() => {});
+        throw error instanceof Error ? error : new Error(String(error));
+      }
+      return writer.ref();
+    };
+    try {
+      if (src.blobRefs.file) newFileRef = await dupStream('file'); // file slot; also the drawing-PNG slot
+      if (src.blobRefs.image) newImageRef = await dupStream('image');
+      if (src.blobRefs.body) {
+        // Oversized text body: full plaintext → fresh encrypted body blob.
+        const payload = await manager.getTextPayload(id);
+        if (!payload) throw new Error('Failed to read text content for copy');
+        newBodyRef = await writeBytesIntoVault(manager, new TextEncoder().encode(payload.text));
+      }
+    } catch (error) {
+      await unlinkNewRefs(); // unlink already-completed refs of THIS copy — nothing half-owned leaks
+      results.push({ id, success: false, error: error instanceof Error ? error.message : String(error) });
+      continue;
+    }
+
+    const copyOption = src.expirationOption ?? '2h'; // web's default (W6, drops.ts:1792)
+    // '4h' is import-only (CREATE_EXPIRY_OPTIONS excludes it, dropOps.ts:37-38) but an IMPORTED
+    // record can legally carry it (importer.ts:543-548 keeps '4h'), so copyOption spans the
+    // record's option union. The helper parses any 'Nh' option exactly (same parseInt idiom as
+    // importer.ts:549), and 'forever' → null — forever stays forever (§3 decision 5).
+    const copyExpiresAt = getExpirationDateFromNow(copyOption as CreateExpirationOption);
+    // W6 :1895-1898 — labels ride ONLY for text drops whose resolved categories are NOT
+    // password categories (isPasswordCategoryList is already imported above, dropOps.ts:24).
+    const keepLabels = src.type === 'text'
+      && !isPasswordCategoryList(resolved)
+      && (src.youtubeVideoLabels?.length ?? 0) > 0;
+    const next: VaultDropRecord = {
+      id: crypto.randomUUID(),
+      spaceId: args.targetSpaceId,
+      type: src.type,
+      name: src.name,
+      content: src.content,            // inline body rides as-is (body blob duplicated separately)
+      categories: resolved,            // same resolution as move
+      pinned: false,                   // web: copy starts unpinned (drops.ts:1812)
+      locked: false,                   // web: "a copy always starts open — the lock never transfers" (drops.ts:1813)
+      isDrawing: src.isDrawing,
+      createdAt: batchCreatedAt, // the batch's ONE shared stamp — see batchCreatedAt above
+      expiresAt: copyExpiresAt,        // recomputed from the source's option — clock restarts (W6)
+      expirationOption: copyOption,
+      reminderAt: src.reminderAt,      // RIDES verbatim (owner decision 2026-09-03 — reminders ride on
+      reminderSetByUid: src.reminderSetByUid, // copy like move). Deliberately different from the web,
+      // whose SHARED workspaces make reminders user-coupled (web drops.ts:311-313) — the single-user
+      // desktop has no one to impose a reminder on. Past reminderAt surfaces via the missed queue.
+      reminderDismissedBy: src.reminderDismissedBy, // RIDES verbatim (owner ruling 2026-09-03): a
+      // dismissal is the user's "I'm DONE with this reminder" decision and must travel with the
+      // copy — else a copied drop re-notifies about something already closed (owner-found on
+      // candidate 3: 10 drops copied, 5 dismissed, all 5 copies re-notified).
+      reminderFiredAt: null,           // the ONLY reset — the copy hasn't fired on its own id yet:
+      // an UNdismissed past reminder surfaces once via the missed queue; a dismissed one never fires.
+      fileSize: src.fileSize,
+      mimeType: src.mimeType,
+      imageSize: newImageRef?.bytes ?? src.imageSize,
+      imageMimeType: src.imageMimeType,
+      creatorName: 'local',
+      youtubeVideoLabels: keepLabels ? structuredClone(src.youtubeVideoLabels) : undefined,
+      drawingScene: src.drawingScene,  // same bytes ⇒ same cached scene
+      blobRefs: {
+        file: newFileRef ?? undefined,
+        image: newImageRef ?? undefined,
+        body: newBodyRef ?? undefined,
+      },
+      contentSha256s: { ...src.contentSha256s, ...(newFileRef ? { file: newFileRef.sha256 } : {}) },
+    };
+    try {
+      await manager.putDrop(next); // the ONE journal op for the copy
+    } catch (error) {
+      // Create failed before commit → zero orphan vblobs (pattern of createTextDrop's catch,
+      // dropOps.ts:165-171). The source's blobs are never touched (W6 Step 6).
+      await unlinkNewRefs();
+      results.push({ id, success: false, error: error instanceof Error ? error.message : String(error) });
+      continue;
+    }
+    results.push({ id, success: true, newId: next.id });
+  }
+
+  return { ok: true, results };
 }
 
 // ------------------------------------------------------------------ orphan sweep
