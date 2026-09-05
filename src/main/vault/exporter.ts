@@ -122,17 +122,21 @@ async function buildExportDrop(
   // Attached images (blobRefs.image) AND drawings (PNG in blobRefs.file, or blobRefs.image for
   // imported ones) both ride the IMAGE payload slot — importer validation requires a drawing to
   // carry payloads.image. The stream source follows wherever the bytes actually live.
-  const imageRef = record.blobRefs.image ?? (record.isDrawing ? record.blobRefs.file : undefined);
+  // 27: a drawing exports the LIVE drawing bytes (blobRefs.file — replaced by every canvas
+  // save). The image slot only holds the import-era preview (web imports); before 27 the
+  // stale image slot won and backups silently lost canvas edits.
+  const fromFile = record.isDrawing && !!record.blobRefs.file;
+  const imageRef = fromFile ? record.blobRefs.file : record.blobRefs.image;
   if (record.type === 'text' && imageRef) {
     payloads.image = `files/${crypto.randomUUID()}.img`;
     entries.push({
       entryName: payloads.image,
       dropId: record.id,
-      sourceKind: record.blobRefs.image ? 'image' : 'file',
-      expectedBytes: record.imageSize ?? imageRef.bytes,
+      sourceKind: fromFile ? 'file' : 'image',
+      expectedBytes: fromFile ? (record.fileSize ?? imageRef.bytes) : (record.imageSize ?? imageRef.bytes),
       displayName: record.name,
     });
-    estimated.bytes += record.imageSize ?? imageRef.bytes;
+    estimated.bytes += fromFile ? (record.fileSize ?? imageRef.bytes) : (record.imageSize ?? imageRef.bytes);
   }
 
   let content: string | undefined;
@@ -164,7 +168,9 @@ async function buildExportDrop(
     reminderDismissedBy: record.reminderDismissedBy ?? null,
     fileSize: record.type === 'file' ? record.fileSize : undefined,
     mimeType: record.type === 'file' ? record.mimeType : undefined,
-    imageSize: record.type === 'text' && imageRef ? record.imageSize ?? imageRef.bytes : undefined,
+    imageSize: record.type === 'text' && imageRef
+      ? (fromFile ? (record.fileSize ?? imageRef.bytes) : (record.imageSize ?? imageRef.bytes))
+      : undefined,
     imageMimeType:
       record.type === 'text' && imageRef
         ? record.isDrawing

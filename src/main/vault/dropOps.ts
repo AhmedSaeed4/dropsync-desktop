@@ -364,6 +364,11 @@ export async function updateTextDropContent(
     await w.close();
     newFileRef = await writer.ref();
     next.isDrawing = true;
+    // 27: the manifest drawingScene is now stale by definition — the PNG it mirrors was just
+    // replaced by this save. Clearing it makes the editor fall back to the saved PNG's
+    // embedded scene (the proven path every locally created drawing uses). Metadata-only
+    // saves keep the scene — still accurate there, so the zero-fetch open is preserved.
+    next.drawingScene = undefined;
   }
   if (updates.imagePath) {
     newImageRef = await streamPathIntoVault(manager, updates.imagePath, undefined, undefined, onProgress);
