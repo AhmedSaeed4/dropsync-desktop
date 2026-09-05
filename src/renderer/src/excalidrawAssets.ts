@@ -12,7 +12,11 @@ declare global {
 }
 
 if (typeof window !== 'undefined') {
-  window.EXCALIDRAW_ASSET_PATH = '/';
+  // 108b: root-absolute '/' only resolves on the DEV server; on the packaged file:// page the
+  // library's normalizeBaseUrl degenerates it to 'file:/' (planner-proven 2026-09-04) and every
+  // vendored font 404s — all families rendered one fallback since 1.0.0. Compute the REAL
+  // renderer directory instead: identical value in dev, correct absolute file URL in production.
+  window.EXCALIDRAW_ASSET_PATH = new URL('./', document.baseURI).href;
 }
 
 export {};

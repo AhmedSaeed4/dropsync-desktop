@@ -1,6 +1,6 @@
 {
   "name": "dropsync-desktop",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "DropSync Desktop — offline encrypted vault companion for .dropsync backups",
   "main": "./out/main/index.js",
   "type": "module",
