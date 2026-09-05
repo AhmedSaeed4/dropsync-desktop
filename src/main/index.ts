@@ -3281,6 +3281,14 @@ function createWindow(): void {
         for (let i = 0; i < 30 && !up; i++) { await sleep(300); up = !!document.querySelector('.excalidraw'); }
         if (!up) return { ok: false, note: 'editor-not-mounted' };
         await sleep(900);
+        let txt = null;
+        for (let i = 0; i < 24 && !txt; i++) {
+          await sleep(500);
+          const api = window.__DRAWING_API;
+          const els = api ? (api.getSceneElementsIncludingDeleted() || []) : [];
+          for (let k = els.length - 1; k >= 0; k--) { if (els[k].type === 'text' && !els[k].isDeleted) { txt = els[k].id; break; } }
+        }
+        if (!txt) return { ok: false, note: 'scene-text-missing' };
         return { ok: true, note: '' };
       };
       const textAfterCell9 = () => {
@@ -3502,6 +3510,483 @@ function createWindow(): void {
       } catch (e) { out.f22b_idle_autolock_err = String(e.message || e).slice(0, 60); }
       localStorage.removeItem('dropsync.sit3.dom');
       out.stage = '9';
+      return JSON.stringify(out);
+    }
+    if (stage === '10') {
+      // __STAGE10_FIX26__
+      // ---- STAGE 10 (Round 108, FIX 26): the EDIT-mode font-restyle legs. The font clicks
+      // are the REAL toolbar surface — elementFromPoint-gated full pointer+mouse sequences
+      // dispatched on the hit-test element (the harness cannot reach CDP from in-page; the
+      // gate keeps hit-testing honest, the sequence keeps our pointerdown + Radix/library
+      // listeners in play — round-8's "PointerEvents mandatory" finding). Every leg asserts
+      // the SCENE value; f_26_fontSurvivesReopen also asserts the engine-side reopen value
+      // (the 8b payload-parse pattern). This whole chain is dev-gated — zero behavior change
+      // when the env gates are unset.
+      const EX10 = window.__EXCAL;
+      if (!EX10) { out.f_26 = 'no excalidraw hook'; return done(out, '10'); }
+      out.f_26_env = 'stage10';
+      const M10 = () => (window.__DC_METRICS || null);
+      const api10 = () => (window.__DRAWING_API || null);
+      const alive10 = () => !!document.querySelector('.excalidraw')
+        && !!Array.from(document.querySelectorAll('button')).find((b) => (b.textContent || '').trim() === 'Save drawing');
+      const gotoSpace10 = async (name) => {
+        await openMenu();
+        const menuEl = document.querySelector('header .absolute.top-full');
+        const row = Array.from(menuEl.querySelectorAll('div')).find((el) => el.className.indexOf('cursor-pointer') >= 0 && (el.textContent || '').trim() === name)
+          || Array.from(menuEl.querySelectorAll('button')).find((el) => (el.textContent || '').trim() === name);
+        if (!row) return false;
+        row.click();
+        await sleep(1000);
+        return true;
+      };
+      const cardByName10 = (name) => {
+        const h = cardH3s().find((x) => (x.getAttribute('title') || '') === name);
+        return h ? h.closest('.cursor-pointer') : null;
+      };
+      const closeOverlays10 = async () => {
+        for (let i = 0; i < 6; i++) {
+          if (!document.querySelector('.fixed.inset-0')) return;
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          await sleep(450);
+          const disc = Array.from(document.querySelectorAll('.fixed.inset-0 button')).find((b) => (b.textContent || '').trim() === 'Discard');
+          if (disc) { disc.click(); await sleep(350); }
+        }
+      };
+      const openEditor10 = async () => {
+        if (!(await gotoSpace10('Personal'))) return { ok: false, note: 'no-personal' };
+        let card = null;
+        for (let i = 0; i < 24 && !card; i++) { await sleep(500); card = cardByName10('R108 Fixture'); }
+        if (!card) return { ok: false, note: 'no-fixture-card' };
+        card.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        await sleep(800);
+        const btn = document.querySelector('.fixed.inset-0 button[title="Edit"]');
+        if (!btn) return { ok: false, note: 'no-edit-btn' };
+        btn.click();
+        let ready = false;
+        for (let i = 0; i < 30 && !ready; i++) { await sleep(300); ready = !Array.from(document.querySelectorAll('.fixed.inset-0 *')).some((el) => el.textContent === 'Loading drawing...'); }
+        if (!ready) return { ok: false, note: 'extract-not-done' };
+        let up = false;
+        for (let i = 0; i < 30 && !up; i++) { await sleep(300); up = !!document.querySelector('.excalidraw'); }
+        if (!up) return { ok: false, note: 'editor-not-mounted' };
+        await sleep(900);
+        let txt = null;
+        for (let i = 0; i < 24 && !txt; i++) {
+          await sleep(500);
+          const api = window.__DRAWING_API;
+          const els = api ? (api.getSceneElementsIncludingDeleted() || []) : [];
+          for (let k = els.length - 1; k >= 0; k--) { if (els[k].type === 'text' && !els[k].isDeleted) { txt = els[k].id; break; } }
+        }
+        if (!txt) return { ok: false, note: 'scene-text-missing' };
+        return { ok: true, note: '' };
+      };
+      const canvasEl10 = () => (document.querySelector('.excalidraw .excalidraw__canvas.interactive') || document.querySelector('.excalidraw canvas'));
+      // Full trusted-shape sequence on the hit-test element, AFTER an elementFromPoint gate.
+      // Async with inter-event yields: a real browser delivers these events as SEPARATE
+      // tasks, so React can flush a teardown (the OLD blur bug) between pointerdown and
+      // click — a synchronous loop would hide exactly the mechanism the RED pairs target.
+      const dispatchReal10 = async (x, y, dbl) => {
+        const at = document.elementFromPoint(x, y);
+        if (!at) return { ok: false, gate: 'NONE' };
+        const gate = at.tagName + '|tid=' + ((at.getAttribute && at.getAttribute('data-testid')) || '') + '|cls=' + String(at.className && at.className.baseVal !== undefined ? at.className.baseVal : at.className).slice(0, 40);
+        const seq = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+        for (const t of seq) {
+          const opts = { clientX: x, clientY: y, bubbles: true, cancelable: true, button: 0 };
+          if (t.indexOf('pointer') === 0) { opts.pointerId = 1; opts.isPrimary = true; opts.buttons = (t === 'pointerdown') ? 1 : 0; }
+          at.dispatchEvent(t.indexOf('pointer') === 0 ? new PointerEvent(t, opts) : new MouseEvent(t, opts));
+          await sleep(40);
+        }
+        if (dbl) {
+          at.dispatchEvent(new MouseEvent('dblclick', { clientX: x, clientY: y, bubbles: true, cancelable: true }));
+          await sleep(40);
+        }
+        return { ok: true, gate };
+      };
+      const canvasTap10 = async (x, y, dbl) => {
+        const cv = canvasEl10();
+        if (!cv) return { ok: false, gate: 'no-canvas' };
+        const at = document.elementFromPoint(x, y);
+        if (!at || !(at === cv || cv.contains(at))) return { ok: false, gate: at ? at.tagName : 'NONE' };
+        return await dispatchReal10(x, y, dbl);
+      };
+      const buttonClick10 = async (el, label) => {
+        if (!el) return { ok: false, gate: 'no-' + label };
+        const r = el.getBoundingClientRect();
+        return await dispatchReal10(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2), false);
+      };
+      // Dropdown ITEM gesture: synchronous sequence ON the captured item element. With our
+      // pointerdown preventDefault active, Radix's teardown detaches the popup item
+      // +20…75 ms INTO the press (investigation 26-3: E3/E4/E5; causal replica C3pd/C5pd),
+      // so with inter-event yields a synthetic click dispatches on a detached node and
+      // never bubbles. Trusted real-timing input does NOT survive this teardown (26-3:
+      // detach +20…75 ms into the press; pass ≤62 ms, fail ≥127 ms; causal replica
+      // C3pd/C5pd) — the sync gesture here is a battery-only convenience. Real-timing
+      // proof lives in the external trusted probes (%TEMP%\f26p3\ driver), not in this
+      // harness. The sync gesture keeps the item attached through the click; the resetAll
+      // race that follows is exactly what the watcher complement exists for.
+      const itemClick10 = (el, label) => {
+        if (!el) return { ok: false, gate: 'no-' + label };
+        const r = el.getBoundingClientRect();
+        const x = Math.round(r.left + r.width / 2), y = Math.round(r.top + r.height / 2);
+        const at = document.elementFromPoint(x, y);
+        if (!at) return { ok: false, gate: 'NONE' };
+        const gate = at.tagName + '|tid=' + ((at.getAttribute && at.getAttribute('data-testid')) || '') + '|cls=' + String(at.className && at.className.baseVal !== undefined ? at.className.baseVal : at.className).slice(0, 40);
+        const seq = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+        for (const t of seq) {
+          const opts = { clientX: x, clientY: y, bubbles: true, cancelable: true, button: 0 };
+          if (t.indexOf('pointer') === 0) { opts.pointerId = 1; opts.isPrimary = true; opts.buttons = (t === 'pointerdown') ? 1 : 0; }
+          el.dispatchEvent(t.indexOf('pointer') === 0 ? new PointerEvent(t, opts) : new MouseEvent(t, opts));
+        }
+        return { ok: true, gate };
+      };
+      const lastTextId10 = () => {
+        const api = api10();
+        if (!api) return null;
+        const els = api.getSceneElementsIncludingDeleted() || [];
+        let t = null;
+        for (let k = els.length - 1; k >= 0; k--) { if (els[k].type === 'text' && !els[k].isDeleted) { t = els[k]; break; } }
+        return t ? t.id : null;
+      };
+      const sceneEl10 = (id) => {
+        const api = api10();
+        return id ? (api.getSceneElementsIncludingDeleted() || []).find((e) => e.id === id && !e.isDeleted) || null : null;
+      };
+      const elemCenter10 = (id) => {
+        const api = api10();
+        const e = sceneEl10(id);
+        if (!e) return null;
+        const v = EX10.sceneCoordsToViewportCoords({ sceneX: e.x + e.width / 2, sceneY: e.y + e.height / 2 }, api.getAppState());
+        return { x: Math.round(v.x), y: Math.round(v.y) };
+      };
+      const emptyPoint10 = () => {
+        const cv = canvasEl10();
+        if (!cv) return null;
+        const r = cv.getBoundingClientRect();
+        return { x: Math.round(r.left + r.width * 0.82), y: Math.round(r.top + r.height * 0.75) };
+      };
+      // Desktop layout: the docked modal editor is under Excalidraw's mobile MQ breakpoint,
+      // where the properties panel hides behind the bottom-bar toggle. Go fullscreen first
+      // (our own header toggle), then fall back to the toggle if controls are still missing.
+      // exit=true clicks the 'Exit fullscreen' title (the toggle flips its title, DrawingCanvas).
+      const goFullscreen10 = async (exit) => {
+        const fs = document.querySelector(exit ? 'button[title="Exit fullscreen"]' : 'button[title="Fullscreen"]');
+        if (!fs) return exit ? 'no-exit-toggle' : 'no-toggle';
+        const r = fs.getBoundingClientRect();
+        await dispatchReal10(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2), false);
+        await sleep(900);
+        return exit ? 'docked' : 'fullscreen';
+      };
+      const fontControlsUp10 = () => !!document.querySelector('[data-testid="font-family-code"], [data-testid="font-family-hand-drawn"]');
+      const ensureFontControls10 = async () => {
+        if (fontControlsUp10()) return 'already';
+        const cands = Array.from(document.querySelectorAll('.excalidraw button'));
+        const toggle = cands.find((b) => {
+          const al = (b.getAttribute('aria-label') || '') + '|' + (b.getAttribute('title') || '') + '|' + (b.textContent || '');
+          return al.indexOf('Edit') >= 0;
+        });
+        if (!toggle) return 'no-toggle';
+        toggle.click();
+        await sleep(600);
+        return fontControlsUp10() ? 'shape-menu' : 'failed';
+      };
+      // Pan the viewport so the text element sits at the CANVAS CENTER — the shape panel
+      // then never covers its screen point (panel-over-element flake class, bootGF3).
+      const panToCenter10 = async () => {
+        const api = api10();
+        const tid = lastTextId10();
+        if (!api || !tid) return 'no-text';
+        for (let i = 0; i < 4; i++) {
+          const e = (api.getSceneElementsIncludingDeleted() || []).find((x) => x.id === tid);
+          const st = api.getAppState();
+          const c = canvasEl10();
+          if (!c || !e) return 'no-canvas';
+          const r = c.getBoundingClientRect();
+          const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+          const cur = EX10.sceneCoordsToViewportCoords({ sceneX: e.x + e.width / 2, sceneY: e.y + e.height / 2 }, st);
+          const dx = (cx - cur.x) / st.zoom.value, dy = (cy - cur.y) / st.zoom.value;
+          if (Math.abs(dx) <= 10 && Math.abs(dy) <= 10) return 'centered';
+          api.updateScene({ appState: { scrollX: st.scrollX + dx, scrollY: st.scrollY + dy } });
+          await sleep(350);
+        }
+        return 'centered';
+      };
+      const selectText10 = async () => {
+        const api = api10();
+        const tid = lastTextId10();
+        if (!api || !tid) return { ok: false, how: 'no-text' };
+        const gates = [];
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const p = elemCenter10(tid);
+          if (p) {
+            const tap = await canvasTap10(p.x, p.y, false);
+            gates.push(tap.gate);
+            await sleep(600);
+          }
+          if ((api.getAppState().selectedElementIds || {})[tid]) return { ok: true, how: 'pointer', gates: gates.join('|') };
+          try { api.updateScene({ appState: { selectedElementIds: { [tid]: true }, selectedGroupIds: {}, editingGroupId: null } }); } catch (e) { /* setup shortcut */ }
+          await sleep(500);
+          if ((api.getAppState().selectedElementIds || {})[tid]) return { ok: true, how: 'api-fallback', gates: gates.join('|') };
+        }
+        return { ok: false, how: 'exhausted', gates: gates.join('|') };
+      };
+      // Enter the wysiwyg on the text element: select → Enter key (deterministic); dblclick
+      // fallback. NEVER dblclick empty canvas here — that would CREATE a second text element.
+      const enterWysiwyg10 = async () => {
+        const api = api10();
+        const tid = lastTextId10();
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+        await sleep(600);
+        let editing = !!(api.getAppState().editingTextElement) && !!document.querySelector('.excalidraw textarea');
+        let how = editing ? 'enter' : '';
+        let dblGate = '';
+        if (!editing) {
+          const p = elemCenter10(tid);
+          if (p) { const d1 = await canvasTap10(p.x, p.y, false); await sleep(250); const d2 = await canvasTap10(p.x, p.y, true); dblGate = d2.gate; }
+          await sleep(700);
+          editing = !!(api.getAppState().editingTextElement) && !!document.querySelector('.excalidraw textarea');
+          how = editing ? 'dblclick' : '';
+        }
+        const diag = { textCount: (api.getSceneElementsIncludingDeleted() || []).filter((e) => e.type === 'text' && !e.isDeleted).length, sel: Object.keys(api.getAppState().selectedElementIds || {}).length };
+        return { ok: editing, how, dblGate, diag };
+      };
+      const commitWysiwyg10 = async () => {
+        const cv = canvasEl10();
+        if (!cv) return false;
+        const r = cv.getBoundingClientRect();
+        const tries = [[0.82, 0.75], [0.5, 0.85], [0.15, 0.6], [0.5, 0.9]];
+        for (const [fx, fy] of tries) {
+          const x = Math.round(r.left + r.width * fx), y = Math.round(r.top + r.height * fy);
+          await canvasTap10(x, y, false);
+          await sleep(550);
+          if (!document.querySelector('.excalidraw textarea') && !(api10().getAppState().editingTextElement)) {
+            await canvasTap10(x, y, false);
+            await sleep(350);
+            return true;
+          }
+        }
+        return !document.querySelector('.excalidraw textarea') && !(api10().getAppState().editingTextElement);
+      };
+      // ===== engine-side fixture (rerun-safe): one text + one rectangle, PNG-embedded scene
+      let fixOk10 = false;
+      try {
+        const dtos0 = await dropsync.drop.list('personal');
+        for (const d of dtos0) { if (d.name === 'R108 Fixture') { try { await dropsync.drop.delete(d.id); } catch (e) { /* best-effort */ } } }
+        const seedEls10 = EX10.convertToExcalidrawElements([{ type: 'text', x: 60, y: 60, text: 'hist abc' }])
+          .concat(EX10.convertToExcalidrawElements([{ type: 'rectangle', x: 300, y: 60, width: 100, height: 60 }]));
+        const blob10 = await EX10.exportToBlob({ elements: seedEls10, appState: { viewBackgroundColor: '#ffffff', exportBackground: true, exportEmbedScene: true }, files: {}, exportPadding: 10 });
+        await dropsync.drop.createText({ spaceId: 'personal', name: 'R108 Fixture', content: '', expirationOption: 'forever', categories: [], locked: false, reminderAt: null, pngBytes: new Uint8Array(await blob10.arrayBuffer()) });
+        fixOk10 = !!(await dropsync.drop.list('personal')).find((d) => d.name === 'R108 Fixture' && d.isDrawing);
+      } catch (e) { out.f_26_seedErr = String(e.message || e).slice(0, 80); }
+      out.f_26_fixtureSeeded = fixOk10;
+      // ===== LEG 1 + 2: f_26_fontSticksEditOpen / f_26_fontSurvivesReopen =====
+      try {
+        const op1 = fixOk10 ? await openEditor10() : { ok: false, note: 'seed-failed' };
+        out.f_26_editorOpened = op1.ok;
+        if (!op1.ok) { out.f_26_editorOpenNote = op1.note; throw new Error('skip: ' + op1.note); }
+        out.f_26_fullscreen1 = await goFullscreen10();
+        out.f_26_pan1 = await panToCenter10();
+        const sel1 = await selectText10();
+        out.f_26_selectHow = sel1.how;
+        const ed1 = sel1.ok ? await enterWysiwyg10() : { ok: false };
+        out.f_26_wysiwygHow = ed1.how;
+        out.f_26_controlsHow1 = await ensureFontControls10();
+        const tid1 = lastTextId10();
+        const before1 = sceneEl10(tid1) ? { f: sceneEl10(tid1).fontFamily, v: sceneEl10(tid1).version } : null;
+        const mPre1 = M10() ? M10().mounts : -1;
+        let landed1 = '';
+        const spy1 = (ev) => {
+          const t = ev.target;
+          if (t && t.closest && t.closest('[data-testid="font-family-code"]')) landed1 = 'font-family-code';
+        };
+        window.addEventListener('click', spy1, true);
+        const clk1 = await buttonClick10(document.querySelector('[data-testid="font-family-code"]'), 'quick-code');
+        await sleep(700);
+        window.removeEventListener('click', spy1, true);
+        const mPost1 = M10() ? M10().mounts : -1;
+        const afterEl1 = sceneEl10(tid1);
+        const after1 = afterEl1 ? { f: afterEl1.fontFamily, v: afterEl1.version } : null;
+        out.f_26_clickLandedOn = landed1 || ('gate:' + clk1.gate);
+        out.f_26_mounts = mPre1 + '→' + mPost1;
+        out.f_26_editCell = JSON.stringify({ before: before1, after: after1, taOpen: !!document.querySelector('.excalidraw textarea'), gateOk: clk1.ok, selectGates: sel1.gates || '', wysiwygDiag: ed1.diag || null, dblGate: ed1.dblGate || '' });
+        out.f_26_fontSticksEditOpen = !!(ed1.ok && clk1.ok && landed1 === 'font-family-code' && mPre1 === mPost1 && alive10()
+          && before1 && after1 && after1.f === 8 && after1.v > before1.v);
+        out.f_26_panelStayedOpen = alive10() && !!document.querySelector('[data-testid="font-family-code"]');
+        // ===== LEG 2: real Save drawing → Save changes → close → engine-side reopen parse
+        const committed2 = await commitWysiwyg10();
+        out.f_26_fullscreenExit2 = await goFullscreen10(true); // back to the docked modal for its footer
+        const saveBtn2 = Array.from(document.querySelectorAll('button')).find((b) => (b.textContent || '').trim() === 'Save drawing');
+        const saved2 = saveBtn2 ? await buttonClick10(saveBtn2, 'save-drawing') : { ok: false, gate: 'no-save-drawing' };
+        let attached2 = false;
+        for (let i = 0; i < 35 && !attached2; i++) { await sleep(100); attached2 = !!Array.from(document.querySelectorAll('span')).find((s) => (s.textContent || '') === 'Drawing attached'); }
+        const submit2 = Array.from(document.querySelectorAll('.fixed.inset-0 button')).find((b) => (b.textContent || '').trim() === 'Save changes');
+        if (submit2) { await buttonClick10(submit2, 'save-changes'); await sleep(1800); }
+        await closeOverlays10();
+        await sleep(600);
+        let reopen2 = false;
+        try {
+          const sp2 = (await dropsync.vault.listSpaces()).find((s) => s.name === 'Personal');
+          const dto2 = sp2 ? (await dropsync.drop.list(sp2.id)).find((d) => d.name === 'R108 Fixture') : null;
+          const b2 = dto2 && dto2.hasFilePayload ? await dropsync.media.getBytes(dto2.id, 'file') : null;
+          if (b2) {
+            const sc2 = await EX10.loadFromBlob(new Blob([b2], { type: 'image/png' }), null, null);
+            const t2 = sc2.elements.find((e) => e.type === 'text' && !e.isDeleted);
+            reopen2 = !!t2 && String(t2.text || '').indexOf('hist abc') >= 0 && t2.fontFamily === 8;
+          }
+        } catch (e) { out.f_26_reopenErr = String(e.message || e).slice(0, 60); }
+        out.f_26_reopenShowsFam8 = reopen2;
+        out.f_26_fontSurvivesReopen = !!(committed2 && saved2.ok && attached2 && submit2 && reopen2);
+      } catch (e) { out.f_26_leg12Err = String(e.message || e).slice(0, 80); }
+      // ===== LEG 3: f_26_dropdownApplySurvives (fresh editor session, chosen value 1) =====
+      try {
+        const op3 = await openEditor10();
+        if (!op3.ok) { out.f_26_dropdownApplySurvives = false; out.f_26_dropdownNote = 'open:' + op3.note; }
+        else {
+          await goFullscreen10();
+          await panToCenter10();
+          const sel3 = await selectText10();
+          const api3 = api10();
+          const tid3 = lastTextId10();
+          if (!sel3.ok || !tid3) { out.f_26_dropdownApplySurvives = false; out.f_26_dropdownNote = 'select:' + sel3.how; }
+          else {
+            await ensureFontControls10();
+            const trig3 = document.querySelector('[data-testid="font-family-show-fonts"]');
+            const clkTrig3 = await buttonClick10(trig3, 'show-fonts');
+            await sleep(500);
+            const popupUp3 = !!document.querySelector('.FontPicker__dropdown') || api3.getAppState().openPopup === 'fontFamily';
+            out.f_26_dropdownPopupOpened = popupUp3;
+            // "a different family": this build's FontPicker dropdown ships exactly the four
+            // bundled families (census-proven: values 8,7,5,6) — pick 7 (Lilita One), which
+            // differs from the scene's current 8. (Value 1 does not exist as an item.)
+            let item3 = null;
+            let itemCensus3 = '';
+            for (let i = 0; i < 12 && !item3; i++) {
+              await sleep(250);
+              item3 = document.querySelector('.dropdown-menu-item[value="7"]');
+              if (!item3 && i === 5) {
+                itemCensus3 = JSON.stringify(Array.from(document.querySelectorAll('.dropdown-menu-item')).map((x) => x.getAttribute('value')).slice(0, 12));
+              }
+            }
+            const clkItem3 = itemClick10(item3, 'item-7');
+            await sleep(400);
+            const pEmpty3 = emptyPoint10();
+            if (pEmpty3) await canvasTap10(pEmpty3.x, pEmpty3.y, false); // close any still-open popup
+            await sleep(1700); // outlive the 1500 ms complement window — final settled value
+            const fin3 = sceneEl10(tid3);
+            out.f_26_dropdownCell = JSON.stringify({ trig: clkTrig3.ok, item: clkItem3.ok, gateItem: clkItem3.gate, popup: popupUp3, finalFam: fin3 ? fin3.fontFamily : null, census: itemCensus3 });
+            out.f_26_dropdownApplySurvives = !!(clkTrig3.ok && clkItem3.ok && popupUp3 && fin3 && fin3.fontFamily === 7);
+          }
+          await closeOverlays10();
+        }
+      } catch (e) { out.f_26_leg3Err = String(e.message || e).slice(0, 80); }
+      // ===== LEG 4 + 5: f_26_handDrawnIsExcalifont / f_26_noShapePollution =====
+      try {
+        const op4 = await openEditor10();
+        if (!op4.ok) { out.f_26_handDrawnIsExcalifont = false; out.f_26_noShapePollution = false; out.f_26_leg45Note = 'open:' + op4.note; }
+        else {
+          await goFullscreen10();
+          await panToCenter10();
+          const api4 = api10();
+          const sel4 = await selectText10();
+          await ensureFontControls10();
+          const tid4 = lastTextId10();
+          const mPre4 = M10() ? M10().mounts : -1;
+          const clk4 = sel4.ok ? await buttonClick10(document.querySelector('[data-testid="font-family-hand-drawn"]'), 'quick-hand-drawn') : { ok: false, gate: 'no-select' };
+          await sleep(700);
+          const el4 = sceneEl10(tid4);
+          const mPost4 = M10() ? M10().mounts : -1;
+          out.f_26_handDrawnIsExcalifont = !!(clk4.ok && el4 && el4.fontFamily === 5 && mPre4 === mPost4 && alive10());
+          // both selected (api setup shortcut — the CRASH surface, the toolbar click, stays real)
+          const rect4 = (api4.getSceneElementsIncludingDeleted() || []).find((e) => e.type === 'rectangle' && !e.isDeleted);
+          if (rect4 && tid4) {
+            const rectFamBefore4 = rect4.fontFamily === undefined ? 'unset' : rect4.fontFamily;
+            api4.updateScene({ appState: { selectedElementIds: { [tid4]: true, [rect4.id]: true }, selectedGroupIds: {}, editingGroupId: null } });
+            await sleep(500);
+            const clk5 = await buttonClick10(document.querySelector('[data-testid="font-family-code"]'), 'quick-code-mixed');
+            await sleep(700);
+            const elTxt5 = sceneEl10(tid4);
+            const rect5 = (api4.getSceneElementsIncludingDeleted() || []).find((e) => e.id === rect4.id);
+            const rectFamAfter5 = rect5.fontFamily === undefined ? 'unset' : rect5.fontFamily;
+            out.f_26_rectFam = rectFamBefore4 + '→' + rectFamAfter5;
+            out.f_26_noShapePollution = !!(clk5.ok && elTxt5 && elTxt5.fontFamily === 8 && rectFamAfter5 === rectFamBefore4);
+          } else {
+            out.f_26_noShapePollution = false;
+            out.f_26_leg45Note = 'no-rect';
+          }
+          await closeOverlays10();
+        }
+      } catch (e) { out.f_26_leg45Err = String(e.message || e).slice(0, 80); }
+      // ===== LEG 6: f_26_createStockUnchanged (CREATE mode — stock pipeline, no intercept) =====
+      try {
+        const addBtn6 = Array.from(document.querySelectorAll('main button')).find((b) => (b.textContent || '').trim() === 'Add Text');
+        if (!addBtn6) throw new Error('no-add-text');
+        addBtn6.click();
+        await sleep(700);
+        const drawTab6 = Array.from(document.querySelectorAll('.fixed.inset-0 button')).find((b) => (b.textContent || '').trim() === 'Draw');
+        if (!drawTab6) throw new Error('no-draw-tab');
+        drawTab6.click();
+        let up6 = false;
+        for (let i = 0; i < 30 && !up6; i++) { await sleep(300); up6 = alive10(); }
+        if (!up6) throw new Error('create-canvas-not-up');
+        await sleep(700);
+        out.f_26_fullscreen6 = await goFullscreen10();
+        await ensureFontControls10();
+        // create a text via Excalidraw's own path: dblclick empty canvas + type
+        const cv6 = canvasEl10();
+        const r6 = cv6.getBoundingClientRect();
+        const cx6 = Math.round(r6.left + Math.min(170, r6.width * 0.45)), cy6 = Math.round(r6.top + 120);
+        const gate6 = await canvasTap10(cx6, cy6, true);
+        let ta6 = null;
+        for (let i = 0; i < 16 && !ta6; i++) { await sleep(250); ta6 = document.querySelector('.excalidraw textarea'); }
+        if (!ta6) throw new Error('create-no-textarea: ' + gate6.gate);
+        try {
+          const setV = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+          setV.call(ta6, 'hi');
+          ta6.dispatchEvent(new Event('input', { bubbles: true }));
+        } catch (e) { throw new Error('create-type-failed'); }
+        await sleep(300);
+        const mPre6 = M10() ? M10().mounts : -1;
+        const clk6 = await buttonClick10(document.querySelector('[data-testid="font-family-hand-drawn"]'), 'create-quick-hand-drawn');
+        await sleep(800);
+        const mPost6 = M10() ? M10().mounts : -1;
+        const t6 = (api10().getSceneElementsIncludingDeleted() || []).filter((e) => e.type === 'text' && !e.isDeleted).pop();
+        out.f_26_createCell = JSON.stringify({ gate: gate6.gate, clk: clk6.ok, gateClk: clk6.gate, fam: t6 ? t6.fontFamily : null, mounts: mPre6 + '→' + mPost6 });
+        out.f_26_createStockUnchanged = !!(clk6.ok && mPre6 === mPost6 && alive10() && t6 && t6.fontFamily === 5);
+        await closeOverlays10();
+      } catch (e) { out.f_26_leg6Err = String(e.message || e).slice(0, 80); out.f_26_createStockUnchanged = false; }
+      // ===== 108b layer-2 legs: the vendored font files must LOAD on any origin =====
+      // f_26b_assetPathAbsolute (dev regression gate — passes before AND after; must NEVER
+      // regress to a relative/root value) + f_26b_fontFacesLoad (≥1 of the 8 families has a
+      // 'loaded' face, zero 'error' — the f22b_fontStatus tally shape, reused).
+      try {
+        const ap26b = String(window.EXCALIDRAW_ASSET_PATH || '');
+        const expected26b = new URL('./', document.baseURI).href;
+        out.f_26b_assetPathValue = ap26b;
+        out.f_26b_assetPathAbsolute = /^(https?:|file:)/.test(ap26b)
+          && ap26b.charAt(ap26b.length - 1) === '/'
+          && ap26b === expected26b;
+      } catch (e) { out.f_26b_assetPathAbsolute = false; out.f_26b_assetPathErr = String(e.message || e).slice(0, 60); }
+      try {
+        const fams26b = ['Excalifont', 'Nunito', 'Virgil', 'Cascadia', 'Comic Shanns', 'Lilita One', 'Helvetica', 'Liberation Sans'];
+        const faces26b = Array.from(document.fonts);
+        let loaded26b = 0; let err26b = 0; let totalErr26b = 0;
+        const perFam26b = {};
+        for (const fam of fams26b) {
+          const ff = faces26b.filter((f) => f.family === fam || f.family === '"' + fam + '"');
+          const bad = ff.filter((f) => f.status === 'error').length;
+          const ok = ff.filter((f) => f.status === 'loaded').length;
+          loaded26b += ok; err26b += bad;
+          perFam26b[fam] = ff.length === 0 ? 'no-faces' : ok + 'ok/' + ff.length;
+        }
+        for (const f of faces26b) { if (f.status === 'error') totalErr26b++; }
+        out.f_26b_fontCensus = JSON.stringify({ famLoaded: loaded26b, famErr: err26b, allFaces: faces26b.length, allErr: totalErr26b, perFam: perFam26b });
+        out.f_26b_fontFacesLoad = loaded26b >= 1 && err26b === 0;
+      } catch (e) { out.f_26b_fontFacesLoad = false; out.f_26b_fontErr = String(e.message || e).slice(0, 60); }
+      out.f_26_allGreen = out.f_26_fixtureSeeded === true && out.f_26_fontSticksEditOpen === true
+        && out.f_26_fontSurvivesReopen === true && out.f_26_dropdownApplySurvives === true
+        && out.f_26_handDrawnIsExcalifont === true && out.f_26_noShapePollution === true
+        && out.f_26_createStockUnchanged === true;
+      localStorage.removeItem('dropsync.sit3.dom');
+      out.stage = '10';
       return JSON.stringify(out);
     }
     return JSON.stringify({ stage: 'unknown' });
