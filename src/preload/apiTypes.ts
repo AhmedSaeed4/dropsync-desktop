@@ -45,6 +45,9 @@ export interface DropDTO {
   hasImagePayload?: boolean;
   /** FIX 20 — manifest Excalidraw scene for imported drawings (editor zero-fetch path). */
   drawingScene?: unknown;
+  /** #28 — content fingerprint (stamped at write time; lets a list card notice its
+   *  content changed and re-read just itself). Mirrors the record's map. */
+  contentSha256s?: { content?: string; file?: string; image?: string };
 }
 
 export interface ArchiveInspectionDTO {

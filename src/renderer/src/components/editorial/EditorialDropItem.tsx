@@ -117,6 +117,11 @@ export const EditorialDropItem = memo(function EditorialDropItem({
 
   const { ref: cardRef, inView } = useInView<HTMLDivElement>('1000px 0px');
   const hasLoaded = useRef(false);
+  // 28: the card re-reads ITSELF when its content fingerprint changes (no whole-list refresh —
+  // the save already patches this one drop's DTO in place). Key = the stamped shas; null until
+  // the first successful load (that first load keeps the old one-shot behavior).
+  const contentKey = JSON.stringify([drop.contentSha256s?.content ?? null, drop.contentSha256s?.file ?? null, drop.contentSha256s?.image ?? null]);
+  const loadedKeyRef = useRef<string | null>(null);
 
   const tc = getEditorialThemeColors(theme);
   const font = tc.fontClass;
@@ -141,7 +146,8 @@ export const EditorialDropItem = memo(function EditorialDropItem({
   // IPC; binaries resolve to opaque media:// URLs streamed (and range-served) by main.
   useEffect(() => {
     async function load() {
-      if (!inView || hasLoaded.current) return;
+      if (!inView) return;
+      if (loadedKeyRef.current !== null && loadedKeyRef.current === contentKey) return;
       hasLoaded.current = true;
       try {
         if (drop.type === 'text') {
@@ -159,6 +165,7 @@ export const EditorialDropItem = memo(function EditorialDropItem({
           const url = await getMediaUrl(drop.id, 'image');
           setImageUrl(url);
         }
+        loadedKeyRef.current = contentKey;
       } catch {
         /* card stays in its placeholder state */
       }

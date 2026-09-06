@@ -94,6 +94,9 @@ export interface DropDTO {
   /** FIX 20 — the manifest's Excalidraw scene blueprint for imported drawings. Present ⇒ the
    * editor builds the initial scene from THIS JSON with zero byte fetches. */
   drawingScene?: unknown;
+  /** #28 — content fingerprint (stamped at write time; lets a list card notice its
+   *  content changed and re-read just itself). Mirrors the record's map. */
+  contentSha256s?: { content?: string; file?: string; image?: string };
 }
 
 function toDTO(record: VaultDropRecord): DropDTO {
@@ -123,6 +126,8 @@ function toDTO(record: VaultDropRecord): DropDTO {
     importedFromArchiveId: record.importedFromArchiveId,
     hasFilePayload: !!record.blobRefs.file,
     hasImagePayload: !!record.blobRefs.image,
+    // 28: the card's refresh key — stamped at write time in updateTextDropContent.
+    contentSha256s: record.contentSha256s,
     drawingScene: record.drawingScene ?? undefined,
   };
 }

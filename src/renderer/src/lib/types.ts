@@ -48,6 +48,9 @@ export interface Drop {
   hasImagePayload?: boolean;
   /** FIX 20 — manifest Excalidraw scene for imported drawings (zero-fetch editor path). */
   drawingScene?: unknown;
+  /** #28 — content fingerprint (stamped at write time; lets a list card notice its
+   *  content changed and re-read just itself). Mirrors the DTO's map. */
+  contentSha256s?: { content?: string; file?: string; image?: string };
 }
 
 export interface Category {
@@ -100,6 +103,7 @@ export function dropDtoToDrop(dto: DropDTO): Drop {
     hasFilePayload: dto.hasFilePayload,
     hasImagePayload: dto.hasImagePayload,
     drawingScene: dto.drawingScene,
+    contentSha256s: dto.contentSha256s,
     encrypted: false,
   };
 }

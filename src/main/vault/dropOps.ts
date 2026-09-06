@@ -18,6 +18,11 @@ import { tmpdir } from 'node:os';
 // (a WEB ReadableStream, vault.ts:713-719) into readableToWritable (below), which pumps a NODE
 // Readable — Readable.fromWeb is the adapter (same conversion as the drop:saveAs handler).
 import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
+
+// 28: same one-liner helper the importer uses (importer.ts sha256Hex, not exported) — the
+// content fingerprint stamped at write time must be byte-identical to the import-time one.
+const sha256Hex = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex');
 
 import type { VaultManager } from './vault.ts';
 import {
@@ -351,7 +356,10 @@ export async function updateTextDropContent(
       newInlineContent = text;
     }
     next.content = newInlineContent;
-    next.contentSha256s.content = undefined;
+    // 28: stamp the content fingerprint at write time (sha of the UTF-8 text bytes, inline or
+    // >64KB body alike — the bytes are the same regardless of where they live). The list card
+    // compares this key to notice its own content changed and re-read JUST itself.
+    next.contentSha256s.content = sha256Hex(new TextEncoder().encode(text));
   }
 
   // Image / drawing payload replacement.
@@ -364,6 +372,8 @@ export async function updateTextDropContent(
     await w.close();
     newFileRef = await writer.ref();
     next.isDrawing = true;
+    // 28: stamp the file-slot fingerprint — the card's thumbnail key.
+    next.contentSha256s.file = newFileRef.sha256;
     // 27: the manifest drawingScene is now stale by definition — the PNG it mirrors was just
     // replaced by this save. Clearing it makes the editor fall back to the saved PNG's
     // embedded scene (the proven path every locally created drawing uses). Metadata-only
@@ -374,10 +384,14 @@ export async function updateTextDropContent(
     newImageRef = await streamPathIntoVault(manager, updates.imagePath, undefined, undefined, onProgress);
     next.imageSize = newImageRef.bytes;
     next.imageMimeType = await sniffImageMime(manager, newImageRef);
+    // 28: stamp the attached-image fingerprint — the card's attached-image key.
+    next.contentSha256s.image = newImageRef.sha256;
   } else if (updates.imageBytes && updates.imageBytes.byteLength > 0) {
     newImageRef = await writeBytesIntoVault(manager, updates.imageBytes);
     next.imageSize = newImageRef.bytes;
     next.imageMimeType = await sniffImageMime(manager, newImageRef);
+    // 28: stamp the attached-image fingerprint — the card's attached-image key.
+    next.contentSha256s.image = newImageRef.sha256;
   } else if (updates.imageRemoved) {
     next.imageSize = undefined;
     next.imageMimeType = undefined;
