@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { attachContextMenu } from './contextMenu';
 
 export const CLOUD_URL = 'https://drag-drop-app.vercel.app';
 /** Exported for PAC-4's battery leg: the trailing-slash origin (`CLOUD_ORIGIN + '/'`) is the
@@ -2243,6 +2244,12 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       readyMs = Date.now() - loadStartedAt;
       console.log('[cloud] did-finish-load in', readyMs, 'ms');
     }, (code, isMainFrame, url, desc) => onSiteLoadFailed(code, isMainFrame, url, desc), onSiteLoadSucceeded);
+    // Round 111 (#29) — the Cloud site view gets the same browser-style right-click menu
+    // as Local (index.ts, label 'local-main'). The payload comes from Chromium OUTSIDE the
+    // page — NOT site injection (invariant I6/I1; same posture as the input-event
+    // idle-clock feed below and the permission doorman). Attached HERE in ensureView so
+    // every recreation of the view (dead-page retries) re-attaches.
+    attachContextMenu(view.webContents, 'cloud-site');
     // C2h FIX 2 — cloud gestures feed the SAME idle-auto-lock clock as Local actions (owner
     // decision D-B). We sense INPUTS from OUTSIDE the page (main-process listener; this is NOT
     // site injection — we never execute/read anything in the site, invariant I6/I1). Buttons,

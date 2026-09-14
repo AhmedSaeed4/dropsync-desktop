@@ -20,6 +20,10 @@ import { VaultManager } from './vault/vault.ts';
 // helper types its parameter with the record type itself.
 import type { VaultDropRecord } from './vault/vaultTypes.ts';
 import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_ROOM_PAD_X, CLOUD_ORIGIN, CAPTURE_DEADLINE_MS, ENTRY_CONNECT_TIMEOUT_MS, STATUS_TOP, STATUS_H, CLOUD_URL, type CloudController } from './cloud';
+import { attachContextMenu } from './contextMenu';
+// Round 111 §8 DEV battery — the f_29_* legs assert the builder's pure menu shape and the
+// attach-map state (main-side seams; the menu is OUR native UI, so no page-side probe exists).
+import { buildContextMenuItems, isContextMenuAttached } from './contextMenu';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -201,6 +205,12 @@ function createWindow(): void {
     },
   });
   mainWindow.once('ready-to-show', () => mainWindow?.show());
+  // Round 111 (#29) — the Local UI gets the browser-style right-click menu (Copy on a
+  // selection; Cut/Copy/Paste/Select All in editable fields). Sensed from OUTSIDE the page
+  // (main-process event); the Cloud site view carries the identical handler (cloud.ts
+  // ensureView, label 'cloud-site'). globals.css stops blocking selection in the same
+  // round — see the FIX D comment there.
+  attachContextMenu(mainWindow.webContents, 'local-main');
   // C1: cloud view lifecycle + C2f generalized bounds tracking (resize/maximize/full-screen/move).
   // C2h FIX 3 — cloud-view gestures feed the SAME idle-auto-lock clock (owner decision D-B):
   // the controller senses raw inputs from OUTSIDE the page and calls manager.touch() here.
@@ -4085,6 +4095,45 @@ function createWindow(): void {
                 pillRaw: bootPill,
               }));
 
+              // ==== Round 111 (#29) — f_29_* battery legs (order §8) =====================
+              // The context menu is OUR native UI — no page-side probe can exist — so the
+              // legs assert the MAIN-SIDE seams: the builder's pure menu shape (unit legs),
+              // the attach-map state for the Local window, and the Local selection CSS
+              // (FIX D web parity, read from the live DOM). RED (revert FIX B/C/D): the
+              // attached/selection legs flip false; the builder unit legs are controls and
+              // stay true (pure function, no attach involved).
+              {
+                const f_29_builderEditableRaw = buildContextMenuItems({ isEditable: true, selectionText: '', editFlags: { canCopy: true, canCut: false, canPaste: true } });
+                const f_29_builderEditable = JSON.stringify(f_29_builderEditableRaw) === JSON.stringify([
+                  { label: 'Cut', role: 'cut', enabled: false },
+                  { label: 'Copy', role: 'copy', enabled: true },
+                  { label: 'Paste', role: 'paste', enabled: true },
+                  { type: 'separator' },
+                  { label: 'Select All', role: 'selectAll' },
+                ]);
+                const f_29_builderSelectionRaw = buildContextMenuItems({ isEditable: false, selectionText: 'hello', editFlags: { canCopy: true, canCut: false, canPaste: false } });
+                const f_29_builderSelection = Array.isArray(f_29_builderSelectionRaw) && f_29_builderSelectionRaw.length === 1
+                  && JSON.stringify(f_29_builderSelectionRaw[0]) === JSON.stringify({ label: 'Copy', role: 'copy', enabled: true });
+                const f_29_builderSilent = buildContextMenuItems({ isEditable: false, selectionText: '', editFlags: { canCopy: false, canCut: false, canPaste: false } }) === null
+                  && buildContextMenuItems({ isEditable: false, selectionText: '   ', editFlags: { canCopy: false, canCut: false, canPaste: false } }) === null;
+                const f_29_attachedLocal = isContextMenuAttached('local-main');
+                const sel29 = await win.webContents.executeJavaScript(
+                  `(() => { try {
+                      const us = getComputedStyle(document.body).userSelect;
+                      const r = document.createRange(); r.selectNodeContents(document.body);
+                      const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(r);
+                      const text = sel.toString(); sel.removeAllRanges();
+                      return JSON.stringify({ us, len: text.length, sample: text.slice(0, 40) });
+                    } catch (e) { return JSON.stringify({ err: String(e) }); } })()`
+                ).then((s) => JSON.parse(s as string) as { us?: string; len?: number; sample?: string; err?: string });
+                const f_29_selectionLocal = !sel29.err && sel29.us !== 'none' && (sel29.len ?? 0) > 0;
+                console.log('[f29-local]', JSON.stringify({
+                  f_29_builderEditable, f_29_builderSelection, f_29_builderSilent,
+                  f_29_attachedLocal, f_29_selectionLocal,
+                  raw: { builderEditable: f_29_builderEditableRaw, builderSelection: f_29_builderSelectionRaw, dom: sel29 },
+                }));
+              }
+
               // ==== 1.0.5 — DOWNLOADS LIVE AGAIN + THE YOUTUBE REFERER STAMP ================
               // (repair-order-105-downloads-and-youtube.md §8) Both new legs live HERE —
               // before the heavy stages — on their own evidence (no vault/site/pill state).
@@ -4374,6 +4423,37 @@ function createWindow(): void {
               for (let i = 0; i < 30 && readyMs === null; i++) {
                 await sleep(1000);
                 readyMs = cloudCtl.probeState().readyMs ?? null;
+              }
+              // f_29_attachedCloud — the site view is ALIVE here (ensureView created it via
+              // the REAL pill-flip above); our label must be attached to its webContents
+              // (FIX C). RED (revert the FIX C attach call): flips false.
+              const f_29_attachedCloud = isContextMenuAttached('cloud-site');
+              console.log('[f29-cloud]', JSON.stringify({ f_29_attachedCloud, raw: { siteReadyMs: readyMs } }));
+              // f_29_pillToggleUntouched — the pill's OWN right-click style toggle (the
+              // c2g/c2l pillDrive pattern — synthetic contextmenu through the REAL layer
+              // listeners) still flips A→B→A now that our context-menu handler exists
+              // app-wide (order F8). The pill is its own WebContentsView and this round
+              // attaches NOTHING to it — its DOM toggle must stay the only right-click
+              // behavior there. CONTROL leg: stays true in the RED pair too.
+              {
+                const g29 = cloudCtl; // narrowed alias — TS can't keep null-checks in closures
+                const style29 = (): Promise<string> =>
+                  g29.pillEval('JSON.stringify(window.__c2gPill ? window.__c2gPill.style : null)')
+                    .then((s) => String(JSON.parse(s as string)));
+                const poll29 = async (want: string): Promise<boolean> => {
+                  for (let i = 0; i < 8; i++) { if ((await style29()) === want) return true; await sleep(400); }
+                  return false;
+                };
+                const before29 = await style29();
+                await g29.pillDrive('contextmenu'); // A → B (the REAL toggle path)
+                const flippedToB = await poll29('B');
+                await g29.pillDrive('contextmenu'); // B → A
+                const restoredToA = await poll29('A');
+                const f_29_pillToggleUntouched = before29 === 'A' && flippedToB && restoredToA;
+                console.log('[f29-pill]', JSON.stringify({
+                  f_29_pillToggleUntouched,
+                  raw: { before: before29, flippedToB, restoredToA, end: await style29() },
+                }));
               }
               // (2b) f_c2g_* — THE PUNCH-HOLE PILL battery (C2g FIX 5). Runs BEFORE the c2f
               // bounds/storm legs and restores Style A at the end, so those carried keys keep
