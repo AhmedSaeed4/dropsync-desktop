@@ -27,7 +27,6 @@ body {
   -webkit-font-smoothing: antialiased;
   scrollbar-gutter: stable;
   overscroll-behavior: none;
-  user-select: none;
 }
 
 ::-webkit-scrollbar {
