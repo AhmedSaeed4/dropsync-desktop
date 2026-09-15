@@ -19,7 +19,7 @@ import { VaultManager } from './vault/vault.ts';
 // Round 107 battery (§8.3) — the f_t107_* legs read REAL records main-side; the ride-keys
 // helper types its parameter with the record type itself.
 import type { VaultDropRecord } from './vault/vaultTypes.ts';
-import { initCloud, attachCloudResizeTracking, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_ROOM_PAD_X, CLOUD_ORIGIN, CAPTURE_DEADLINE_MS, ENTRY_CONNECT_TIMEOUT_MS, STATUS_TOP, STATUS_H, CLOUD_URL, type CloudController } from './cloud';
+import { initCloud, attachCloudResizeTracking, wireHtmlFullscreen, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_ROOM_PAD_X, CLOUD_ORIGIN, CAPTURE_DEADLINE_MS, ENTRY_CONNECT_TIMEOUT_MS, STATUS_TOP, STATUS_H, CLOUD_URL, type CloudController } from './cloud';
 import { attachContextMenu } from './contextMenu';
 // Round 111 §8 DEV battery — the f_29_* legs assert the builder's pure menu shape and the
 // attach-map state (main-side seams; the menu is OUR native UI, so no page-side probe exists).
@@ -151,6 +151,19 @@ if (process.env.DROPSYNC_CLOUD_DEV === '1') {
     return (origStdoutWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
   }) as typeof process.stdout.write;
 }
+// Round 113 (#30) — f_113 stdout tap, same technique as the f105 tap above: the battery legs
+// assert the LITERAL `[fullscreen]` enter/leave lines wireHtmlFullscreen prints and the
+// lockdown's `[pill] permission-denied fullscreen` refusal, so the lines are CAPTURED, never
+// replayed. Gated on THIS round's own env flag (DROPSYNC_F113), not CLOUD_DEV, so the legs
+// can run in a bare boot too. Production (env absent) never taps anything.
+const f113FullscreenLines: string[] = [];
+if (process.env.DROPSYNC_F113 === '1') {
+  const origStdoutWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = ((chunk: unknown, ...rest: unknown[]): boolean => {
+    if (typeof chunk === 'string' && (chunk.includes('[fullscreen]') || chunk.includes('permission-denied fullscreen'))) f113FullscreenLines.push(chunk);
+    return (origStdoutWrite as (...a: unknown[]) => boolean)(chunk, ...rest);
+  }) as typeof process.stdout.write;
+}
 
 let appMode: 'cloud' | 'local' = 'local'; // relaunch always starts Local in C1 (remember-last-mode = C2)
 /** Assigned by registerIpc — shared by mode:set and the DEV probe's switch storm. */
@@ -211,6 +224,12 @@ function createWindow(): void {
   // ensureView, label 'cloud-site'). globals.css stops blocking selection in the same
   // round — see the FIX D comment there.
   attachContextMenu(mainWindow.webContents, 'local-main');
+  // Round 113 (#30) — the Local window's HTML-fullscreen wiring: a page's fullscreen request
+  // (the vault video player's native control, the YouTube embed) now takes the WINDOW truly
+  // fullscreen; Esc / exit restores it. Same helper as the Cloud site view (cloud.ts
+  // ensureView) — one implementation, two windows. The permission grant lives in the
+  // default-session lockdown (cloud.ts attachPillLockdown FIX A).
+  wireHtmlFullscreen(mainWindow, mainWindow.webContents);
   // C1: cloud view lifecycle + C2f generalized bounds tracking (resize/maximize/full-screen/move).
   // C2h FIX 3 — cloud-view gestures feed the SAME idle-auto-lock clock (owner decision D-B):
   // the controller senses raw inputs from OUTSIDE the page and calls manager.touch() here.
@@ -4189,6 +4208,116 @@ function createWindow(): void {
                   matrix: { devServer: !!devBase, saw: appliedRaw.saw, refererMatch: appliedRaw.referer === YT_EMBED_REFERER },
                   raw: appliedRaw,
                 }));
+              }
+              // ==== Round 113 (#30) — f_113_* battery legs (order §8) =====================
+              // HTML-fullscreen everywhere. The Local legs drive the REAL pipeline: a one-shot
+              // document click handler calls requestFullscreen() (armed HERE via
+              // executeJavaScript on OUR page), the f113 DRIVER sends a REAL mouse click over
+              // CDP (Input.dispatchMouseEvent — programmatic .click() carries no user
+              // activation), and the leg asserts the wireHtmlFullscreen log lines (captured by
+              // the f113FullscreenLines tap above) + the window state. The driver waits for
+              // the [f113-armed] / [f113-armed-pill] stdout cues printed below. Pill leg: the
+              // deny must SURVIVE (the trusted layer keeps deny-all; only the Local main
+              // window's requests are granted, cloud.ts FIX A). Doorman legs ride
+              // doormanProbe's direct invocation (deterministic; the real site can't be
+              // scripted, I1/I6). RED (pre-fix cloud.ts): no grant, no wiring — the enter
+              // evidence disappears and the legs flip false.
+              if (process.env.DROPSYNC_F113 === '1' && cloudCtl) {
+                const markF113 = f113FullscreenLines.length;
+                // (1) f_113_localFullscreen — arm, cue the driver, wait for the real click.
+                await win.webContents.executeJavaScript(
+                  `(() => { const h = () => { document.removeEventListener('click', h, true); document.documentElement.requestFullscreen().catch(() => {}); }; document.addEventListener('click', h, true); return true; })()`
+                );
+                console.log('[f113-armed] {"localArmed":true}');
+                let sawEnter = false;
+                for (let i = 0; i < 30 && !sawEnter; i++) { // ≤15 s for the driver's real click
+                  await sleep(500);
+                  sawEnter = f113FullscreenLines.slice(markF113).some((l) => l.includes('enter-html-full-screen'));
+                }
+                await sleep(400); // window state settles behind the event
+                const f_113_localFullscreen = sawEnter && win.isFullScreen();
+                console.log('[f113-local]', JSON.stringify({ f_113_localFullscreen, isFullScreen: win.isFullScreen(), lines: f113FullscreenLines.slice(markF113) }));
+                // (2) f_113_localExit — leaving the element restores the window. The exit call is
+                // the ORDER's single executeJavaScript document.exitFullscreen(); the harness
+                // re-issues it (≤3 tries, ≤3 s poll each) so a swallowed first rejection cannot
+                // fail the leg — the VERDICT itself stays: leave line logged + window restored.
+                const markExit = f113FullscreenLines.length;
+                const wasFocused = win.isFocused();
+                if (!wasFocused) { win.focus(); await sleep(300); }
+                let sawLeave = false;
+                const exitDiag: unknown[] = [];
+                for (let attempt = 0; attempt < 3 && !sawLeave; attempt++) {
+                  exitDiag.push(await win.webContents.executeJavaScript(
+                    `(() => { const st = { fe: !!document.fullscreenElement, fs: !!document.fullscreen }; if (document.fullscreenElement) { const p = document.exitFullscreen(); if (p && p.catch) p.catch((e) => { window.__f113ExitErr = String(e && e.name ? e.name : e); }); } return JSON.stringify(st); })()`
+                  ).catch(() => 'eval-failed'));
+                  for (let i = 0; i < 6 && !sawLeave; i++) {
+                    await sleep(500);
+                    sawLeave = f113FullscreenLines.slice(markExit).some((l) => l.includes('leave-html-full-screen'));
+                  }
+                }
+                await sleep(400);
+                const f_113_localExit = sawLeave && !win.isFullScreen();
+                const exitErr = await win.webContents.executeJavaScript('window.__f113ExitErr ?? null').catch(() => 'eval-failed');
+                console.log('[f113-exit]', JSON.stringify({ f_113_localExit, isFullScreen: win.isFullScreen(), wasFocused, sawLeave, attempts: exitDiag, exitErr }));
+                // (3) f_113_pillStillDenied — the trusted pill layer keeps deny-all.
+                const markPill = f113FullscreenLines.length;
+                let pillArmed = false;
+                for (let i = 0; i < 10 && !pillArmed; i++) {
+                  try {
+                    await cloudCtl.pillEval(`(() => { const h = () => { document.removeEventListener('click', h, true); document.documentElement.requestFullscreen().catch(() => {}); }; document.addEventListener('click', h, true); return true; })()`);
+                    pillArmed = true;
+                  } catch { await sleep(500); }
+                }
+                console.log('[f113-armed-pill]', JSON.stringify({ pillArmed }));
+                let sawPillDeny = false;
+                for (let i = 0; i < 24 && !sawPillDeny; i++) { // ≤12 s for the driver's pill click
+                  await sleep(500);
+                  sawPillDeny = f113FullscreenLines.slice(markPill).some((l) => l.includes('permission-denied fullscreen'));
+                }
+                await sleep(400);
+                const f_113_pillStillDenied = pillArmed && sawPillDeny && !win.isFullScreen();
+                console.log('[f113-pill]', JSON.stringify({ f_113_pillStillDenied, pillArmed, isFullScreen: win.isFullScreen(), lines: f113FullscreenLines.slice(markPill) }));
+                // The real pill click may also run the layer's OWN flip relay — put Local back
+                // so the later stages start from the boot state (clean flip, no dirty editor).
+                try {
+                  if ((await readModeSafe()) !== 'local') {
+                    win.webContents.send('pill:flipRequested', 'local');
+                    await sleep(1500);
+                  }
+                } catch { /* battery-only hygiene */ }
+                // (4)+(5) doorman legs — direct invocation through the DEV-gated probe seam.
+                let door: Awaited<ReturnType<CloudController['doormanProbe']>> | null = null;
+                let doorErr: string | null = null;
+                try { door = await cloudCtl.doormanProbe(); } catch (e) { doorErr = String(e); }
+                const f_113_cloudGrantFullscreen = door?.fullscreenYoutube === true;
+                const f_113_cloudScopeUnchanged = door?.fullscreenEvilReq === true
+                  && door?.checkFullscreenSite === true
+                  && door?.geoSite === false && door?.mediaEvil === false
+                  && door?.checkMediaEvil === false && door?.notificationsEvil === false
+                  && door?.notificationsEvilReq === false && door?.clipboardEvilReq === false
+                  && door?.checkClipboardEvil === false
+                  && door?.mediaSite === true && door?.checkMediaSite === true
+                  && door?.notificationsSite === true && door?.clipboardSite === true
+                  && door?.checkClipboardSite === true;
+                console.log('[f113-doorman]', JSON.stringify({ f_113_cloudGrantFullscreen, f_113_cloudScopeUnchanged, door, doorErr }));
+                // (6) f_113_modeFlipSafety — a flip never strands the window fullscreen.
+                const flip1T0 = Date.now();
+                win.setFullScreen(true);
+                await sleep(150);
+                cloudCtl.hide();
+                let flip1 = false;
+                for (let i = 0; i < 10 && !flip1; i++) { await sleep(100); flip1 = !win.isFullScreen(); }
+                const flip1Ms = Date.now() - flip1T0;
+                const flip2T0 = Date.now();
+                win.setFullScreen(true);
+                await sleep(150);
+                cloudCtl.show();
+                let flip2 = false;
+                for (let i = 0; i < 10 && !flip2; i++) { await sleep(100); flip2 = !win.isFullScreen(); }
+                const flip2Ms = Date.now() - flip2T0;
+                await sleep(300);
+                const f_113_modeFlipSafety = flip1 && flip2 && flip1Ms <= 1000 && flip2Ms <= 1000;
+                console.log('[f113-flip]', JSON.stringify({ f_113_modeFlipSafety, flip1, flip2, flip1Ms, flip2Ms, lines: f113FullscreenLines.slice(markF113) }));
               }
               // (1b) f_c2f_flipGuardFull — THE robot test for the unsaved-work guard
               // (C2f-hotfix-1). The old relay leg could only prove the CLEAN path; this one
