@@ -7,7 +7,7 @@ import { DropMentionContent } from '../shared/DropMentionContent';
 import { getEditorialThemeColors } from '../../lib/editorialTheme';
 import { DropContextMenu, useContextMenu } from '../shared/DropContextMenu';
 import { useVaultStore } from '../../store/vault';
-import { prefetchImageMedia, prefetchPreviewPayload } from '../../lib/previewPayloadCache';
+import { prefetchImageMedia, prefetchPreviewPayload, prebufferVideoMedia, putCachedPreviewPayload } from '../../lib/previewPayloadCache';
 import { useVideoThumbnail } from '../../hooks/useVideoThumbnail';
 
 interface EditorialDropItemProps {
@@ -144,14 +144,25 @@ export const EditorialDropItem = memo(function EditorialDropItem({
 
   // Lazy payload load — the desktop analogue of the web's lazy decrypt: text bodies come over
   // IPC; binaries resolve to opaque media:// URLs streamed (and range-served) by main.
+  // Round 112 (web #235 port): a COMPLETED load banks its payload into the shared preview
+  // cache — the card's in-view load IS the web's card decrypt, so handing the finished result
+  // to the shelf makes the click a warm hit with zero loading frame. Banked only when the
+  // payload is COMPLETE for the modal's cache shape (EditorialPreviewModal mount effect): a
+  // text-format FILE drop (isTextFile && type 'file') needs BOTH text and fileUrl but this
+  // load fetches only fileUrl, so banking it would poison the modal's hit with an empty body
+  // (the FIX 14 poisoning rule). Freshness rides the round-110 fingerprints: contentKey
+  // changes re-run this load, which re-banks fresh — plus the App.tsx edit-success invalidate.
   useEffect(() => {
     async function load() {
       if (!inView) return;
       if (loadedKeyRef.current !== null && loadedKeyRef.current === contentKey) return;
       hasLoaded.current = true;
       try {
+        let text = '';
+        let bankFileUrl: string | null = null;
+        let bankImageUrl: string | null = null;
         if (drop.type === 'text') {
-          const text = await fetchTextPayload(drop.id);
+          text = await fetchTextPayload(drop.id);
           setTextContent(text);
         }
         if (drop.type === 'file' || drop.isDrawing) {
@@ -160,14 +171,28 @@ export const EditorialDropItem = memo(function EditorialDropItem({
           const kind = drop.isDrawing ? drawingMediaKind(drop) : 'file';
           const url = await getMediaUrl(drop.id, kind);
           setFileUrl(url);
+          // Round 112 bank mapping = the modal's own fetch branches: a type-'file' drop's URL
+          // is the modal's fileUrl (its branch at EditorialPreviewModal.tsx:101); a drawing's
+          // slot URL is additionally its imageUrl (its branch at :109) so the text-body image
+          // render (:307) and the local-drawing render both hit warm.
+          if (drop.type === 'file') bankFileUrl = url;
+          if (drop.isDrawing) bankImageUrl = url;
         }
         if (hasAttachedImage) {
           const url = await getMediaUrl(drop.id, 'image');
           setImageUrl(url);
+          bankImageUrl = url;
         }
         loadedKeyRef.current = contentKey;
+        if (!(drop.type === 'file' && isTextFile(drop))) {
+          putCachedPreviewPayload(drop.id, {
+            text,
+            fileUrl: bankFileUrl,
+            imageUrl: bankImageUrl,
+          });
+        }
       } catch {
-        /* card stays in its placeholder state */
+        /* card stays in its placeholder state — and nothing is banked */
       }
     }
     void load();
@@ -237,6 +262,34 @@ export const EditorialDropItem = memo(function EditorialDropItem({
       prefetchImageMedia(() => getMediaUrl(drop.id, 'file'));
     } else if (hasAttachedImage) {
       prefetchImageMedia(() => getMediaUrl(drop.id, 'image'));
+    } else if (drop.isDrawing) {
+      prefetchImageMedia(() => getMediaUrl(drop.id, drawingMediaKind(drop)));
+    }
+  };
+
+  // Round 112 — video hover pre-stage (web #235's desktop hover, ported): a settled fine
+  // pointer on a video card starts the offscreen prebuffer so the click finds the head already
+  // served. Sweeping past never triggers (100 ms settle, mouse only — a touch tap synthesizes
+  // mouse/pointer enters). Selection mode never pre-stages (the FIX 14 rule).
+  const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (hoverTimerRef.current !== null) clearTimeout(hoverTimerRef.current);
+  }, []);
+
+  const handleVideoPointerEnter = (e: React.PointerEvent) => {
+    if (selectionMode || e.pointerType !== 'mouse') return;
+    if (drop.type !== 'file' || !isVideo) return;
+    if (hoverTimerRef.current !== null) clearTimeout(hoverTimerRef.current);
+    hoverTimerRef.current = setTimeout(() => {
+      hoverTimerRef.current = null;
+      prebufferVideoMedia(async () => fileUrl ?? (await getMediaUrl(drop.id, 'file')));
+    }, 100);
+  };
+
+  const handleVideoPointerLeave = () => {
+    if (hoverTimerRef.current !== null) {
+      clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
     }
   };
 
@@ -248,6 +301,8 @@ export const EditorialDropItem = memo(function EditorialDropItem({
     <div
       ref={cardRef}
       onMouseEnter={handleHoverPrefetch}
+      onPointerEnter={handleVideoPointerEnter}
+      onPointerLeave={handleVideoPointerLeave}
       onClick={() => selectionMode ? onSelect(drop.id) : onPreview(drop)}
       {...contextMenuProps}
       className={`relative select-none ${tc.cardBg} ${tc.roundedClass} border ${tc.border} transition-all cursor-pointer group overflow-hidden ${

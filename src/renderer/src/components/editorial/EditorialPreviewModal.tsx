@@ -11,6 +11,7 @@ import { getEditorialThemeColors } from '../../lib/editorialTheme';
 import { DropMentionContent } from '../shared/DropMentionContent';
 import { useVaultStore } from '../../store/vault';
 import { getCachedPreviewPayload, putCachedPreviewPayload } from '../../lib/previewPayloadCache';
+import type { PreviewPayload } from '../../lib/previewPayloadCache';
 import type { DropDTO } from '../../../../preload/apiTypes';
 
 interface EditorialPreviewModalProps {
@@ -31,6 +32,12 @@ interface EditorialPreviewModalProps {
    * the parent patches the list in place (animated demotion, no reload). Called with no
    * argument only if the patched record was unavailable (parent falls back to a refresh). */
   onChanged?: (updated?: DropDTO) => void;
+  /** Round 112b (defect #31): the payload the MOUNT paints from — the open path consults
+   * the shelf synchronously (web parity, page.tsx:584-600) so frame 1 carries content
+   * instead of one empty body frame. Read ONLY by the useState initializers below; trail
+   * swaps keep the modal mounted and ride the effect as before (investigation 31: swaps
+   * never painted an empty frame). */
+  seed?: PreviewPayload | null;
 }
 
 const SUPPORTED_VIDEO_TYPES = new Set(['video/mp4', 'video/webm', 'video/ogg']);
@@ -41,7 +48,7 @@ const SUPPORTED_VIDEO_TYPES = new Set(['video/mp4', 'video/webm', 'video/ogg']);
  * YouTube iframe are stripped — links render as text (offline-first); Download uses the
  * native Save As dialog every time.
  */
-export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 'light', isLoading = false, allDrops = [], onPreview, onEdit, onMove, onChanged }: EditorialPreviewModalProps) {
+export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 'light', isLoading = false, seed = null, allDrops = [], onPreview, onEdit, onMove, onChanged }: EditorialPreviewModalProps) {
   useBodyScrollLock();
   // Esc routes through the same close path as the X (polish sweep #3).
   useEscapeClose(true, onClose);
@@ -50,9 +57,13 @@ export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 
   // Local flag keeps the button honest between the patch landing and the parent refresh.
   const [reminderDismissed, setReminderDismissed] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [textContent, setTextContent] = useState<string>('');
-  const [fileUrl, setFileUrl] = useState<string | null>(null);
-  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  // Round 112b (#31): initial values come from the mount seed so the FIRST paint carries
+  // the payload (web parity). The mount effect below still runs — its reset + cache-hit
+  // re-set batch into one commit of identical content (invisible); on a miss it still
+  // shows the honest skeleton. Never read after mount: trail swaps ride the effect.
+  const [textContent, setTextContent] = useState<string>(seed?.text ?? '');
+  const [fileUrl, setFileUrl] = useState<string | null>(seed?.fileUrl ?? null);
+  const [imageUrl, setImageUrl] = useState<string | null>(seed?.imageUrl ?? null);
   // FIX 8: REAL loading only — true while a cache-miss payload fetch is in flight. A cache hit
   // restores synchronously and this never turns on (zero loading frame on Back).
   const [internalLoading, setInternalLoading] = useState(false);

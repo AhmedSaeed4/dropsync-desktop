@@ -5,7 +5,11 @@
  * flashing a loading frame. Cached entries restore with ZERO fetches.
  *
  * Deliberately memory-only (module-level Map — nothing persists to disk, nothing survives an
- * app restart) and deliberately tiny (10 entries). Invalidation contract: edit-success and
+ * app restart). Capped at 30 entries (round 112 — web #235's shelf size: the CARD now banks
+ * every in-view load, so the shelf holds a whole screen of prepared drops; entries carry text
+ * bodies + media:// token URLs, never media bytes, so count-only capping stays sound — the
+ * web needed a 30 MB budget only because it banks full base64 payloads). Invalidation
+ * contract: edit-success and
  * deletion paths call invalidate/clear (wired in App.tsx) so stale content can never be served;
  * media:// URLs stored here are session-scoped tokens that stay valid for the app's lifetime.
  */
@@ -18,7 +22,7 @@ export interface PreviewPayload {
   imageUrl: string | null;
 }
 
-const CAPACITY = 10;
+const CAPACITY = 30;
 
 const cache = new Map<string, PreviewPayload>();
 
@@ -98,6 +102,7 @@ export function prefetchImageMedia(resolveUrl: () => Promise<string | null>): vo
     .then((url) => {
       if (!url || inFlightPrefetches.has(url)) return;
       inFlightPrefetches.add(url);
+      imageWarmCount++;
       const img = new Image();
       img.decoding = 'async';
       const done = () => {
@@ -109,5 +114,58 @@ export function prefetchImageMedia(resolveUrl: () => Promise<string | null>): vo
     })
     .catch(() => {
       /* resolve failure = normal cold load later */
+    });
+}
+
+// ---- Round 112 — video hover prebuffer (web #235's prebuiltVideoUrl, desktop shape) --------
+// All desktop videos stream through media:// (range-served, decrypted on demand by main), so
+// unlike the web's data-URL videos there is nothing to pre-convert: the faithful port is a
+// BEST-EFFORT head start. A settled hover starts an offscreen <video preload="auto"> so main
+// has already served + decrypted the head ranges by click time; the GUARANTEED instant-open
+// gain for videos lives in the card's shelf banking, not here. Fire-and-forget; the element
+// releases its decoder + in-flight range requests on canplay/error/timeout. Done-markers are
+// plain URL strings (no retained media), so the set needs no byte budget; a failed prebuffer
+// just means a normal cold start later.
+
+const prebufferDoneUrls = new Set<string>();
+let prebufferCount = 0;
+let imageWarmCount = 0;
+
+/** Dev battery probe — round-112 legs (started prebuffers; image warm decodes). */
+export function previewPrebufferCount(): number {
+  return prebufferCount;
+}
+
+/** Dev battery probe — round-112 legs. */
+export function previewImageWarmCount(): number {
+  return imageWarmCount;
+}
+
+export function prebufferVideoMedia(resolveUrl: () => Promise<string | null>): void {
+  void resolveUrl()
+    .then((url) => {
+      if (!url || prebufferDoneUrls.has(url) || inFlightPrefetches.has(`prebuffer:${url}`)) return;
+      inFlightPrefetches.add(`prebuffer:${url}`);
+      prebufferCount++;
+      const video = document.createElement('video');
+      video.preload = 'auto';
+      video.muted = true;
+      let timer = 0;
+      const release = () => {
+        video.removeEventListener('canplay', release);
+        video.removeEventListener('error', release);
+        window.clearTimeout(timer);
+        video.removeAttribute('src'); // releases the decoder + in-flight range requests
+        video.load();
+        inFlightPrefetches.delete(`prebuffer:${url}`);
+        prebufferDoneUrls.add(url);
+      };
+      timer = window.setTimeout(release, 10_000);
+      video.addEventListener('canplay', release);
+      video.addEventListener('error', release);
+      video.src = url;
+    })
+    .catch(() => {
+      /* resolve failure = normal cold start later */
     });
 }
