@@ -515,6 +515,10 @@ export interface CloudController {
     clipboardEvilReq: boolean;
     checkClipboardSite: boolean;
     checkClipboardEvil: boolean;
+    /** #30 — the browser-like fullscreen scope, both paths (order §4 FIX H). */
+    fullscreenYoutube: boolean;
+    fullscreenEvilReq: boolean;
+    checkFullscreenSite: boolean;
   }>;
   // ==== PAC-2 FIX B — the share picker =======================================================
   /** The picker page's handshake/relay targets (registered ONCE in index.ts's registerIpc —
@@ -649,7 +653,7 @@ function attachGuards(
 /** C2f FIX 1 — security lockdown for the PILL layer (a second, tiny webContents): local file
  * only, no navigation ever, no window.open, no permission requests granted. Any violation is
  * logged loudly — this layer must stay a dumb button. */
-function attachPillLockdown(wc: Electron.WebContents): void {
+function attachPillLockdown(wc: Electron.WebContents, localMainWc?: Electron.WebContents): void {
   wc.on('will-navigate', (e) => {
     e.preventDefault();
     console.log('[pill] nav-denied (pill layer never navigates)');
@@ -658,9 +662,37 @@ function attachPillLockdown(wc: Electron.WebContents): void {
     console.log('[pill] window-open-denied', url.slice(0, 120));
     return { action: 'deny' };
   });
-  wc.session.setPermissionRequestHandler((_wc, permission, callback) => {
+  // #30 — this handler is SESSION-WIDE (default session): it also receives the LOCAL main
+  // window's requests, and its deny-all is what killed every Local fullscreen since C2f
+  // ([pill] permission-denied fullscreen — probe %TEMP%\f30probe\realprobe.log, 2026-09-15).
+  // Electron 43 routes HTML-fullscreen through HERE as permission 'fullscreen' (probe
+  // %TEMP%\f30probe\probe.log). Grant it ONLY for the Local main window's webContents
+  // (identity check); the trusted layers and every other default-session page stay fully
+  // denied — posture unchanged. Chromium gesture-gates fullscreen; the grant is silent.
+  wc.session.setPermissionRequestHandler((requestWc, permission, callback) => {
+    if (permission === 'fullscreen' && localMainWc && requestWc === localMainWc) {
+      console.log('[pill] permission-granted fullscreen (local main window)');
+      callback(true);
+      return;
+    }
     console.log('[pill] permission-denied', permission);
     callback(false);
+  });
+}
+
+/** #30 — HTML-fullscreen wiring: when a page asks for fullscreen, the WINDOW goes truly
+ * fullscreen; leaving (Esc / exit) restores it. ONE implementation shared by the Local
+ * renderer (index.ts) and the Cloud site view (ensureView) — probe-proven shape,
+ * %TEMP%\f30probe\probe.log (grant + wire ⇒ isFullScreen() true, clean exit). Safe per-wc:
+ * listeners attach per webContents, and each window has exactly one wiring site. */
+export function wireHtmlFullscreen(win: Electron.BrowserWindow, wc: Electron.WebContents): void {
+  wc.on('enter-html-full-screen', () => {
+    console.log('[fullscreen] enter-html-full-screen → window fullscreen');
+    if (!win.isDestroyed()) win.setFullScreen(true);
+  });
+  wc.on('leave-html-full-screen', () => {
+    console.log('[fullscreen] leave-html-full-screen → window restored');
+    if (!win.isDestroyed()) win.setFullScreen(false);
   });
 }
 
@@ -964,7 +996,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     });
     // Transparency is the whole trick — spike-proven under WSLg (STEP 0.5, 2026-08-26).
     pillView.setBackgroundColor('#00000000');
-    attachPillLockdown(pillView.webContents);
+    attachPillLockdown(pillView.webContents, mainWindow.webContents);
     // C2g-hotfix-1 §5 — capture the layer's own console (ring buffer) so the battery can prove
     // a clean load/click session instead of asserting silence by assumption.
     pillView.webContents.on('console-message', (_e, _level, message) => {
@@ -1110,7 +1142,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       },
     });
     faderView.setBackgroundColor('#00000000'); // WSLg-transparency-safe (pill precedent)
-    attachPillLockdown(faderView.webContents); // same trusted-layer lockdown: no nav, no popups
+    attachPillLockdown(faderView.webContents, mainWindow.webContents); // same trusted-layer lockdown: no nav, no popups
     faderView.webContents.once('did-finish-load', () => {
       faderLoaded = true;
       console.log('[fader] layer loaded');
@@ -1254,7 +1286,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       },
     });
     cardView.setBackgroundColor('#00000000'); // WSLg-transparency-safe (pill precedent, STEP 0.5)
-    attachPillLockdown(cardView.webContents); // same trusted-layer lockdown: no nav, no popups
+    attachPillLockdown(cardView.webContents, mainWindow.webContents); // same trusted-layer lockdown: no nav, no popups
     cardView.webContents.once('did-finish-load', () => onCardLoadFinished());
     void cardView.webContents.loadURL(cardPageUrl());
     cardView.setBounds(cardCollapsedBounds()); // COLLAPSED until a card actually shows
@@ -1397,7 +1429,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       },
     });
     statusView.setBackgroundColor('#00000000'); // WSLg-transparency-safe (pill precedent)
-    attachPillLockdown(statusView.webContents); // same trusted-layer lockdown: no nav, no popups
+    attachPillLockdown(statusView.webContents, mainWindow.webContents); // same trusted-layer lockdown: no nav, no popups
     statusView.webContents.once('did-finish-load', () => onStatusLoadFinished());
     void statusView.webContents.loadURL(statusPageUrl());
     statusView.setBounds(statusCollapsedBounds()); // COLLAPSED + hidden until a presentation
@@ -1856,7 +1888,14 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     const source = details.requestingUrl ?? (wc.isDestroyed() ? '' : wc.mainFrame.url);
     // PAC-2 FIX C — 'notifications' joins the allowlist (still strictly origin-gated below):
     // the site gates its own toasts on Notification.permission, which read 'denied' forever.
-    const ok = SITE_ALLOWED_PERMISSIONS.has(permission) && originOf(source) === CLOUD_ORIGIN;
+    // #30 (owner scope 2026-09-15: browser-like) — 'fullscreen' is granted for ANY origin the
+    // site view shows: requests arrive under the REQUESTING page's origin (youtube.com /
+    // youtube-nocookie embeds), so the CLOUD_ORIGIN gate below can never pass them. Chromium
+    // gesture-gates fullscreen; the grant is silent and promptless. strictNav (:634–646)
+    // already keeps foreign pages out of the view. Every OTHER permission stays strictly
+    // allowlist + site-origin.
+    const ok = permission === 'fullscreen'
+      || (SITE_ALLOWED_PERMISSIONS.has(permission) && originOf(source) === CLOUD_ORIGIN);
     // FIX C — EVERY verdict is loud, grants included (the mic bug taught us: an invisible
     // refusal path is undebuggable; the request log shows the EXACT permission string the
     // site sent, which is the evidence the allowlist must match).
@@ -1868,7 +1907,10 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     permission: string,
     requestingOrigin: string,
   ): boolean => {
-    const ok = SITE_ALLOWED_PERMISSIONS.has(permission) && originOf(requestingOrigin) === CLOUD_ORIGIN;
+    // #30 — same browser-like fullscreen scope as the REQUEST path above (symmetry; the
+    // Permissions API never queries fullscreen in practice, this keeps the two handlers true).
+    const ok = permission === 'fullscreen'
+      || (SITE_ALLOWED_PERMISSIONS.has(permission) && originOf(requestingOrigin) === CLOUD_ORIGIN);
     // FIX C — log EVERY invocation: what the site's Permissions-API query asked us, and what
     // we answered. If the query never consults this handler, the silence is itself evidence.
     console.log('[cloud] permission-check', permission, requestingOrigin, ok ? '→ granted' : '→ denied');
@@ -2250,6 +2292,11 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     // idle-clock feed below and the permission doorman). Attached HERE in ensureView so
     // every recreation of the view (dead-page retries) re-attaches.
     attachContextMenu(view.webContents, 'cloud-site');
+    // Round 113 (#30) — the site view's HTML-fullscreen wiring (same helper as Local,
+    // index.ts): the site's video player / an embedded YouTube page can take the window
+    // truly fullscreen. The fullscreen events come from Chromium OUTSIDE the page — no
+    // injection (invariant I6/I1). Attached HERE so every recreation re-attaches.
+    wireHtmlFullscreen(mainWindow, view.webContents);
     // C2h FIX 2 — cloud gestures feed the SAME idle-auto-lock clock as Local actions (owner
     // decision D-B). We sense INPUTS from OUTSIDE the page (main-process listener; this is NOT
     // site injection — we never execute/read anything in the site, invariant I6/I1). Buttons,
@@ -2279,7 +2326,23 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     return view;
   };
 
+  // #30 safety exit — a mode flip must never leave the window stuck fullscreen: if the
+  // fullscreen SOURCE is hidden or destroyed, its leave-html-full-screen event can never
+  // arrive. Also clears OUR Local page's element state so no ghost top-layer survives the
+  // flip (our own page — this is NOT site injection; the SITE page is never touched, I6/I1).
+  const endFullscreenIfActive = (why: string): void => {
+    if (mainWindow.isDestroyed()) return;
+    if (mainWindow.isFullScreen()) {
+      console.log('[fullscreen] mode-flip safety exit (' + why + ')');
+      mainWindow.setFullScreen(false);
+    }
+    void mainWindow.webContents
+      .executeJavaScript('try { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); } catch {}')
+      .catch(() => { /* best effort only */ });
+  };
+
   const show = (): void => {
+    endFullscreenIfActive('cloud show');
     const existed = view !== null; // FIX B — a freshly created view loads in ensureView itself
     const v = ensureView();
     // C3-hotfix-4 FIX C — refresh the void: cheap + idempotent, so a theme changed while
@@ -2313,6 +2376,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   };
 
   const hide = (): void => {
+    endFullscreenIfActive('cloud hide');
     if (view && shown) {
       mainWindow.contentView.removeChildView(view);
       shown = false;
@@ -2743,6 +2807,13 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
         clipboardEvilReq: await ask('clipboard-sanitized-write', 'https://evil.example/'),
         checkClipboardSite: sitePermissionCheck(null, 'clipboard-sanitized-write', CLOUD_ORIGIN),
         checkClipboardEvil: sitePermissionCheck(null, 'clipboard-sanitized-write', 'https://evil.example'),
+        // #30 — the browser-like fullscreen scope, both paths: youtube.com origin granted on
+        // the REQUEST path; evil.example granted TOO (origin-free BY DESIGN — the doorman
+        // does not origin-gate fullscreen; strictNav is what keeps foreign pages out of the
+        // view). CHECK path mirrors.
+        fullscreenYoutube: await ask('fullscreen', 'https://www.youtube.com/watch?v=abc'),
+        fullscreenEvilReq: await ask('fullscreen', 'https://evil.example/'),
+        checkFullscreenSite: sitePermissionCheck(null, 'fullscreen', CLOUD_ORIGIN),
       };
     },
     // ==== PAC-2 FIX B — the share picker =====================================================
