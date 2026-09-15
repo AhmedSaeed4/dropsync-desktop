@@ -17,7 +17,8 @@ import { EditorialTextModal, type TextModalCreatePayload, type TextModalEditUpda
 import { getEditorialThemeColors } from './lib/editorialTheme';
 import { dropDtoToDrop } from './lib/types';
 import { isTextFileDrop, drawingMediaKind } from './lib/dropsHelpers';
-import { invalidatePreviewPayload, clearPreviewPayloadCache, putCachedPreviewPayload } from './lib/previewPayloadCache';
+import { invalidatePreviewPayload, clearPreviewPayloadCache, putCachedPreviewPayload, getCachedPreviewPayload } from './lib/previewPayloadCache';
+import type { PreviewPayload } from './lib/previewPayloadCache';
 import { Toast } from './components/shared/Toast';
 import { requestModeSwitch } from './lib/modeSwitchGuard';
 
@@ -173,6 +174,22 @@ function AppBody() {
   // Export-back target (M5): 'personal' or a workspace id, plus its display name.
   const [exportTarget, setExportTarget] = useState<{ scope: 'personal' | { workspaceId: string }; name: string } | null>(null);
   const [previewDrop, setPreviewDrop] = useState<Drop | null>(null);
+  // Round 112b (defect #31): the seed the next preview MOUNT paints from. Web parity — the
+  // web's handlePreview hands the primed payload into setPreviewDrop synchronously on a
+  // shelf hit (page.tsx:584-600), so the modal's FIRST render already carries content. The
+  // desktop modal filled state inside its mount effect, which runs after first paint — the
+  // measured one-frame empty pop (investigation 31: 25/25 hit runs, 1-2 empty frames,
+  // ~32-48 ms, panel 142->236). Fresh mounts happen at exactly three sites (openPreview,
+  // handleEditClose, reopenSavedPreview); each seeds from the CURRENT cache synchronously
+  // in the same batch as the mount, so a stale seed can never paint: the id-guard at the
+  // render site plus overwrite-before-mount keep any lingering value inert. Seeds ride
+  // useState INITIAL values in the modal (EditorialPreviewModal) — trail swaps stay mounted
+  // and keep riding the effect exactly as before (measured: no empty frame on swaps).
+  const [previewSeed, setPreviewSeed] = useState<{ dropId: string; payload: PreviewPayload } | null>(null);
+  const seedPreviewFor = useCallback((drop: Drop) => {
+    const payload = getCachedPreviewPayload(drop.id);
+    setPreviewSeed(payload ? { dropId: drop.id, payload } : null);
+  }, []);
   // FIX 18: ref mirror of previewDrop — openEditModal must capture the return context
   // SYNCHRONOUSLY (before its await), exactly like the web's previewDropRef pattern.
   const previewDropRef = useRef<Drop | null>(null);
@@ -291,9 +308,10 @@ function AppBody() {
   // Preview trail: mention chips push here so ← walks back through A→B→C. FIX 8: no fake
   // loading timer — a cache miss shows the modal's REAL loading; a hit is instant.
   const openPreview = useCallback((drop: Drop) => {
+    seedPreviewFor(drop);
     setPreviewTrail((trail) => [...trail, drop]);
     setPreviewDrop(drop);
-  }, []);
+  }, [seedPreviewFor]);
 
   const previewBack = useCallback(() => {
     setPreviewTrail((trail) => {
@@ -410,16 +428,20 @@ function AppBody() {
     setEditDrop(null);
     editOriginRef.current = null;
     if (!origin) return;
+    seedPreviewFor(origin);
     setPreviewDrop(origin);
-  }, []);
+  }, [seedPreviewFor]);
 
   /** FIX 18 — save-path reopen: REPLACE the trail tail instead of pushing (web's reopenPreview
    * never touches dropTrail either), so A→B→edit-B→save lands on B′ with Back still going to A,
    * never to a stale duplicate of B. */
   const reopenSavedPreview = useCallback((d: Drop) => {
+    // Seed AFTER primeSavedPreviewPayload has re-banked the SAVED version (the caller
+    // awaits it) — frame 1 must paint the NEW content, never the pre-edit seed (#31).
+    seedPreviewFor(d);
     setPreviewTrail((trail) => (trail.length > 0 ? [...trail.slice(0, -1), d] : [d]));
     setPreviewDrop(d);
-  }, []);
+  }, [seedPreviewFor]);
 
   /**
    * FIX 18 — prime the payload cache with the SAVED version before reopening the preview
@@ -867,6 +889,7 @@ function AppBody() {
       {previewDrop && (
         <EditorialPreviewModal
           drop={previewDrop}
+          seed={previewSeed && previewSeed.dropId === previewDrop.id ? previewSeed.payload : null}
           onClose={closePreview}
           onBack={previewBack}
           canBack={previewTrail.length > 1}
