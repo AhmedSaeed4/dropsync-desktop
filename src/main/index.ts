@@ -39,6 +39,9 @@ import {
   type UpdateContentArgs,
   type UpdateMetaPatch,
 } from './vault/dropOps.ts';
+// Round 114 — the test reset rides the same import: the §8.2 battery's diskCache leg calls it
+// directly (same process). getYouTubeThumbnail backs the youtube:getThumbnail handler below.
+import { getYouTubeThumbnail, testResetYouTubeThumbMemoryCaches } from './youtubeThumbs.ts';
 
 // Media scheme must be registered as privileged BEFORE app ready.
 protocol.registerSchemesAsPrivileged([
@@ -4318,6 +4321,90 @@ function createWindow(): void {
                 await sleep(300);
                 const f_113_modeFlipSafety = flip1 && flip2 && flip1Ms <= 1000 && flip2Ms <= 1000;
                 console.log('[f113-flip]', JSON.stringify({ f_113_modeFlipSafety, flip1, flip2, flip1Ms, flip2Ms, lines: f113FullscreenLines.slice(markF113) }));
+              }
+              // ==== Round 114 (#32) — f_114_* battery legs (order §8.2) ===================
+              // Main-side legs call the youtubeThumbs module DIRECTLY (same process) against
+              // the stub CDN (DROPSYNC_YT_THUMB_BASE, set by the boot wrapper); one stdout
+              // line per leg, f113-style. The f113 block is the shape precedent.
+              if (process.env.DROPSYNC_F114 === '1') {
+                const { createHash } = await import('node:crypto');
+                const F114_STUB_JPEG_SHA = 'e481882ffdaedcf3350af17a33c4e19d2663ded13d984af3af477e1f9590e060';
+                const decodedSha = (dataUrl: string): string =>
+                  createHash('sha256').update(Buffer.from(String(dataUrl).slice(String(dataUrl).indexOf(',') + 1), 'base64')).digest('hex');
+                const stubBase = process.env.DROPSYNC_YT_THUMB_BASE ?? '';
+                const stubCount = async (): Promise<number> => {
+                  try {
+                    const r = await fetch(stubBase + '/__count');
+                    return ((await r.json()) as { count: number }).count;
+                  } catch {
+                    return -1;
+                  }
+                };
+                // f_114_moduleFetch — first fetch: stub hit, bytes match the frozen stub JPEG.
+                {
+                  const before = await stubCount();
+                  const u = await getYouTubeThumbnail('f114live001');
+                  const after = await stubCount();
+                  const f_114_moduleFetch = typeof u === 'string' && u.startsWith('data:image/jpeg;base64,')
+                    && after === before + 1 && decodedSha(u) === F114_STUB_JPEG_SHA;
+                  console.log('[f114-moduleFetch]', JSON.stringify({ f_114_moduleFetch, stubBefore: before, stubAfter: after, decodedSha: u ? decodedSha(u) : null, expectSha: F114_STUB_JPEG_SHA, len: u ? u.length : 0, online: net.isOnline(), stubBase }));
+                }
+                // f_114_memoryCache — same id again: served from memory, no stub hit.
+                {
+                  const before = await stubCount();
+                  const u = await getYouTubeThumbnail('f114live001');
+                  const after = await stubCount();
+                  const f_114_memoryCache = typeof u === 'string' && u.startsWith('data:image/jpeg;base64,') && after === before;
+                  console.log('[f114-memoryCache]', JSON.stringify({ f_114_memoryCache, stubBefore: before, stubAfter: after, len: u ? u.length : 0 }));
+                }
+                // f_114_diskCache — memory cleared: the DISK cache serves, still no stub hit.
+                {
+                  testResetYouTubeThumbMemoryCaches();
+                  const before = await stubCount();
+                  const u = await getYouTubeThumbnail('f114live001');
+                  const after = await stubCount();
+                  const f_114_diskCache = typeof u === 'string' && u.startsWith('data:image/jpeg;base64,') && after === before
+                    && decodedSha(u) === F114_STUB_JPEG_SHA;
+                  console.log('[f114-diskCache]', JSON.stringify({ f_114_diskCache, stubBefore: before, stubAfter: after, len: u ? u.length : 0 }));
+                }
+                // f_114_offlineNull — online:false ⇒ null with NO fetch; a following ONLINE
+                // call for the SAME id succeeds (offline never poisons any cache).
+                {
+                  const before = await stubCount();
+                  const off = await getYouTubeThumbnail('f114fresh01', { online: false });
+                  const midCount = await stubCount();
+                  const on = await getYouTubeThumbnail('f114fresh01');
+                  const after = await stubCount();
+                  const f_114_offlineNull = off === null && midCount === before
+                    && typeof on === 'string' && on.startsWith('data:image/jpeg;base64,') && after === before + 1;
+                  console.log('[f114-offlineNull]', JSON.stringify({ f_114_offlineNull, offlineResult: off, stubBefore: before, stubMidOffline: midCount, stubAfterOnline: after, online: net.isOnline() }));
+                }
+                // f_114_deadVideo — 404 twice in a row: the FIRST call may hit the stub (the
+                // 404 IS the server's answer); the SECOND must ride the negative cache (no hit).
+                {
+                  const before = await stubCount();
+                  const d1 = await getYouTubeThumbnail('dead1234567');
+                  const midCount = await stubCount();
+                  const d2 = await getYouTubeThumbnail('dead1234567');
+                  const after = await stubCount();
+                  const f_114_deadVideo = d1 === null && d2 === null && after === midCount;
+                  console.log('[f114-deadVideo]', JSON.stringify({ f_114_deadVideo, first: d1, second: d2, stubBefore: before, stubAfterFirst: midCount, stubAfterSecond: after }));
+                }
+                // f_114_offlineDiskHit (114-HOTFIX-1 §3) — online fetch (+1 stub hit) → memory
+                // reset → OFFLINE call: the DISK tier serves the data URL with ZERO stub hits.
+                // The parent round's tier order returned null here (gate ran before disk).
+                {
+                  const beforeOnline = await stubCount();
+                  const on = await getYouTubeThumbnail('f114cache01'); // online — fetches once
+                  const afterOnline = await stubCount();
+                  testResetYouTubeThumbMemoryCaches();
+                  const before = await stubCount();
+                  const off = await getYouTubeThumbnail('f114cache01', { online: false });
+                  const after = await stubCount();
+                  const fromOffline = typeof off === 'string' && off.startsWith('data:image/jpeg;base64,');
+                  const f_114_offlineDiskHit = fromOffline && after === before;
+                  console.log('[f114-offlineDiskHit]', JSON.stringify({ f_114_offlineDiskHit, fromOffline, stubHits: after - before, stubBeforeOnline: beforeOnline, stubAfterOnline: afterOnline, stubBefore: before, stubAfter: after, onlineLen: on ? on.length : 0, offlineLen: off ? off.length : 0 }));
+                }
               }
               // (1b) f_c2f_flipGuardFull — THE robot test for the unsaved-work guard
               // (C2f-hotfix-1). The old relay leg could only prove the CLEAN path; this one
@@ -8788,6 +8875,10 @@ function registerIpc(): void {
       .map((d) => d.id);
     return { ...result, updatedDrops: updatedDrops.map((id) => manager.getDropMeta(id)).filter((d): d is NonNullable<typeof d> => !!d) };
   });
+
+  // ---- YouTube thumbnails (round 114): fetch-once-then-cache, main-process only — the
+  // renderer stays zero-network (CSP untouched). Null offline/dead ⇒ the card's placeholder.
+  handle('youtube:getThumbnail', (_e, videoId: string) => getYouTubeThumbnail(videoId));
 
   // ---- Open in browser (https-only — the one shell surface the renderer gets)
   handle('shell:openExternal', async (_e, url: string) => {

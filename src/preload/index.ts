@@ -60,6 +60,8 @@ const api: DropsyncBridge = {
   },
   youtube: {
     refreshTitles: (spaceId: string) => invoke('youtube:refreshTitles', spaceId),
+    // Round 114 — fetch-once-then-cache thumbnail; null offline/dead (placeholder stays).
+    getThumbnail: (videoId: string) => invoke('youtube:getThumbnail', videoId),
   },
   mode: {
     get: () => invoke<'cloud' | 'local'>('mode:get'),
