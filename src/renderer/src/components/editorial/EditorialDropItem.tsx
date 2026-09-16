@@ -113,6 +113,8 @@ export const EditorialDropItem = memo(function EditorialDropItem({
   const [fileUrl, setFileUrl] = useState<string | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
+  // Round 114 — YouTube thumbnail data URL from main (fetch-once-then-cache); null = placeholder.
+  const [ytThumb, setYtThumb] = useState<string | null>(null);
   const { fetchTextPayload, getMediaUrl } = useVaultStore();
 
   const { ref: cardRef, inView } = useInView<HTMLDivElement>('1000px 0px');
@@ -202,10 +204,30 @@ export const EditorialDropItem = memo(function EditorialDropItem({
     ? (textContent || (hasLoaded.current ? '' : ''))
     : '';
 
-  // YouTube links are detected OFFLINE; thumbnails stay a local placeholder (zero-network audit).
+  // YouTube links are detected OFFLINE; since round 114 the THUMBNAIL rides the main-process
+  // fetch-once-then-cache (null offline/dead ⇒ placeholder). Detection itself needs no net,
+  // and the renderer still makes zero direct network requests (CSP untouched).
   const youtubeVideoId = drop.type === 'text' && !drop.isDrawing
     ? getYouTubeVideoId(displayContent)
     : null;
+
+  // Round 114 — YouTube thumbnail (fetch-once-then-cache). Rides the SAME one-shot in-view
+  // latch as the payload load; youtubeVideoId exists only after the text payload fills, so
+  // [inView, youtubeVideoId] is the earliest a card can ask. Null (offline/dead) keeps the
+  // placeholder; the retry is the card's next mount (space switch / app restart).
+  // PLACEMENT NOTE (deviation D-1, flagged in the report): the order anchored this effect
+  // directly after the load effect, but its dependency array evaluates youtubeVideoId —
+  // declared just above — so THAT anchor is a use-before-declaration compile error
+  // (TS2448/TS2454, raw: %TEMP%\f114\typecheck-web-1-FAILED-d1.txt). The effect sits below the
+  // declaration instead; the code itself is the order's, verbatim.
+  useEffect(() => {
+    if (!inView || !youtubeVideoId) return;
+    let cancelled = false;
+    window.dropsync.youtube.getThumbnail(youtubeVideoId).then((dataUrl) => {
+      if (!cancelled && dataUrl) setYtThumb(dataUrl);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [inView, youtubeVideoId]);
 
   // FIX 20: a drawing's thumbnail comes from whichever slot the resolver picked — no mimeType
   // gating (imported drawings carry no record.mimeType at all).
@@ -213,7 +235,8 @@ export const EditorialDropItem = memo(function EditorialDropItem({
   const hasThumbnail =
     (isImage && !!fileUrl) ||
     (drop.type === 'text' && hasAttachedImage && !!imageUrl) ||
-    !!drawingThumbUrl;
+    !!drawingThumbUrl ||
+    (!!youtubeVideoId && !!ytThumb);
 
   const handleSaveAs = async (e?: React.MouseEvent) => {
     e?.stopPropagation();
@@ -294,7 +317,7 @@ export const EditorialDropItem = memo(function EditorialDropItem({
   };
 
   const thumbnailSrc = hasThumbnail
-    ? (drop.isDrawing ? drawingThumbUrl : isImage ? fileUrl : imageUrl)
+    ? (drop.isDrawing ? drawingThumbUrl : (fileUrl ?? imageUrl ?? ytThumb))
     : null;
 
   return (

@@ -225,6 +225,8 @@ export interface DropsyncBridge {
   };
   youtube: {
     refreshTitles(spaceId: string): Promise<RefreshTitlesResultDTO>;
+    /** Round 114 — fetch-once-then-cache thumbnail; null offline/dead/unknown. */
+    getThumbnail(videoId: string): Promise<string | null>;
   };
   /** C1 — desktop mode. Cloud = embedded real site; Local = the encrypted vault UI.
    * (C2f: the porch-era probeEmail/devC2 members are gone with the porch.) */
