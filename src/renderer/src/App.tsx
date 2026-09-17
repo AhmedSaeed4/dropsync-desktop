@@ -806,6 +806,14 @@ function AppBody() {
         onDeleteSpace={handleDeleteSpace}
       />
 
+      {/* #34 layout parity: on the web the always-rendered zero-width chat panel adds a
+          second wide:gap-[60px] on the right (EditorialLayout.tsx:614 + :520), so the web's
+          drops column and header buttons both end 140px from the window edge. The desktop has
+          no chat panel, so the right column carries wide:mr-[60px] — 80px page padding + 60px
+          = the web's 140. 115-HOTFIX-1: a wide:pr-[140px] token on this main CANNOT do the
+          job — TW4 emits padding-right:140px BEFORE padding-inline:80px, and the later
+          padding-inline wins the cascade (proven by CDP stylesheet scan, %TEMP%\f115\,
+          2026-09-17); margin-* never interacts with padding-*. */}
       <main id="app-main" className="flex flex-col wide:flex-row flex-1 min-h-0 overflow-y-auto overscroll-contain editorial-scroll-hide wide:overflow-hidden py-6 wide:py-[45px] px-4 sm:px-6 lg:px-[80px] wide:gap-[60px] gap-6">
         {/* Left column: Import card + Status + Theme */}
         <div className={`wide:border-r ${tc.border} wide:overflow-y-auto editorial-scroll-hide wide:min-h-0 wide:pr-5 w-full min-w-0 wide:flex-1 wide:pl-11`}>
@@ -870,7 +878,7 @@ function AppBody() {
         </div>
 
         {/* Right column: Drops list */}
-        <div className="shrink-0 wide:overflow-y-auto editorial-scroll-hide wide:min-h-0 w-full wide:w-[520px] wide:min-w-[520px]">
+        <div className="shrink-0 wide:overflow-y-auto editorial-scroll-hide wide:min-h-0 w-full wide:w-[520px] wide:min-w-[520px] wide:mr-[60px]">
           <EditorialDropList
             drops={drops}
             loading={loading}
