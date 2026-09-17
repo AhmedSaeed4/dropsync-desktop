@@ -5,6 +5,7 @@ import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } 
 import type { Category, Drop } from '../../lib/types';
 import { EditorialDropItem } from './EditorialDropItem';
 import { EditorialMoveDropModal } from './EditorialMoveDropModal';
+import HoldToDeleteButton from './HoldToDeleteButton';
 import { UndoToast } from '../shared/UndoToast';
 import { Toast } from '../shared/Toast';
 import { isReminderFiredShared, isReminderGlowingForViewer, sortUnpinned, type DropSortMode } from '../../lib/dropsHelpers';
@@ -94,13 +95,12 @@ export function EditorialDropList({
   const { settings, updateSettings, removeDropInPlace } = useVaultStore();
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  // FIX 5 (web #225): two-tap bulk delete — first click ARMS ("Confirm delete N"), second click
-  // within the window deletes. Auto-disarms after 3 s, on any click outside the button, on
-  // Cancel / Select-all-deselect, or when the selection empties. The undo-toast pipeline for
-  // SINGLE deletes sits downstream of its own path and is untouched by this guard.
-  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
-  const bulkDeleteRef = useRef<HTMLButtonElement>(null);
+  // FIX 5 (web #225) superseded 2026-09-17 (#33): the web replaced the two-tap confirm with
+  // the press-and-hold HoldToDeleteButton — this file now carries the same component and the
+  // web's deleting/holdDone sequence (D10). The undo-toast pipeline for SINGLE deletes sits
+  // downstream of its own path and is untouched.
   const [deleting, setDeleting] = useState(false);
+  const [holdDone, setHoldDone] = useState(false);
   // Round 107 (order §4 FIX G) — bulk move/copy: the modal's drops, the in-modal error banner
   // (web's alert() has no desktop counterpart, D16) and the busy flag the modal's close paths veto on.
   const [bulkMoveDrops, setBulkMoveDrops] = useState<Drop[] | null>(null);
@@ -113,30 +113,6 @@ export function EditorialDropList({
 
   useEffect(() => { setSelectedCategory('all'); }, [categories]);
   const [confirmDeleteCategory, setConfirmDeleteCategory] = useState<string | null>(null);
-
-  // Auto-disarm after 3 s (the confirmation window).
-  useEffect(() => {
-    if (!confirmBulkDelete) return;
-    const t = setTimeout(() => setConfirmBulkDelete(false), 3000);
-    return () => clearTimeout(t);
-  }, [confirmBulkDelete]);
-
-  // Any click outside the confirm button disarms (pointer-level, like web #225); clicks on the
-  // button itself are ignored so the second tap can fire.
-  useEffect(() => {
-    if (!confirmBulkDelete) return;
-    const onDocPointerDown = (e: PointerEvent) => {
-      if (bulkDeleteRef.current && e.target instanceof Node && bulkDeleteRef.current.contains(e.target)) return;
-      setConfirmBulkDelete(false);
-    };
-    document.addEventListener('pointerdown', onDocPointerDown);
-    return () => document.removeEventListener('pointerdown', onDocPointerDown);
-  }, [confirmBulkDelete]);
-
-  // Disarm the moment the selection empties (reads the LIVE set reactively).
-  useEffect(() => {
-    if (selectedIds.size === 0) setConfirmBulkDelete(false);
-  }, [selectedIds]);
 
   const tc = getEditorialThemeColors(theme);
   const font = tc.fontClass;
@@ -153,20 +129,9 @@ export function EditorialDropList({
   const selectAll = () => {
     if (selectedIds.size === filteredDrops.length) {
       setSelectedIds(new Set());
-      setConfirmBulkDelete(false);
     } else {
       setSelectedIds(new Set(filteredDrops.map(d => d.id)));
     }
-  };
-
-  // FIX 5: arm on first tap, delete on the second tap inside the window.
-  const handleBulkDeleteClick = () => {
-    if (!confirmBulkDelete) {
-      setConfirmBulkDelete(true);
-      return;
-    }
-    setConfirmBulkDelete(false);
-    void handleBulkDelete();
   };
 
   const handleBulkDelete = async () => {
@@ -174,23 +139,27 @@ export function EditorialDropList({
     setDeleting(true);
     const selectedDrops = filteredDrops.filter(d => selectedIds.has(d.id));
     // FIX 17: ONE deletion pipeline. performBatchDelete tombstones every selected id
-    // SYNCHRONOUSLY inside THIS click's commit — the same hide mechanism, start timing,
+    // SYNCHRONOUSLY inside THIS hold's commit — the same hide mechanism, start timing,
     // exit tween and neighbor glide as the single-delete undo flow (requestDelete), for a
     // batch of 1 or N. The IPC deletes commit behind the curtain through removeDropInPlace
     // (zero visual event). No undo toast is created — web parity (requestDelete stays
     // single-only; the web's bulk path likewise bypasses the undo store).
     await performBatchDelete(selectedDrops, handleCommittedDelete);
-    setSelectedIds(new Set());
-    setSelectionMode(false);
     selectedDrops.forEach(d => invalidatePreviewPayload(d.id));
     setDeleting(false);
-    setConfirmBulkDelete(false);
+    setHoldDone(true);
+    // D10 sequence (web parity): the green "Deleted ✓" beat plays, THEN the toolbar closes
+    // out — clear the selection, exit selection mode, drop the done beat.
+    window.setTimeout(() => {
+      setSelectedIds(new Set());
+      setSelectionMode(false);
+      setHoldDone(false);
+    }, 650);
   };
 
   const cancelSelection = () => {
     setSelectedIds(new Set());
     setSelectionMode(false);
-    setConfirmBulkDelete(false);
   };
 
   // Round 107 (order §4 FIX G) — bulk move/copy. THIN by design: main owns category
@@ -777,14 +746,14 @@ export function EditorialDropList({
                     >
                       Move {selectedIds.size}
                     </button>
-                    <button
-                      ref={bulkDeleteRef}
-                      onClick={handleBulkDeleteClick}
-                      disabled={deleting}
-                      className={`text-xs ${font} px-3 py-1.5 ${tc.roundedClass} bg-red-500 text-white hover:bg-red-600 transition-colors disabled:opacity-50 flex items-center gap-1`}
-                    >
-                      {deleting ? 'Deleting...' : confirmBulkDelete ? `Confirm delete ${selectedIds.size}` : `Delete ${selectedIds.size}`}
-                    </button>
+                    <HoldToDeleteButton
+                      variant="full"
+                      count={selectedIds.size}
+                      deleting={deleting}
+                      done={holdDone}
+                      onHoldComplete={handleBulkDelete}
+                      className={`h-7 px-3 ${tc.roundedClass} hover:bg-red-600 transition-colors ${font}`}
+                    />
                   </>
                 )}
               </div>
