@@ -8,6 +8,16 @@ site, Cloud mode runs the real DropSync website inside the app, with useful desk
 added. Everything stays private by design: your data is encrypted locally, and the app has
 no accounts, no servers of ours, and nothing phoning home.
 
+## Download
+
+No need to build from source — grab an installer from the
+[Releases page](https://github.com/AhmedSaeed4/dropsync-desktop/releases/latest).
+Every published version lives there, and the newest one is marked Latest.
+
+- The installer is unsigned, so Windows SmartScreen shows **More info** → **Run anyway** on first run.
+- The app does not auto-update: when a new version ships, download its installer from the
+  Releases page and install it over the old one.
+
 ## What it does
 
 **Local vault (fully offline)**
