@@ -4406,6 +4406,21 @@ function createWindow(): void {
                   console.log('[f114-offlineDiskHit]', JSON.stringify({ f_114_offlineDiskHit, fromOffline, stubHits: after - before, stubBeforeOnline: beforeOnline, stubAfterOnline: afterOnline, stubBefore: before, stubAfter: after, onlineLen: on ? on.length : 0, offlineLen: off ? off.length : 0 }));
                 }
               }
+              // ==== Round 116 (#35) — f_116_* battery legs (order §8.2) ===================
+              // The file-write doorman gate, via the same DEV-gated doormanProbe seam as
+              // f_113: direct invocation of the REGISTERED handlers (deterministic; the real
+              // site can't be scripted). Request path: the site's own origin granted,
+              // evil.example denied. CHECK path mirrors. One stdout line, f113-style.
+              if (process.env.DROPSYNC_F116 === '1' && cloudCtl) {
+                let door116: Awaited<ReturnType<CloudController['doormanProbe']>> | null = null;
+                let door116Err: string | null = null;
+                try { door116 = await cloudCtl.doormanProbe(); } catch (e) { door116Err = String(e); }
+                const f_116_filesystemSite = door116?.filesystemSite === true
+                  && door116?.checkFilesystemSite === true;
+                const f_116_filesystemEvilDenied = door116?.filesystemEvilReq === false
+                  && door116?.checkFilesystemEvil === false;
+                console.log('[f116-doorman]', JSON.stringify({ f_116_filesystemSite, f_116_filesystemEvilDenied, door: door116, doorErr: door116Err }));
+              }
               // (1b) f_c2f_flipGuardFull — THE robot test for the unsaved-work guard
               // (C2f-hotfix-1). The old relay leg could only prove the CLEAN path; this one
               // drives a REAL dirty editor through the REAL relay path:

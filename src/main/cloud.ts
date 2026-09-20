@@ -519,6 +519,14 @@ export interface CloudController {
     fullscreenYoutube: boolean;
     fullscreenEvilReq: boolean;
     checkFullscreenSite: boolean;
+    /** Round 116 (#35) — the file-write gate, both paths, both origins (the type mirror of
+     * the implementation's probe tail; hotfix-1 FIX E). The site's own export origin is
+     * GRANTED (the FS Access write the owner's export button needs), evil.example DENIED —
+     * strict origin gate; fullscreen's origin-free scope does NOT apply here. */
+    filesystemSite: boolean;
+    filesystemEvilReq: boolean;
+    checkFilesystemSite: boolean;
+    checkFilesystemEvil: boolean;
   }>;
   // ==== PAC-2 FIX B — the share picker =======================================================
   /** The picker page's handshake/relay targets (registered ONCE in index.ts's registerIpc —
@@ -1849,8 +1857,10 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   // 'notifications' (PAC-2 FIX C — the site's own Notification.permission read 'denied'
   // forever, so its code skipped every fire; grant is silent, origin-gated, same posture as
   // mic/camera: our site, our shell), and, since 1.0.6 FIX A, 'clipboard-sanitized-write'
-  // (the site's copy/share buttons — see the set's comment above) — still strictly
-  // origin-gated; everything else denies with a one-line log. The CHECK handler is what
+  // (the site's copy/share buttons — see the set's comment above), and, since round 116
+  // (#35), 'fileSystem' (the site's export writes through the File System Access API — see
+  // the set's comment above) — still strictly origin-gated; everything else denies with a
+  // one-line log. The CHECK handler is what
   // makes the site's own Permissions-API gate report "granted" (un-deads the voice buttons).
   // electron.d.ts verified: details.requestingUrl exists (PermissionRequest, REQUIRED);
   // wc.mainFrameUrl does NOT exist on this build — the verified fallback is wc.mainFrame.url
@@ -1875,6 +1885,18 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     'media',
     'notifications',
     'clipboard-sanitized-write',
+    // Round 116 (#35) — the site's export writes through the File System Access API (web
+    // reference: archiveFormat.ts createArchiveSink → showSaveFilePicker → createWritable);
+    // Chromium routes that write through THESE handlers as 'fileSystem'
+    // (electron.d.ts:13352/13361). With the gate shut, Cloud export died AFTER the native
+    // Save dialog with NotAllowedError "The request is not allowed by the user agent or the
+    // platform in the current context" (owner report 2026-09-20; browsers fine — no custom
+    // handler; Firefox fine — no API, blob-download fallback). Same posture as
+    // media/notifications/clipboard: still strictly origin-gated below. The page never
+    // chooses a path — the write only lands on the file the USER picked in the native
+    // dialog, and Chromium gesture-gates the picker. Import is unaffected (plain
+    // input[type=file], no permission handler involved).
+    'fileSystem',
   ]);
   const sitePermissionRequest = (
     wc: Electron.WebContents,
@@ -2814,6 +2836,15 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
         fullscreenYoutube: await ask('fullscreen', 'https://www.youtube.com/watch?v=abc'),
         fullscreenEvilReq: await ask('fullscreen', 'https://evil.example/'),
         checkFullscreenSite: sitePermissionCheck(null, 'fullscreen', CLOUD_ORIGIN),
+        // Round 116 (#35) — the file-write gate, both paths, both origins: the site's own
+        // export origin GRANTED (the FS Access write the owner's export button needs),
+        // evil.example DENIED on both paths (strict origin gate — fullscreen's origin-free
+        // scope does NOT apply here). Request path uses the CLOUD_URL convention, CHECK path
+        // the CLOUD_ORIGIN convention (same as the media fields above).
+        filesystemSite: await ask('fileSystem', CLOUD_URL),
+        filesystemEvilReq: await ask('fileSystem', 'https://evil.example/'),
+        checkFilesystemSite: sitePermissionCheck(null, 'fileSystem', CLOUD_ORIGIN),
+        checkFilesystemEvil: sitePermissionCheck(null, 'fileSystem', 'https://evil.example'),
       };
     },
     // ==== PAC-2 FIX B — the share picker =====================================================
