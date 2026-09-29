@@ -233,6 +233,30 @@ function createWindow(): void {
   // ensureView) — one implementation, two windows. The permission grant lives in the
   // default-session lockdown (cloud.ts attachPillLockdown FIX A).
   wireHtmlFullscreen(mainWindow, mainWindow.webContents);
+
+  // Round 117 (web Round 11 #240 port) — links in drop text open in the OWNER'S BROWSER,
+  // never a second in-app window: until now the Local window had NO window-open rule, so
+  // any target="_blank" click would spawn an in-app Electron window loading the site.
+  // Rule mirrors the Cloud view's popup gate (cloud.ts attachGuards setWindowOpenHandler)
+  // and the shell:openExternal IPC guard below: https → shell.openExternal (the default
+  // browser), everything else refused + logged loudly.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      console.log('[shell] popup denied unparseable', url.slice(0, 120));
+      return { action: 'deny' };
+    }
+    if (parsed.protocol !== 'https:') {
+      console.log('[shell] popup denied non-https', url.slice(0, 120));
+      return { action: 'deny' };
+    }
+    console.log('[shell] popup external', url.slice(0, 120));
+    void shell.openExternal(parsed.toString());
+    return { action: 'deny' };
+  });
+
   // C1: cloud view lifecycle + C2f generalized bounds tracking (resize/maximize/full-screen/move).
   // C2h FIX 3 — cloud-view gestures feed the SAME idle-auto-lock clock (owner decision D-B):
   // the controller senses raw inputs from OUTSIDE the page and calls manager.touch() here.
