@@ -28,6 +28,17 @@ type DesktopMode = 'cloud' | 'local';
 /** Memory rule (§2, KEPT EXACTLY from C2): localStorage `dropsync.mode.last`; first-ever launch
  * (absent/corrupt) ⇒ LOCAL. Read BEFORE first paint so boot goes straight into the last mode. */
 const MEMORY_KEY = 'dropsync.mode.last';
+
+// Round 117 (web Round 11 #241 port) — link hover color by theme: the owner's crimson pick
+// ("Change link hover color to crimson", 2026-09-20), one fine-tuned shade per theme.
+// Published on document.body.style by the AppBody effect below (body-only mutation, the
+// web page.tsx:449 channel) and read by globals.css `.ds-link:hover` via var(--link-hover).
+const LINK_HOVER_BY_THEME: Record<'light' | 'dark' | 'minimal', string> = {
+  light: '#C81E3C',
+  dark: '#FF5C74',
+  minimal: '#A81730',
+};
+
 function readLastMode(): DesktopMode {
   try {
     const v = localStorage.getItem(MEMORY_KEY);
@@ -231,6 +242,14 @@ function AppBody() {
     });
     return () => { off(); };
   }, []);
+
+  // Round 117 — the crimson link-hover shade rides the theme (LINK_HOVER_BY_THEME above).
+  // Same body-only channel as the web's page.tsx theme effect; globals.css .ds-link:hover
+  // reads the var. documentElement stays untouched.
+  useEffect(() => {
+    document.body.style.setProperty('--link-hover', LINK_HOVER_BY_THEME[theme]);
+    return () => { document.body.style.removeProperty('--link-hover'); };
+  }, [theme]);
 
   const currentWorkspace = useMemo(
     () => (currentSpaceId ? spaces.find((s) => s.id === currentSpaceId) ?? null : null),

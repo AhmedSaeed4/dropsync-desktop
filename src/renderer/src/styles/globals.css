@@ -221,3 +221,41 @@ textarea,
 select {
   user-select: text;
 }
+
+/* Clickable links inside drop text (web Round 11 #240 + the #241 crimson follow-up,
+   ported round 117): at rest the link keeps the surrounding ink with a quiet underline;
+   on hover the words turn CRIMSON red, the underline deepens, and a small ↗ hint appears.
+   The resting look derives from currentColor, so one class serves every theme (light,
+   dark, minimal); the hover shade is per-theme — App.tsx publishes --link-hover on
+   document.body (light #C81E3C / dark #FF5C74 / minimal #A81730; the var fallback below
+   is the light shade). Applied by shared/DropMentionContent renderLinkified. */
+.ds-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  transition: color .18s ease, text-decoration-color .18s ease, text-decoration-thickness .18s ease, opacity .12s ease;
+  cursor: pointer;
+}
+.ds-link:hover {
+  color: var(--link-hover, #C81E3C);
+  text-decoration-color: var(--link-hover, #C81E3C);
+  text-decoration-thickness: 2px;
+}
+.ds-link:active { opacity: .6; }
+.ds-link::after {
+  content: "↗";
+  display: inline-block;
+  font-size: .72em;
+  line-height: 1;
+  margin-left: 3px;
+  opacity: 0;
+  transform: translate(-3px, 3px);
+  transition: opacity .18s ease, transform .18s ease;
+}
+.ds-link:hover::after { opacity: .85; transform: translate(0, 0); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ds-link, .ds-link::after { transition: none; }
+}
