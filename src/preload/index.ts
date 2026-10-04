@@ -4,7 +4,7 @@
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { DropsyncBridge, ImportProgressDTO } from './apiTypes';
+import type { DropsyncBridge, ImportProgressDTO, UpdateProgressDTO } from './apiTypes';
 
 function invoke<T = void>(channel: string, ...args: unknown[]): Promise<T> {
   return ipcRenderer.invoke(channel, ...args).then((value) => {
@@ -80,6 +80,14 @@ const api: DropsyncBridge = {
   shell: {
     openExternal: (url: string) => invoke('shell:openExternal', url),
   },
+  update: {
+    // Round 118 — manual-mode in-app updates (see src/main/updater.ts).
+    check: () => invoke('update:check'),
+    notes: () => invoke('update:notes'),
+    download: () => invoke('update:download'),
+    cancel: () => invoke('update:cancel'),
+    install: () => invoke('update:install'),
+  },
   dialog: {
     pickOpen: (options?: { title?: string; extensions?: string[] }) => invoke('dialog:pickOpen', options ?? {}),
     pickOpenMultiple: (options?: { title?: string; extensions?: string[] }) => invoke('dialog:pickOpenMultiple', options ?? {}),
@@ -107,6 +115,11 @@ const api: DropsyncBridge = {
     const wrapped = (_event: unknown, progress: ImportProgressDTO): void => listener(progress);
     ipcRenderer.on('vault:importProgress', wrapped as never);
     return () => ipcRenderer.removeListener('vault:importProgress', wrapped as never);
+  },
+  onUpdateProgress: (listener: (progress: UpdateProgressDTO) => void): (() => void) => {
+    const wrapped = (_event: unknown, progress: UpdateProgressDTO): void => listener(progress);
+    ipcRenderer.on('update:progress', wrapped as never);
+    return () => ipcRenderer.removeListener('update:progress', wrapped as never);
   },
   onNotifyFallback: (listener: (payload: { title: string; body: string }) => void): (() => void) => {
     const wrapped = (_event: unknown, payload: { title: string; body: string }): void => listener(payload);

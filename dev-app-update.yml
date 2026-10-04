@@ -1,0 +1,10 @@
+# Round 118 — dev/battery-only update config (stop-6 ruling). NEVER packaged:
+# electron-builder's files list is [out/**, package.json] so this never enters the asar;
+# the packaged app reads resources\app-update.yml instead (F2's publish block). The
+# DOWNLOAD path reads updaterCacheDirName from on-disk config (AppUpdater.js:545) —
+# checks don't (setFeedURL supplies the provider directly, AppUpdater.js:234). The
+# provider/url below are inert in our flows (feedEnabled() setFeedURLs the real per-boot
+# feed on every operation) — the file just has to be a VALID publish config.
+provider: generic
+url: http://127.0.0.1:8931/
+updaterCacheDirName: dropsync-desktop-updater

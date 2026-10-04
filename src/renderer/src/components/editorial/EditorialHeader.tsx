@@ -1,12 +1,16 @@
 import type { Workspace } from '../../lib/types';
 import { getEditorialThemeColors } from '../../lib/editorialTheme';
 import { EditorialWorkspaceSwitcher } from './EditorialWorkspaceSwitcher';
+import { Tooltip } from '../shared/Tooltip';
 
 type Theme = 'light' | 'dark' | 'minimal';
 
 interface EditorialHeaderProps {
   theme: Theme;
   onOpenSettings?: () => void;
+  /** Round 118 — shown only when a newer app version exists (in-app updates). */
+  updateVersion?: string | null;
+  onOpenUpdate?: () => void;
   workspaces: Workspace[];
   currentWorkspace: Workspace | null;
   currentUserId: string | null;
@@ -31,6 +35,8 @@ interface EditorialHeaderProps {
 export function EditorialHeader({
   theme,
   onOpenSettings,
+  updateVersion,
+  onOpenUpdate,
   workspaces,
   currentWorkspace,
   currentUserId,
@@ -73,6 +79,25 @@ export function EditorialHeader({
           />
 
           {/* FIX 12: header padlock removed — Settings modal owns manual locking now. */}
+
+          {/* Round 118 hotfix-2 — the ghost update sign (owner-approved design): borderless
+              refresh icon + per-theme crimson dot (--link-hover rides the body). The shared
+              Tooltip shows the version on hover; the click opens the update modal. */}
+          {updateVersion && onOpenUpdate && (
+            <Tooltip content={`DropSync ${updateVersion} is available`}>
+              <button
+                onClick={onOpenUpdate}
+                aria-label="Update available"
+                className={`relative flex h-9 w-9 items-center justify-center rounded-md ${tc.text} transition-opacity hover:opacity-70`}
+              >
+                <svg className="h-[18px] w-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 1 1-2.64-6.36" />
+                  <polyline strokeLinecap="round" strokeLinejoin="round" points="21 3 21 9 15 9" />
+                </svg>
+                <span className="absolute right-[5px] top-[5px] h-2 w-2 rounded-full" style={{ background: 'var(--link-hover, #C81E3C)' }} />
+              </button>
+            </Tooltip>
+          )}
 
           {/* Settings - Outline pill */}
           {onOpenSettings && (

@@ -24,6 +24,8 @@ import { attachContextMenu } from './contextMenu';
 // Round 111 §8 DEV battery — the f_29_* legs assert the builder's pure menu shape and the
 // attach-map state (main-side seams; the menu is OUR native UI, so no page-side probe exists).
 import { buildContextMenuItems, isContextMenuAttached } from './contextMenu';
+// Round 118 — in-app updates (manual mode; see src/main/updater.ts).
+import { wireUpdater, checkForUpdate, downloadUpdate, cancelUpdate, installUpdate, fetchUpdateNotes } from './updater';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -8931,6 +8933,20 @@ function registerIpc(): void {
     await shell.openExternal(parsed.toString());
     return true;
   });
+
+  // ---- In-app updates (round 118) — user-clicks-every-step: quiet check, download only on
+  // request, install only on an explicit Update-&-restart click. Progress pushes to every
+  // window; only the app renderer listens (trusted layers ignore the channel).
+  wireUpdater((p) => {
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) w.webContents.send('update:progress', p);
+    }
+  });
+  handle('update:check', () => checkForUpdate());
+  handle('update:notes', () => fetchUpdateNotes());
+  handle('update:download', () => downloadUpdate());
+  handle('update:cancel', () => cancelUpdate());
+  handle('update:install', () => installUpdate());
 
   // ---- settings
   handle('vault:settingsGet', () => manager.getSettings());
