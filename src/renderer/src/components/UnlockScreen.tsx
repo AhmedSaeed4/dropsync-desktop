@@ -12,10 +12,13 @@ interface UnlockScreenProps {
   onCancelCreateHere?: () => void;
   onPickFolder: () => Promise<void>;
   onUnlock: (password: string) => Promise<string | null>; // resolves error string or null
+  /** Round 118 hotfix-2 — quiet update sign at the bottom (only when a newer version exists). */
+  updateVersion?: string | null;
+  onOpenUpdate?: () => void;
 }
 
 /** Unlock screen — modeled on EditorialLogin.tsx (centered ◆ logo, Raleway, footer decorations). */
-export function UnlockScreen({ theme, folder, notice, createHereOffer, onCreateHere, onCancelCreateHere, onPickFolder, onUnlock }: UnlockScreenProps) {
+export function UnlockScreen({ theme, folder, notice, createHereOffer, onCreateHere, onCancelCreateHere, onPickFolder, onUnlock, updateVersion, onOpenUpdate }: UnlockScreenProps) {
   const tc = getEditorialThemeColors(theme);
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
@@ -115,6 +118,18 @@ export function UnlockScreen({ theme, folder, notice, createHereOffer, onCreateH
         <div className={`absolute bottom-8 right-8 text-xs ${tc.fontClass} ${tc.muted}`}>
           EDITION 2.0
         </div>
+        {/* Round 118 hotfix-2 — the update sign: centered bottom line between the clock
+            and EDITION corners. Dot = the theme's link-hover crimson; click opens the modal. */}
+        {updateVersion && onOpenUpdate && (
+          <button
+            type="button"
+            onClick={onOpenUpdate}
+            className={`absolute bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-2 text-xs ${tc.fontClass} ${tc.muted} hover:underline underline-offset-4`}
+          >
+            <span className="h-[7px] w-[7px] rounded-full" style={{ background: 'var(--link-hover, #C81E3C)' }} />
+            Update available
+          </button>
+        )}
       </main>
     </div>
   );

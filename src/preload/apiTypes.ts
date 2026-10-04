@@ -96,6 +96,25 @@ export interface ImportProgressDTO {
   message?: string;
 }
 
+/** Round 118 — in-app updates (manual mode; see src/main/updater.ts). */
+export interface UpdateCheckResultDTO {
+  currentVersion: string;
+  available: boolean;
+  version: string | null;
+  disabled: boolean;
+}
+export interface UpdateNotesDTO {
+  notes: string | null;
+  url: string;
+}
+export interface UpdateProgressDTO {
+  state: 'downloading' | 'done' | 'cancelled' | 'error';
+  percent: number;
+  transferred: number;
+  total: number;
+  bytesPerSecond: number;
+}
+
 /** Expiry menu is exactly these five on desktop (LOCKED decision — 4h stays import-only). */
 export type CreateExpirationOptionDTO = '1h' | '2h' | '6h' | '24h' | 'forever';
 
@@ -243,6 +262,14 @@ export interface DropsyncBridge {
   shell: {
     openExternal(url: string): Promise<boolean>;
   };
+  /** Round 118 — user-clicks-every-step in-app updates. */
+  update: {
+    check(): Promise<UpdateCheckResultDTO>;
+    notes(): Promise<UpdateNotesDTO>;
+    download(): Promise<boolean>;
+    cancel(): Promise<boolean>;
+    install(): Promise<boolean>;
+  };
   dialog: {
     pickOpen(options?: { title?: string; extensions?: string[] }): Promise<string | null>;
     pickOpenMultiple(options?: { title?: string; extensions?: string[] }): Promise<string[]>;
@@ -262,6 +289,8 @@ export interface DropsyncBridge {
   /** Absolute disk path for a renderer-side File (drag-drop). '' when unavailable (clipboard). */
   pathForFile(file: File): string;
   onImportProgress(listener: (progress: ImportProgressDTO) => void): () => void;
+  /** Round 118 — download progress push from main (subscribe/unsubscribe). */
+  onUpdateProgress(listener: (progress: UpdateProgressDTO) => void): () => void;
   /** In-app fallback event when the OS can't show a reminder notification (spec M6). */
   onNotifyFallback(listener: (payload: { title: string; body: string }) => void): () => void;
   /** DEV-ONLY harness seam — the main process registers this channel ONLY under DROPSYNC_E2E_SIT3. */

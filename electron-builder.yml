@@ -12,5 +12,13 @@ files:
 win:
   target: NSIS
   icon: build/icon.png
+# Round 118 — update feed pointer. With this block dist:win EMITS dist\latest.yml (the
+# update "menu": version + file name + sha512 + size) and embeds resources\app-update.yml
+# in the build. The build NEVER uploads anything (no --publish, no GH_TOKEN) — releases are
+# attached manually at graduation (GIT LAW, planner-only).
+publish:
+  provider: github
+  owner: AhmedSaeed4
+  repo: dropsync-desktop
 nsis:
   oneClick: true

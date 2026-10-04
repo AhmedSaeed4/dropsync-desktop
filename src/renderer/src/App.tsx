@@ -4,6 +4,7 @@ import type { Drop } from './lib/types';
 import { FirstRunSetup } from './components/FirstRunSetup';
 import { UnlockScreen } from './components/UnlockScreen';
 import { SettingsModal } from './components/SettingsModal';
+import { UpdateModal } from './components/UpdateModal';
 import { ImportModal } from './components/ImportModal';
 import { ExportModal } from './components/ExportModal';
 import { EditorialHeader } from './components/editorial/EditorialHeader';
@@ -38,6 +39,12 @@ const LINK_HOVER_BY_THEME: Record<'light' | 'dark' | 'minimal', string> = {
   dark: '#FF5C74',
   minimal: '#A81730',
 };
+
+// Round 118 — ONE update check per renderer session. Module-level latch is StrictMode-proof
+// (double-mount never re-checks); dev boots without a feed are disabled server-side and the
+// promise resolves available:false — silent either way (owner decision 2).
+let updateCheckStarted = false;
+const UPDATE_CHECK_DELAY_MS = 4000;
 
 function readLastMode(): DesktopMode {
   try {
@@ -134,6 +141,19 @@ function CloudModeShell() {
     return () => window.removeEventListener('dropsync:request-mode-cloud', h);
   }, [switchMode]);
 
+  // Round 118 — quiet check ~4 s after the shell mounts (once per session; the latch above
+  // guards StrictMode remounts). Never re-checks on mode flips — the shell never unmounts.
+  const [updateInfo, setUpdateInfo] = useState<{ current: string; next: string } | null>(null);
+  useEffect(() => {
+    if (updateCheckStarted) return;
+    updateCheckStarted = true;
+    setTimeout(() => {
+      window.dropsync.update.check().then((r) => {
+        if (r.available && r.version) setUpdateInfo({ current: r.currentVersion, next: r.version });
+      }).catch(() => { /* silent by design */ });
+    }, UPDATE_CHECK_DELAY_MS);
+  }, []);
+
   // C2i-hotfix-1 — the inner container is PERMANENT and ALWAYS VISIBLE. The C2i original
   // (cream class only while Cloud + visibility:hidden while Cloud) caused two owner-visible
   // regressions, both measured live (probe: /tmp/c2iflash): (a) main removes the site view
@@ -157,13 +177,13 @@ function CloudModeShell() {
   return (
     <div className="contents" data-shell={screen}>
       <div className="fixed inset-0 bg-[#FAF7F2]">
-        <AppBody />
+        <AppBody updateInfo={updateInfo} />
       </div>
     </div>
   );
 }
 
-function AppBody() {
+function AppBody({ updateInfo }: { updateInfo: { current: string; next: string } | null }) {
   const store = useVaultStore();
   const {
     status, folder, checking, theme, spaces, currentSpaceId, currentSpaceName,
@@ -175,6 +195,8 @@ function AppBody() {
   const tc = getEditorialThemeColors(theme);
 
   const [showSettings, setShowSettings] = useState(false);
+  // Round 118 — the update modal (opens only when a newer version was found).
+  const [showUpdate, setShowUpdate] = useState(false);
   // C1 — badge menu "Desktop settings" rides this event (see CloudModeShell planner ruling).
   useEffect(() => {
     const open = (): void => setShowSettings(true);
@@ -781,30 +803,50 @@ function AppBody() {
   if (status !== 'unlocked') {
     // C2f: Local renders DIRECT full-window exactly as these components always have (the C2b
     // porch portal slot is gone; no component needed any porch-only props).
-    return status === 'none' ? (
-      <FirstRunSetup
-        theme={theme}
-        folder={folder}
-        onPickFolder={() => pickFolderForCreate()}
-        onCreate={handleCreate}
-        onOpenExisting={() => pickFolder('Choose the folder that contains DropSync.vault')}
-      />
-    ) : (
-      <UnlockScreen
-        theme={theme}
-        folder={folder}
-        notice={unlockNotice}
-        createHereOffer={createHereOffer}
-        onCreateHere={() => {
-          if (createHereOffer) {
-            setCreateHereOffer(false);
-            startCreateFlow(); // FirstRunSetup with the recorded folder prefilled, passwords empty
-          }
-        }}
-        onCancelCreateHere={() => setCreateHereOffer(false)}
-        onPickFolder={() => pickFolder('Choose the folder that contains DropSync.vault')}
-        onUnlock={handleUnlock}
-      />
+    // Round 118 hotfix-2 — the pre-unlock update sign needs this branch to carry its OWN
+    // modal mount: the post-unlock tree below never renders in this state.
+    return (
+      <>
+        {status === 'none' ? (
+          <FirstRunSetup
+            theme={theme}
+            folder={folder}
+            onPickFolder={() => pickFolderForCreate()}
+            onCreate={handleCreate}
+            onOpenExisting={() => pickFolder('Choose the folder that contains DropSync.vault')}
+            updateVersion={updateInfo ? updateInfo.next : null}
+            onOpenUpdate={() => setShowUpdate(true)}
+          />
+        ) : (
+          <UnlockScreen
+            theme={theme}
+            folder={folder}
+            notice={unlockNotice}
+            createHereOffer={createHereOffer}
+            onCreateHere={() => {
+              if (createHereOffer) {
+                setCreateHereOffer(false);
+                startCreateFlow(); // FirstRunSetup with the recorded folder prefilled, passwords empty
+              }
+            }}
+            onCancelCreateHere={() => setCreateHereOffer(false)}
+            onPickFolder={() => pickFolder('Choose the folder that contains DropSync.vault')}
+            onUnlock={handleUnlock}
+            updateVersion={updateInfo ? updateInfo.next : null}
+            onOpenUpdate={() => setShowUpdate(true)}
+          />
+        )}
+        {/* Round 118 hotfix-2 — the same modal mount expression as the unlocked tree,
+            so the pre-unlock sign opens the identical update modal. */}
+        {showUpdate && updateInfo && (
+          <UpdateModal
+            theme={theme}
+            currentVersion={updateInfo.current}
+            newVersion={updateInfo.next}
+            onClose={() => setShowUpdate(false)}
+          />
+        )}
+      </>
     );
   }
 
@@ -813,6 +855,8 @@ function AppBody() {
       <EditorialHeader
         theme={theme}
         onOpenSettings={() => setShowSettings(true)}
+        updateVersion={updateInfo ? updateInfo.next : null}
+        onOpenUpdate={() => setShowUpdate(true)}
         workspaces={spaces.filter((s) => s.id !== 'personal')}
         currentWorkspace={currentWorkspace}
         currentUserId="local"
@@ -1018,6 +1062,16 @@ function AppBody() {
             clearPreviewPayloadCache();
             void refreshAll();
           }}
+        />
+      )}
+
+      {/* Round 118 — in-app update modal (only when a newer version exists) */}
+      {showUpdate && updateInfo && (
+        <UpdateModal
+          theme={theme}
+          currentVersion={updateInfo.current}
+          newVersion={updateInfo.next}
+          onClose={() => setShowUpdate(false)}
         />
       )}
 

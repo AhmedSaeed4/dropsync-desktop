@@ -15,8 +15,10 @@ No need to build from source — grab an installer from the
 Every published version lives there, and the newest one is marked Latest.
 
 - The installer is unsigned, so Windows SmartScreen shows **More info** → **Run anyway** on first run.
-- The app does not auto-update: when a new version ships, download its installer from the
-  Releases page and install it over the old one.
+- Starting with version 1.0.18 the app checks for updates on launch and can download and
+  install them right inside the app - nothing happens without your click. Versions 1.0.17
+  and older don't have this yet: download the newest installer from the Releases page one
+  last time and you're on the in-app track from then on.
 
 ## What it does
 
@@ -57,7 +59,8 @@ Every published version lives there, and the newest one is marked Latest.
 - One vault password guards everything, and there is no recovery path: if you forget it, the
   data is unrecoverable. That is deliberate — without the password, nobody can read your
   vault. Not us, not anyone.
-- No servers of our own, no accounts, no auto-update.
+- No servers of our own, no accounts. Updates arrive in-app (from 1.0.18 on) and only
+  ever with your click - nothing downloads or installs silently.
 - The app's interface makes zero direct network requests; the only outside content it can
   load is the YouTube player for videos you saved.
 - The app itself makes only one kind of outbound request, and only from its main process:
