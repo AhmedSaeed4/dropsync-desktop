@@ -31,6 +31,9 @@ interface EditorialDropItemProps {
   showDragHandle?: boolean;
   dragHandleProps?: Record<string, unknown>;
   allDrops?: Drop[];
+  /** Round 119 — reports THIS card's Quick Jump blocker state (context menu open or inline
+   *  delete confirm armed); (dropId, false) on cleanup/unmount. Optional. */
+  onBlockedChange?: (dropId: string, blocked: boolean) => void;
   // Reminder glow (viewer-dependent) — rainbow title + clock badge, computed by the parent list.
   reminderGlow?: boolean;
 }
@@ -105,6 +108,7 @@ export const EditorialDropItem = memo(function EditorialDropItem({
   showDragHandle,
   dragHandleProps,
   allDrops = [],
+  onBlockedChange,
   reminderGlow = false,
 }: EditorialDropItemProps) {
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -133,6 +137,13 @@ export const EditorialDropItem = memo(function EditorialDropItem({
   const mentionDeletedClass = `${chipBase} ${tc.inactivePillBg} ${tc.muted} line-through cursor-not-allowed`;
 
   const { menuState, closeMenu, contextMenuProps } = useContextMenu();
+  // Round 119 — Quick Jump blocker report for this card (menuState is {x,y}|null,
+  // DropContextMenu.tsx:178). Cleanup reports (id, false) so unmounting cards unblock.
+  const cardBlocked = !!menuState || confirmDelete;
+  useEffect(() => {
+    onBlockedChange?.(drop.id, cardBlocked);
+    return () => onBlockedChange?.(drop.id, false);
+  }, [onBlockedChange, drop.id, cardBlocked]);
 
   const isImage = drop.mimeType?.startsWith('image/');
   const isVideo = drop.mimeType?.startsWith('video/');

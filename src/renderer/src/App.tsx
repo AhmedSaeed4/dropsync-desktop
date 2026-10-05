@@ -15,6 +15,7 @@ import { EditorialPreviewModal } from './components/editorial/EditorialPreviewMo
 import { EditorialMoveDropModal } from './components/editorial/EditorialMoveDropModal';
 import { EditorialDropZone } from './components/editorial/EditorialDropZone';
 import { EditorialTextModal, type TextModalCreatePayload, type TextModalEditUpdates } from './components/editorial/EditorialTextModal';
+import { EditorialQuickJump } from './components/editorial/EditorialQuickJump';
 import { getEditorialThemeColors } from './lib/editorialTheme';
 import { dropDtoToDrop } from './lib/types';
 import { isTextFileDrop, drawingMediaKind } from './lib/dropsHelpers';
@@ -81,6 +82,9 @@ function CloudModeShell() {
   const { status, handleUnlocked, handleLocked, reconcileStatus } = useVaultStore();
   // Boot: read the memory rule BEFORE first paint and render that mode directly.
   const [screen, setScreen] = useState<DesktopMode>(() => readLastMode());
+  // Round 119 — true while a mode flip is in flight (see applyMode): keeps the Quick Jump
+  // and the preview F key unmounted through the whole transition.
+  const [modeTransition, setModeTransition] = useState(false);
 
   // Boot-into-last-mode: when the remembered mode is Cloud, main must raise the site view.
   // (Local needs nothing — the local flow below is exactly as committed.) The pill's knob is
@@ -97,22 +101,30 @@ function CloudModeShell() {
   const applyMode = useCallback(
     async (next: DesktopMode): Promise<void> => {
       if (next === screen) return;
-      await window.dropsync.mode.set(next);
-      setScreen(next);
-      writeLastMode(next);
-      // C2i FIX B — homecoming WHISPER-CHECK replaces the C1-era forced refreshAll (obsolete
-      // once C2h stopped sealing the vault on every flip). One cheap status() round-trip;
-      // touch NOTHING unless reality differs from what we believe (vault.status() is
-      // ACTIVITY_EXEMPT, so asking cannot feed the idle clock either):
-      if (next === 'local') {
-        const s = await window.dropsync.vault.status();
-        if (s.state !== status) {
-          if (s.state === 'unlocked') await handleUnlocked(); // unlocked-but-stale ⇒ hydrate like any unlock path does
-          else if (s.state === 'locked') handleLocked(); // idle-lock fired behind Cloud ⇒ instant password screen, ZERO fetches
-          else reconcileStatus('none'); // mirror of the 8 s watcher's bare setStatus for non-unlocked worlds
+      // Round 119 — the transition flag spans the ENTIRE flip (main raise/hide + renderer
+      // settle + whisper-check); cleared in finally so a failed mode.set can never leave
+      // the Local keyboard permanently disabled.
+      setModeTransition(true);
+      try {
+        await window.dropsync.mode.set(next);
+        setScreen(next);
+        writeLastMode(next);
+        // C2i FIX B — homecoming WHISPER-CHECK replaces the C1-era forced refreshAll (obsolete
+        // once C2h stopped sealing the vault on every flip). One cheap status() round-trip;
+        // touch NOTHING unless reality differs from what we believe (vault.status() is
+        // ACTIVITY_EXEMPT, so asking cannot feed the idle clock either):
+        if (next === 'local') {
+          const s = await window.dropsync.vault.status();
+          if (s.state !== status) {
+            if (s.state === 'unlocked') await handleUnlocked(); // unlocked-but-stale ⇒ hydrate like any unlock path does
+            else if (s.state === 'locked') handleLocked(); // idle-lock fired behind Cloud ⇒ instant password screen, ZERO fetches
+            else reconcileStatus('none'); // mirror of the 8 s watcher's bare setStatus for non-unlocked worlds
+          }
+          // Equal state ⇒ strictly NO-OP: no setLoading, no setDropsRaw, no list/category/
+          // settings/spaces refetch of any kind — the warm world simply stays as it is.
         }
-        // Equal state ⇒ strictly NO-OP: no setLoading, no setDropsRaw, no list/category/
-        // settings/spaces refetch of any kind — the warm world simply stays as it is.
+      } finally {
+        setModeTransition(false);
       }
     },
     [screen, status, handleUnlocked, handleLocked, reconcileStatus]
@@ -154,6 +166,13 @@ function CloudModeShell() {
     }, UPDATE_CHECK_DELAY_MS);
   }, []);
 
+  // Round 119 — Local-keyboard gate for the Quick Jump (and the preview's F key): Local
+  // must be the live screen AND no transition in flight. Focus alone cannot gate this:
+  // blurPill hands the Local webContents focus even while Cloud covers it (cloud.ts
+  // blurPill → mainWindow.webContents.focus; plan-report focus finding) — so the gate is
+  // explicit state, not focus inference.
+  const localKeyboardActive = screen === 'local' && !modeTransition;
+
   // C2i-hotfix-1 — the inner container is PERMANENT and ALWAYS VISIBLE. The C2i original
   // (cream class only while Cloud + visibility:hidden while Cloud) caused two owner-visible
   // regressions, both measured live (probe: /tmp/c2iflash): (a) main removes the site view
@@ -177,13 +196,13 @@ function CloudModeShell() {
   return (
     <div className="contents" data-shell={screen}>
       <div className="fixed inset-0 bg-[#FAF7F2]">
-        <AppBody updateInfo={updateInfo} />
+        <AppBody updateInfo={updateInfo} localKeyboardActive={localKeyboardActive} />
       </div>
     </div>
   );
 }
 
-function AppBody({ updateInfo }: { updateInfo: { current: string; next: string } | null }) {
+function AppBody({ updateInfo, localKeyboardActive }: { updateInfo: { current: string; next: string } | null; localKeyboardActive: boolean }) {
   const store = useVaultStore();
   const {
     status, folder, checking, theme, spaces, currentSpaceId, currentSpaceName,
@@ -255,6 +274,11 @@ function AppBody({ updateInfo }: { updateInfo: { current: string; next: string }
   const [createHereOffer, setCreateHereOffer] = useState(false);
   // In-app toast fallback when the OS can't show a reminder notification (M6).
   const [notifyToast, setNotifyToast] = useState<{ title: string; body: string } | null>(null);
+  // Round 119 — child-reported Quick Jump blockers (states private to the children flow up
+  // through optional callbacks; false on cleanup/unmount — FIX F/G/H/I/J).
+  const [dropZoneBlocked, setDropZoneBlocked] = useState(false);
+  const [dropListBlocked, setDropListBlocked] = useState(false);
+  const [workspaceUiBlocked, setWorkspaceUiBlocked] = useState(false);
   const pickingForCreateRef = useRef(false);
 
   useEffect(() => {
@@ -346,6 +370,16 @@ function AppBody({ updateInfo }: { updateInfo: { current: string; next: string }
     }
   }, [folder, handleUnlocked]);
 
+  // Round 119 — Quick Jump's blocked chain (web EditorialLayout :496-506 parity): every
+  // App-owned overlay state plus the three child-reported blockers. Selection mode and
+  // passive toasts do NOT block (web parity). requestModeSwitch wrapping was considered
+  // and rejected by the planner (dead code: QJ is blocked whenever an editor is open).
+  const quickJumpBlocked = !!(
+    previewDrop || editDrop || moveDrops || moveBusy || showSettings || showUpdate ||
+    importScope || exportTarget || refreshingTitles ||
+    dropZoneBlocked || dropListBlocked || workspaceUiBlocked
+  );
+
   // Preview trail: mention chips push here so ← walks back through A→B→C. FIX 8: no fake
   // loading timer — a cache miss shows the modal's REAL loading; a hit is instant.
   const openPreview = useCallback((drop: Drop) => {
@@ -370,6 +404,15 @@ function AppBody({ updateInfo }: { updateInfo: { current: string; next: string }
     setPreviewDrop(null);
     setPreviewTrail([]);
   }, []);
+
+  // Round 119 — a Quick Jump workspace pick uses the header switcher's exact primitive
+  // pair (:863 parity): switch space (store refetches that space's drops) + close preview.
+  // Lives BELOW closePreview (in-order correction 3): the dependency array reads it at
+  // declaration time — above it was a use-before-declaration error.
+  const handleQuickJumpSwitch = useCallback((id: string) => {
+    setCurrentSpace(id);
+    closePreview();
+  }, [setCurrentSpace, closePreview]);
 
   // Round 107 (order §4 FIX H.4) — the single-drop transfer; mirrors the web's W3 post-op
   // contract EXACTLY (EditorialLayout.tsx handleMoveDrop :288-296 / handleCopyDrop :322-328):
@@ -852,6 +895,21 @@ function AppBody({ updateInfo }: { updateInfo: { current: string; next: string }
 
   return (
     <div className={`relative flex h-[100dvh] flex-col overflow-x-hidden ${tc.bg} transition-colors duration-500`}>
+      {/* Round 119 — Quick Jump (hotkey search bar; see component header). Mounted only
+          while Local is the live screen with no transition in flight; its own `blocked`
+          prop covers every overlay state. */}
+      {localKeyboardActive && (
+        <EditorialQuickJump
+          theme={theme}
+          currentSpaceId={currentSpaceId}
+          workspaces={spaces.filter((s) => s.id !== 'personal')}
+          drops={drops}
+          dropsLoading={loading}
+          blocked={quickJumpBlocked}
+          onSwitchWorkspace={handleQuickJumpSwitch}
+          onOpenRootDrop={openPreview}
+        />
+      )}
       <EditorialHeader
         theme={theme}
         onOpenSettings={() => setShowSettings(true)}
@@ -867,6 +925,7 @@ function AppBody({ updateInfo }: { updateInfo: { current: string; next: string }
         onCreateSpace={handleCreateSpace}
         onRenameSpace={handleRenameSpace}
         onDeleteSpace={handleDeleteSpace}
+        onWorkspaceUiBlocked={setWorkspaceUiBlocked}
       />
 
       {/* #34 layout parity: on the web the always-rendered zero-width chat panel adds a
@@ -890,6 +949,7 @@ function AppBody({ updateInfo }: { updateInfo: { current: string; next: string }
               onCreateCategory={handleCreateCategory}
               editModalOpen={!!editDrop}
               mentionableDrops={drops}
+              onBlockedChange={setDropZoneBlocked}
             />
 
             <section className={`border ${tc.border} ${tc.cardBg} rounded-lg p-5`}>
@@ -952,6 +1012,7 @@ function AppBody({ updateInfo }: { updateInfo: { current: string; next: string }
             theme={theme}
             currentUserId="local"
             currentSpaceKey={currentSpaceId ?? 'personal'}
+            onBlockedChange={setDropListBlocked}
           />
         </div>
       </main>
@@ -977,6 +1038,7 @@ function AppBody({ updateInfo }: { updateInfo: { current: string; next: string }
             closePreview();
           }}
           onChanged={handlePreviewDismissed}
+          keyboardActive={localKeyboardActive && !editDrop && !moveDrops && !showSettings && !showUpdate && !importScope && !exportTarget}
         />
       )}
 

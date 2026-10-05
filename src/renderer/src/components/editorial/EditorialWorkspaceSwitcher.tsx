@@ -19,6 +19,9 @@ interface EditorialWorkspaceSwitcherProps {
   onDeleteSpace?: (id: string) => Promise<boolean>;
   theme?: 'light' | 'dark' | 'minimal';
   showChat?: boolean;
+  /** Round 119 — reports Quick Jump blocker state (the whole switcher UI: dropdown,
+   *  Personal menu, row menus, inline create/rename, delete confirm, any busy flag). */
+  onBlockedChange?: (blocked: boolean) => void;
 }
 
 /**
@@ -39,6 +42,7 @@ export function EditorialWorkspaceSwitcher({
   onExportWorkspace,
   theme = 'light',
   showChat = false,
+  onBlockedChange,
 }: EditorialWorkspaceSwitcherProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [personalMenuOpen, setPersonalMenuOpen] = useState(false);
@@ -59,6 +63,14 @@ export function EditorialWorkspaceSwitcher({
   // second confirm view with the web's exact wording — never deletes in one step.
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
+  // Round 119 — Quick Jump blocker report: any open switcher surface or in-flight action.
+  const switcherBlocked = isOpen || personalMenuOpen || rowMenuSpaceId !== null ||
+    creatingSpace || renamingSpaceId !== null || deleteTargetId !== null ||
+    spaceCreateBusy || renameBusy || deleteBusy;
+  useEffect(() => {
+    onBlockedChange?.(switcherBlocked);
+    return () => onBlockedChange?.(false);
+  }, [onBlockedChange, switcherBlocked]);
   const tc = getEditorialThemeColors(theme);
 
   useEffect(() => {

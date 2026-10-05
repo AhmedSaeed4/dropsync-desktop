@@ -9,6 +9,7 @@ import { LOCAL_USER_ID } from '../../lib/types';
 import { contentToPlainText } from '../../lib/dropTagUtils';
 import { getEditorialThemeColors } from '../../lib/editorialTheme';
 import { DropMentionContent } from '../shared/DropMentionContent';
+import { ImageLightbox } from './ImageLightbox';
 import { useVaultStore } from '../../store/vault';
 import { getCachedPreviewPayload, putCachedPreviewPayload } from '../../lib/previewPayloadCache';
 import type { PreviewPayload } from '../../lib/previewPayloadCache';
@@ -32,6 +33,10 @@ interface EditorialPreviewModalProps {
    * the parent patches the list in place (animated demotion, no reload). Called with no
    * argument only if the patched record was unavailable (parent falls back to a refresh). */
   onChanged?: (updated?: DropDTO) => void;
+  /** Round 119 — the Local keyboard is live and no sibling App overlay is open: gates the
+   * full-screen image viewer + its F key (Cloud mode/transition and overlapping modals own
+   * the keys). The preview itself is the F host and never blocks itself. Default true. */
+  keyboardActive?: boolean;
   /** Round 112b (defect #31): the payload the MOUNT paints from — the open path consults
    * the shelf synchronously (web parity, page.tsx:584-600) so frame 1 carries content
    * instead of one empty body frame. Read ONLY by the useState initializers below; trail
@@ -48,10 +53,17 @@ const SUPPORTED_VIDEO_TYPES = new Set(['video/mp4', 'video/webm', 'video/ogg']);
  * YouTube iframe are stripped — links render as text (offline-first); Download uses the
  * native Save As dialog every time.
  */
-export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 'light', isLoading = false, seed = null, allDrops = [], onPreview, onEdit, onMove, onChanged }: EditorialPreviewModalProps) {
+export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 'light', isLoading = false, seed = null, keyboardActive = true, allDrops = [], onPreview, onEdit, onMove, onChanged }: EditorialPreviewModalProps) {
   useBodyScrollLock();
-  // Esc routes through the same close path as the X (polish sweep #3).
-  useEscapeClose(true, onClose);
+  // Round 119 — the full-screen image viewer (web Rounds 17/17b/23 port). Declared BEFORE
+  // the hook it gates (the hook's active argument reads it).
+  const [viewer, setViewer] = useState<{ src: string; alt: string } | null>(null);
+  // Esc routes through the same close path as the X (polish sweep #3). Round 119: while the
+  // image viewer is open it OWNS Escape — the hook suspends via its own nested-dialog
+  // mechanism (useEscapeClose.ts doc), so the FIRST Esc closes the viewer only; the next
+  // closes this modal. Without this, the hook's document-capture listener fires first and
+  // closes the preview under the viewer (plan-report B4).
+  useEscapeClose(!viewer, onClose);
   const [copied, setCopied] = useState(false);
   // Reminder visibility (web parity): live fire-time chip in the header + Dismiss in the footer.
   // Local flag keeps the button honest between the patch landing and the parent refresh.
@@ -89,6 +101,7 @@ export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 
     setShowPlayer(false);
     setPlayerBlocked(null);
     setReminderDismissed(false);
+    setViewer(null); // Round 119 — trail swap: the viewer must never show the previous drop's image
     // FIX 8 (web PR #212 mechanism): a cache hit restores the hydrated payload synchronously —
     // zero IPC, zero loading frame, so Back is instant. Only a cache miss pays the real fetch,
     // and it banks its result for the next visit.
@@ -142,6 +155,35 @@ export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 
   const busy = isLoading || internalLoading;
   const displayContent = textContent;
   const youtubeVideoId = displayContent && !drop.isDrawing ? getYouTubeVideoId(displayContent) : null;
+  // Round 119 — F toggles the full-screen image viewer (web Round 17b parity): plain f/F
+  // (Shift+F accepted, like the web), no ctrl/meta/alt, never while typing. The image is
+  // whatever this modal is ACTUALLY showing right now (imageUrl = text-attached/drawings,
+  // fileUrl = image files) and never while loading. keyboardActive false (Cloud mode/
+  // transition or a sibling App overlay) keeps the key dead.
+  // Round 119 hotfix-2: drawings carry an image/* mimeType but their media lives ONLY in
+  // imageUrl (the file slot is never fetched for them), so `isImage ? fileUrl : …` picked
+  // a null source and F could not OPEN the viewer on a drawing (close worked — it needs
+  // no source). Route drawings to imageUrl unconditionally, mirroring the render gates.
+  const viewerImage = !busy ? (drop.isDrawing ? imageUrl : (isImage ? fileUrl : imageUrl)) : null;
+  useEffect(() => {
+    if (!keyboardActive) return;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if ((e.key === 'f' || e.key === 'F') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (viewer) setViewer(null);
+        else if (viewerImage) setViewer({ src: viewerImage, alt: drop.name });
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [keyboardActive, viewer, viewerImage, drop.name]);
+
+  // Round 119 — Cloud flip / sibling overlay while the viewer is open: close it now (the
+  // next keyboardActive preview re-derives state cleanly).
+  useEffect(() => {
+    if (!keyboardActive) setViewer(null);
+  }, [keyboardActive]);
 
   // Reminder visibility (web parity) — the same 30 s tick that drives the list tiers.
   const now = useNow(30_000);
@@ -215,6 +257,9 @@ export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 
       className={`fixed inset-0 bg-[#1a1a1a]/60 flex items-center justify-center z-50 p-4 transition-colors duration-300 overscroll-contain`}
       onClick={(e) => e.target === e.currentTarget && onBack()}
     >
+      {/* Round 119 — the full-screen image viewer at the app's top layer (its own
+          Esc/✕/backdrop exits; the hook above is suspended while it is open). */}
+      {keyboardActive && viewer && <ImageLightbox src={viewer.src} alt={viewer.alt} onClose={() => setViewer(null)} />}
       <div className={`${tc.bg} border ${tc.border} rounded-xl w-full max-w-3xl max-h-[85vh] overflow-hidden flex flex-col transition-colors duration-300 shadow-xl`}>
         {/* Header */}
         <div className={`border-b ${tc.border} px-5 py-4 flex items-center justify-between`}>
@@ -317,15 +362,35 @@ export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 
               )}
               {imageUrl && (
                 <div className="flex items-center justify-center">
-                  <img
-                    src={imageUrl}
-                    alt="Attached"
-                    className={`rounded-lg object-contain ${
-                      drop.isDrawing
-                        ? 'max-w-[80%] max-h-[50vh] border'
-                        : 'max-w-full h-auto'
-                    }`}
-                  />
+                  {/* Round 119 hotfix-1: the drawing's 80% width cap moves to the WRAPPER.
+                      A percentage max-width on the img cannot shrink this shrink-to-fit
+                      wrapper (percentage caps resolve against the wrapper — circular), so
+                      the wrapper stretched to the full row and the capped drawing sat left
+                      with the expand button at the row corner (owner hands-on finding).
+                      On the wrapper the same 80% resolves against the row (definite); the
+                      img's definite 50vh cap keeps the wrapper hugging the displayed size
+                      in every regime — rendered sizes identical to 1.0.18 (order §2). */}
+                  <div className={`relative inline-block ${drop.isDrawing ? 'max-w-[80%]' : ''}`}>
+                    <img
+                      src={imageUrl}
+                      alt="Attached"
+                      className={`rounded-lg object-contain ${
+                        drop.isDrawing
+                          ? 'max-w-full max-h-[50vh] border'
+                          : 'max-w-full h-auto'
+                      }`}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => { if (imageUrl) setViewer({ src: imageUrl, alt: drop.name }); }}
+                      className="absolute top-2 right-2 z-10 w-8 h-8 flex items-center justify-center bg-black/60 hover:bg-black/70 text-white rounded-full transition-colors"
+                      title="View full screen"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9 9V4.5M9 9H4.5M9 9L3.75 3.75M9 15v4.5M9 15H4.5M9 15l-5.25 5.25M15 9h4.5M15 9V4.5M15 9l5.25-5.25M15 15h4.5M15 15v4.5m0-4.5l5.25 5.25" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               )}
               {/* YouTube — cached/imported title card, in-app player on a deliberate play click
@@ -419,11 +484,23 @@ export function EditorialPreviewModal({ drop, onClose, onBack, canBack, theme = 
           {/* Image file */}
           {!busy && isImage && fileUrl && (
             <div className="p-5 flex items-center justify-center">
-              <img
-                src={fileUrl}
-                alt={drop.name}
-                className="max-w-full max-h-[50vh] object-contain rounded-lg border"
-              />
+              <div className="relative inline-block">
+                <img
+                  src={fileUrl}
+                  alt={drop.name}
+                  className="max-w-full max-h-[50vh] object-contain rounded-lg border"
+                />
+                <button
+                  type="button"
+                  onClick={() => { if (fileUrl) setViewer({ src: fileUrl, alt: drop.name }); }}
+                  className="absolute top-2 right-2 z-10 w-8 h-8 flex items-center justify-center bg-black/60 hover:bg-black/70 text-white rounded-full transition-colors"
+                  title="View full screen"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 9V4.5M9 9H4.5M9 9L3.75 3.75M9 15v4.5M9 15H4.5M9 15l-5.25 5.25M15 9h4.5M15 9V4.5M15 9l5.25-5.25M15 15h4.5M15 15v4.5m0-4.5l5.25 5.25" />
+                  </svg>
+                </button>
+              </div>
             </div>
           )}
 
