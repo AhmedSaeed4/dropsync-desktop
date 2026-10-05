@@ -25,6 +25,8 @@ interface EditorialHeaderProps {
   onRenameSpace?: (id: string, name: string) => Promise<boolean>;
   /** FIX 19 — delete a workspace (cascades drops+categories; current lands on Personal). */
   onDeleteSpace?: (id: string) => Promise<boolean>;
+  /** Round 119 — forwards the workspace switcher's Quick Jump blocker state to the app. */
+  onWorkspaceUiBlocked?: (blocked: boolean) => void;
 }
 
 /**
@@ -47,6 +49,7 @@ export function EditorialHeader({
   onCreateSpace,
   onRenameSpace,
   onDeleteSpace,
+  onWorkspaceUiBlocked,
 }: EditorialHeaderProps) {
   const tc = getEditorialThemeColors(theme);
 
@@ -75,6 +78,7 @@ export function EditorialHeader({
             onCreateSpace={onCreateSpace}
             onRenameSpace={onRenameSpace}
             onDeleteSpace={onDeleteSpace}
+            onBlockedChange={onWorkspaceUiBlocked}
             theme={theme}
           />
 

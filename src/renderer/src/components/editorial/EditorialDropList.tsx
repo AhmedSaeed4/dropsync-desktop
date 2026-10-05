@@ -27,6 +27,9 @@ interface EditorialDropListProps {
   theme?: 'light' | 'dark' | 'minimal';
   currentUserId?: string;
   currentSpaceKey: string; // workspace id or 'personal'
+  /** Round 119 — reports Quick Jump blocker state (sort menu, bulk move/delete, category
+   *  confirm, or any card's own blocker); false on cleanup. Optional. */
+  onBlockedChange?: (blocked: boolean) => void;
 }
 
 const BUILT_IN_CATEGORIES = [
@@ -91,6 +94,7 @@ export function EditorialDropList({
   theme = 'light',
   currentUserId,
   currentSpaceKey,
+  onBlockedChange,
 }: EditorialDropListProps) {
   const { settings, updateSettings, removeDropInPlace } = useVaultStore();
   const [selectionMode, setSelectionMode] = useState(false);
@@ -113,6 +117,17 @@ export function EditorialDropList({
 
   useEffect(() => { setSelectedCategory('all'); }, [categories]);
   const [confirmDeleteCategory, setConfirmDeleteCategory] = useState<string | null>(null);
+  // Round 119 — per-card Quick Jump blockers (context menu / inline delete confirm), keyed
+  // by drop id so one card closing never unblocks another (a single boolean from N cards
+  // is unsafe — plan B3). Stable callback; size-guarded so no-op updates skip re-renders.
+  const [cardBlockedIds, setCardBlockedIds] = useState<Set<string>>(new Set());
+  const handleCardBlockedChange = useCallback((dropId: string, blocked: boolean) => {
+    setCardBlockedIds((prev) => {
+      const next = new Set(prev);
+      if (blocked) next.add(dropId); else next.delete(dropId);
+      return next.size === prev.size ? prev : next;
+    });
+  }, []);
 
   const tc = getEditorialThemeColors(theme);
   const font = tc.fontClass;
@@ -395,6 +410,13 @@ export function EditorialDropList({
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const [sortMenuPos, setSortMenuPos] = useState<{ top: number; left: number } | null>(null);
   const sortTriggerRef = useRef<HTMLButtonElement>(null);
+  // Round 119 — Quick Jump blocker report: this list's own overlay states + any card.
+  const listBlocked = sortMenuOpen || !!bulkMoveDrops || bulkMoving || deleting ||
+    !!confirmDeleteCategory || cardBlockedIds.size > 0;
+  useEffect(() => {
+    onBlockedChange?.(listBlocked);
+    return () => onBlockedChange?.(false);
+  }, [onBlockedChange, listBlocked]);
   const currentSortLabel = SORT_OPTIONS.find((o) => o.value === sortMode)?.label ?? 'Newest';
   const openSortMenu = () => {
     const rect = sortTriggerRef.current?.getBoundingClientRect();
@@ -874,6 +896,7 @@ export function EditorialDropList({
                               onUnpin={handlePinDrop}
                               onEdit={onEdit}
                               allDrops={drops}
+                              onBlockedChange={handleCardBlockedChange}
                             />
                           ) : (
                             <EditorialDropItem
@@ -890,6 +913,7 @@ export function EditorialDropList({
                               onUnpin={handlePinDrop}
                               onEdit={onEdit}
                               allDrops={drops}
+                              onBlockedChange={handleCardBlockedChange}
                               showMoveControls={moveIdx !== undefined}
                               canMoveUp={moveIdx !== undefined && moveIdx > 0}
                               canMoveDown={moveIdx !== undefined && moveIdx < manualCount - 1}

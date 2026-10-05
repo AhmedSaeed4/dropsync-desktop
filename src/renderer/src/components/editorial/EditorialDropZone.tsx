@@ -33,6 +33,9 @@ interface EditorialDropZoneProps {
   /** Paste guard while ANY edit modal is open elsewhere on the page. */
   editModalOpen?: boolean;
   mentionableDrops?: Drop[];
+  /** Round 119 — reports Quick Jump blocker state (create modal open or upload in flight);
+   *  false on cleanup/unmount. Optional — absent = no reporting. */
+  onBlockedChange?: (blocked: boolean) => void;
 }
 
 // Richer upload state (web parity): idle, live-uploading with real byte progress, done, or an
@@ -59,6 +62,7 @@ export function EditorialDropZone({
   onCreateCategory,
   editModalOpen = false,
   mentionableDrops = [],
+  onBlockedChange,
 }: EditorialDropZoneProps) {
   const { appendDropInPlace } = useVaultStore();
   const [isDragging, setIsDragging] = useState(false);
@@ -75,6 +79,13 @@ export function EditorialDropZone({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const tc = getEditorialThemeColors(theme);
+  // Round 119 — Quick Jump blocker report: the create-text modal and an in-flight upload
+  // own the keyboard (typing + progress); report either.
+  const zoneBlocked = showTextModal || busy;
+  useEffect(() => {
+    onBlockedChange?.(zoneBlocked);
+    return () => onBlockedChange?.(false);
+  }, [onBlockedChange, zoneBlocked]);
 
   // --- File upload helpers ---
   const uploadFiles = useCallback(

@@ -98,6 +98,12 @@ export default function HoldToDeleteButton({
       onPointerLeave={cancel}
       onPointerCancel={cancel}
       onKeyDown={(e) => {
+        // Round 119: Quick Jump owns the Space chords (Ctrl+Space / Ctrl+Shift+Space /
+        // Shift+Space — the web's hotkeys, EditorialQuickJump). Without this guard a
+        // modified Space on this FOCUSED button would both start a destructive hold and
+        // preventDefault the hotkey dead (plan-report Drift finding #1). Plain Space/Enter
+        // hold is unchanged.
+        if (e.key === ' ' && (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey)) return;
         if ((e.key === 'Enter' || e.key === ' ') && !e.repeat) {
           e.preventDefault();
           begin();
