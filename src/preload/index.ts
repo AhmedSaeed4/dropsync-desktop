@@ -4,7 +4,7 @@
  */
 
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { DropsyncBridge, ImportProgressDTO, UpdateProgressDTO } from './apiTypes';
+import type { DropsyncBridge, ImportProgressDTO, UpdateProgressDTO, ViewAsLensSelectionDTO, ViewAsMenuRequestDTO, ViewAsStateDTO } from './apiTypes';
 
 function invoke<T = void>(channel: string, ...args: unknown[]): Promise<T> {
   return ipcRenderer.invoke(channel, ...args).then((value) => {
@@ -62,6 +62,17 @@ const api: DropsyncBridge = {
     refreshTitles: (spaceId: string) => invoke('youtube:refreshTitles', spaceId),
     // Round 114 — fetch-once-then-cache thumbnail; null offline/dead (placeholder stays).
     getThumbnail: (videoId: string) => invoke('youtube:getThumbnail', videoId),
+  },
+  viewAs: {
+    // Round 120 — the native View-as menu bridge: surfaces report availability, request
+    // the combined menu with renderer-side facts, and receive picks back.
+    state: (state: ViewAsStateDTO) => invoke('viewAs:state', state),
+    menu: (request: ViewAsMenuRequestDTO) => invoke('viewAs:menu', request),
+    onViewAsLensSelected: (listener: (selection: ViewAsLensSelectionDTO) => void): (() => void) => {
+      const wrapped = (_e: unknown, selection: ViewAsLensSelectionDTO): void => listener(selection);
+      ipcRenderer.on('viewAs:lensSelected', wrapped as never);
+      return () => ipcRenderer.removeListener('viewAs:lensSelected', wrapped as never);
+    },
   },
   mode: {
     get: () => invoke<'cloud' | 'local'>('mode:get'),

@@ -23,7 +23,7 @@ import { initCloud, attachCloudResizeTracking, wireHtmlFullscreen, PILL_TOP, PIL
 import { attachContextMenu } from './contextMenu';
 // Round 111 §8 DEV battery — the f_29_* legs assert the builder's pure menu shape and the
 // attach-map state (main-side seams; the menu is OUR native UI, so no page-side probe exists).
-import { buildContextMenuItems, isContextMenuAttached } from './contextMenu';
+import { buildContextMenuItems, buildViewAsMenuItems, isContextMenuAttached, isViewAsLive, setViewAsAvailability, type ViewAsMenuRequest } from './contextMenu';
 // Round 118 — in-app updates (manual mode; see src/main/updater.ts).
 import { wireUpdater, checkForUpdate, downloadUpdate, cancelUpdate, installUpdate, fetchUpdateNotes } from './updater';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
@@ -8920,6 +8920,20 @@ function registerIpc(): void {
   // ---- YouTube thumbnails (round 114): fetch-once-then-cache, main-process only — the
   // renderer stays zero-network (CSP untouched). Null offline/dead ⇒ the card's placeholder.
   handle('youtube:getThumbnail', (_e, videoId: string) => getYouTubeThumbnail(videoId));
+
+  // ---- View-as lenses (round 120): the renderer's text surfaces report availability and
+  // request the combined native menu; a pick returns as viewAs:lensSelected (pill pattern).
+  handle('viewAs:state', (_e, state: { available: boolean; surfaceId: string }) => {
+    setViewAsAvailability(_e.sender, state.available);
+    console.log(`[view-as] state surfaceId=${state.surfaceId} available=${state.available}`);
+  });
+  handle('viewAs:menu', (_e, request: ViewAsMenuRequest) => {
+    console.log(`[view-as] menu surfaceId=${request.surfaceId} lens=${request.lens} live=${isViewAsLive(_e.sender)}`);
+    const send = (lens: string): void => {
+      if (!_e.sender.isDestroyed()) _e.sender.send('viewAs:lensSelected', { surfaceId: request.surfaceId, lens });
+    };
+    Menu.buildFromTemplate(buildViewAsMenuItems(request, send)).popup();
+  });
 
   // ---- Open in browser (https-only — the one shell surface the renderer gets)
   handle('shell:openExternal', async (_e, url: string) => {

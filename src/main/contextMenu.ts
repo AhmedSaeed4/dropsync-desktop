@@ -58,3 +58,69 @@ export function attachContextMenu(wc: WebContents, label: string): void {
     Menu.buildFromTemplate(items).popup();
   });
 }
+
+// ==== Round 120 (View-as lenses) — the native "View as" submenu =========================
+// The renderer's text surfaces own the truth (current lens, recommendations, and the
+// lens label list — the web-verbatim LENSES ride the request payload, so this file never
+// duplicates them). A right-click there suppresses the round-111 listener for that click
+// (DOM preventDefault — suppression probe-proven 2026-10-08) and requests the COMBINED
+// menu with renderer-side facts. The round-111 items are recomputed by the UNTOUCHED
+// buildContextMenuItems from those facts (same rules, never re-implemented); the View-as
+// submenu carries the web menu's content semantics: Recommended first, separator, all
+// lenses, a check on the current one (checkbox renders a ✓ on Windows — the web's glyph).
+
+/** Round 120 menu-request payload (mirrors ViewAsMenuRequestDTO in preload\apiTypes.ts —
+ * main cannot import preload types across bundles; the DTO is the typed authority). */
+export interface ViewAsMenuRequest {
+  surfaceId: string;
+  lens: string;
+  lenses: { lens: string; label: string }[];
+  recommendations: { lens: string; score: number }[];
+  selection: { text: string; isEditable: boolean; editFlags: { canCopy: boolean; canCut: boolean; canPaste: boolean } };
+}
+
+/** Round 120: the combined View-as menu — round-111 items from the request's facts, then
+ * the View-as submenu. Shown with popup() at the cursor (the round-111 no-x/y rule);
+ * `send` delivers a pick back to the requesting renderer. */
+export function buildViewAsMenuItems(request: ViewAsMenuRequest, send: (lens: string) => void): MenuItemConstructorOptions[] {
+  const base = buildContextMenuItems({
+    isEditable: request.selection.isEditable,
+    selectionText: request.selection.text,
+    editFlags: request.selection.editFlags,
+  });
+  const labelFor = (lens: string): string => request.lenses.find(item => item.lens === lens)?.label ?? lens;
+  const lensItem = (lens: string): MenuItemConstructorOptions => ({
+    label: labelFor(lens),
+    type: 'checkbox',
+    checked: lens === request.lens,
+    click: () => send(lens),
+  });
+  const submenu: MenuItemConstructorOptions[] = [
+    ...request.recommendations.map(item => lensItem(item.lens)),
+    { type: 'separator' },
+    ...request.lenses.map(item => lensItem(item.lens)),
+  ];
+  return [
+    ...(base ?? []),
+    ...(base ? [{ type: 'separator' } as MenuItemConstructorOptions] : []),
+    { label: 'View as', submenu },
+  ];
+}
+
+/** Round 120: transient per-webContents view-as availability (hygiene + battery legs
+ * only — a menu request carries its own facts; this store never decides anything).
+ * Cleared by the surface's available:false report (unmount) and by destruction. */
+const viewAsLive = new Map<WebContents, boolean>();
+
+export function setViewAsAvailability(wc: WebContents, available: boolean): void {
+  if (!available) {
+    viewAsLive.delete(wc);
+    return;
+  }
+  if (!viewAsLive.has(wc)) wc.once('destroyed', () => viewAsLive.delete(wc));
+  viewAsLive.set(wc, true);
+}
+
+export function isViewAsLive(wc: WebContents): boolean {
+  return viewAsLive.get(wc) === true && !wc.isDestroyed();
+}

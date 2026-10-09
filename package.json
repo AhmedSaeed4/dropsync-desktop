@@ -1,6 +1,6 @@
 {
   "name": "dropsync-desktop",
-  "version": "1.0.19",
+  "version": "1.0.20",
   "description": "DropSync Desktop — offline encrypted vault companion for .dropsync backups",
   "main": "./out/main/index.js",
   "type": "module",
@@ -20,7 +20,10 @@
   "dependencies": {
     "@excalidraw/excalidraw": "^0.18.1",
     "@zip.js/zip.js": "^2.8.36",
-    "electron-updater": "6.8.10"
+    "electron-updater": "6.8.10",
+    "highlight.js": "11.12.0",
+    "react-markdown": "10.1.0",
+    "remark-breaks": "4.0.0"
   },
   "devDependencies": {
     "@dnd-kit/core": "^6.3.1",
