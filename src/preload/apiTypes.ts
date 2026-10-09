@@ -167,6 +167,27 @@ export interface RefreshTitlesResultDTO {
   updatedDrops?: DropDTO[];
 }
 
+/** Round 120 (View-as lenses) — the nine text lenses (web Round 24 parity) + the native
+ * menu bridge payloads. The lens list WITH labels rides the menu request so the main
+ * process never duplicates the renderer's LENSES constant (single source of truth). */
+export type TextLensDTO = 'plain' | 'markdown' | 'typescript' | 'javascript' | 'python' | 'json' | 'html' | 'css' | 'bash';
+export interface TextLensOptionDTO { lens: TextLensDTO; label: string }
+export interface TextRecommendationDTO { lens: TextLensDTO; score: number }
+export interface ViewAsStateDTO { available: boolean; surfaceId: 'text-body' | 'text-file' }
+export interface ViewAsSelectionFactsDTO {
+  text: string;
+  isEditable: boolean;
+  editFlags: { canCopy: boolean; canCut: boolean; canPaste: boolean };
+}
+export interface ViewAsMenuRequestDTO {
+  surfaceId: 'text-body' | 'text-file';
+  lens: TextLensDTO;
+  lenses: TextLensOptionDTO[];
+  recommendations: TextRecommendationDTO[];
+  selection: ViewAsSelectionFactsDTO;
+}
+export interface ViewAsLensSelectionDTO { surfaceId: 'text-body' | 'text-file'; lens: TextLensDTO }
+
 /** Round 107 — move/copy drops between spaces (repair-order-107 §4 FIX A). One call per
  * batch; the target is 'personal' or a workspace id. */
 export interface DropTransferArgs {
@@ -246,6 +267,12 @@ export interface DropsyncBridge {
     refreshTitles(spaceId: string): Promise<RefreshTitlesResultDTO>;
     /** Round 114 — fetch-once-then-cache thumbnail; null offline/dead/unknown. */
     getThumbnail(videoId: string): Promise<string | null>;
+  };
+  /** Round 120 — the native View-as menu bridge (right-click on a preview text surface). */
+  viewAs: {
+    state(state: ViewAsStateDTO): Promise<void>;
+    menu(request: ViewAsMenuRequestDTO): Promise<void>;
+    onViewAsLensSelected(listener: (selection: ViewAsLensSelectionDTO) => void): () => void;
   };
   /** C1 — desktop mode. Cloud = embedded real site; Local = the encrypted vault UI.
    * (C2f: the porch-era probeEmail/devC2 members are gone with the porch.) */

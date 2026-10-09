@@ -259,3 +259,14 @@ select {
 @media (prefers-reduced-motion: reduce) {
   .ds-link, .ds-link::after { transition: none; }
 }
+
+/* Round 120 (View-as lenses) — the code-lens token colors. Web parity: the web ships
+   these inside TextRenderSurface via styled-jsx (a Next.js feature the desktop lacks);
+   the desktop keeps them here, the .ds-link precedent. The --tr-* custom properties
+   ride the surface's inline style per theme (light/dark). */
+.ds-text-code .hljs-keyword, .ds-text-code .hljs-selector-tag { color: var(--tr-keyword); }
+.ds-text-code .hljs-string, .ds-text-code .hljs-attr, .ds-text-code .hljs-regexp { color: var(--tr-string); }
+.ds-text-code .hljs-number, .ds-text-code .hljs-literal { color: var(--tr-number); }
+.ds-text-code .hljs-type, .ds-text-code .hljs-built_in, .ds-text-code .hljs-variable { color: var(--tr-type); }
+.ds-text-code .hljs-title, .ds-text-code .hljs-name, .ds-text-code .hljs-tag { color: var(--tr-title); }
+.ds-text-code .hljs-comment, .ds-text-code .hljs-quote, .ds-text-code .hljs-meta { color: var(--tr-comment); }
