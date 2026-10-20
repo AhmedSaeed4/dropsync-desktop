@@ -99,6 +99,23 @@ export interface DropDTO {
   contentSha256s?: { content?: string; file?: string; image?: string };
 }
 
+// Round 121 — the texty-file rule for FILE-drop text previews. Same mime prefixes +
+// extensions as the renderer's isTextFileDrop (src/renderer/src/lib/dropsHelpers.ts:111)
+// and the web's isTextFile (drag-drop-app EditorialPreviewModal.tsx:48). Keep all three
+// in sync. Main keeps its own copy: tsconfig separation means main cannot import
+// renderer modules.
+const TEXTY_FILE_MIME_PREFIXES = ['text/', 'application/json', 'application/xml'];
+const TEXTY_FILE_EXTENSIONS = ['.txt', '.md', '.json', '.csv', '.xml', '.html', '.css', '.js', '.ts', '.jsx', '.tsx'];
+// The web only holds inline file bytes below its encryption threshold (drag-drop-app
+// drops.ts:44 MAX_ENCRYPTION_SIZE = 10MB; strict `<` at drops.ts:578) — bigger files have
+// no text preview there, so they get none here either.
+const FILE_TEXT_INLINE_LIMIT = 10 * 1024 * 1024;
+
+function isTextyFileRecord(mimeType: string | undefined, name: string): boolean {
+  return TEXTY_FILE_MIME_PREFIXES.some(t => mimeType?.startsWith(t)) ||
+         TEXTY_FILE_EXTENSIONS.some(ext => name.toLowerCase().endsWith(ext));
+}
+
 function toDTO(record: VaultDropRecord): DropDTO {
   return {
     id: record.id,
@@ -660,6 +677,26 @@ export class VaultManager {
       return { text: new TextDecoder().decode(bytes) };
     }
     return { text: record.content ?? '' };
+  }
+
+  /**
+   * Round 121 — decrypted preview TEXT for a texty FILE drop (web parity: the web shows a
+   * text preview for exactly the files whose bytes it holds inline, i.e. its <10MB encrypted
+   * upload path). NULL — never a rejection — for: non-file drops, a missing file blob, a
+   * non-texty mime/extension, or the file at/over FILE_TEXT_INLINE_LIMIT; the IPC handler
+   * maps null to the historical { text: undefined } so the renderer stays dormant exactly
+   * as before. Size gate runs on ref.bytes (stamped at write time) BEFORE any read.
+   */
+  async getFileTextPayload(dropId: string): Promise<{ text: string } | null> {
+    this.assertUnlocked();
+    const record = this.findDrop(dropId);
+    if (record.type !== 'file') return null;
+    const ref = record.blobRefs.file;
+    if (!ref) return null;
+    if (!isTextyFileRecord(record.mimeType, record.name)) return null;
+    if (!(ref.bytes < FILE_TEXT_INLINE_LIMIT)) return null;
+    const bytes = await readBlobAll(this.fsmod, pathMod.join(this.blobsDir, pathMod.basename(ref.path)), this.keys!.dek);
+    return { text: new TextDecoder().decode(bytes) };
   }
 
   /**
