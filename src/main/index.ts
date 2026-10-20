@@ -8847,8 +8847,15 @@ function registerIpc(): void {
     payloadFetchCount += 1; // battery counter (FIX 8 verification) — exposed ONLY via dev:testOnly
     const meta = manager.getDropMeta(dropId);
     if (!meta) return null;
-    if (meta.type !== 'text') return { text: undefined };
-    return manager.getTextPayload(dropId);
+    if (meta.type === 'text') return manager.getTextPayload(dropId);
+    // Round 121 — a texty FILE drop (mime/extension rule, strictly under 10 MB) decodes its
+    // blob as preview text; null keeps the historical { text: undefined } so non-texty and
+    // oversized files stay dormant exactly as before.
+    if (meta.type === 'file') {
+      const fileText = await manager.getFileTextPayload(dropId);
+      return fileText ?? { text: undefined };
+    }
+    return { text: undefined };
   });
   handle('drop:patch', (_e, dropId: string, patch: Parameters<VaultManager['patchDropMeta']>[1]) => manager.patchDropMeta(dropId, patch));
   handle('drop:delete', (_e, dropId: string) => manager.deleteDrop(dropId));
