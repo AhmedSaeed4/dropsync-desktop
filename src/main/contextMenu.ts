@@ -50,7 +50,29 @@ export function attachContextMenu(wc: WebContents, label: string): void {
     if (attached.get(label) === wc) attached.delete(label);
   });
   wc.on('context-menu', (_event, props) => {
-    const items = buildContextMenuItems(props);
+    const base = buildContextMenuItems(props);
+    // Round 122 (#36) — Chrome-parity image copy. The payload names the node under the
+    // cursor (mediaType 'image' — electron.d.ts ContextMenuParams) and copyImageAt
+    // copies the RENDERED bitmap at those coordinates to the clipboard: a main-process
+    // webContents call, zero page access (site sanctity holds; same posture as the
+    // items buildContextMenuItems returns). Editable targets keep winning (an editable
+    // context is never an image); every non-image right-click keeps the exact old
+    // behavior (base, silent or not). The log line is the battery's marker (f_122):
+    // the attach label names the surface. The clipboard itself is verified harness-side
+    // — copyImageAt's write lands asynchronously, so an in-process read would race it.
+    const items =
+      props.mediaType === 'image' && !props.isEditable
+        ? [
+            {
+              label: 'Copy image',
+              click: () => {
+                wc.copyImageAt(props.x, props.y);
+                console.log(`[context-menu] copy-image ${label}`);
+              },
+            },
+            ...(base ? [{ type: 'separator' } as MenuItemConstructorOptions, ...base] : []),
+          ]
+        : base;
     if (items === null) return;
     // No x/y: popup() opens at the mouse cursor on Windows — exactly where the right-click
     // landed — and skips all view↔window coordinate math (the site view is a
