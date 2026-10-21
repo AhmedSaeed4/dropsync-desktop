@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useBodyScrollLock } from '../hooks/useBodyScrollLock';
 import { useEscapeClose } from '../hooks/useEscapeClose';
 import { getEditorialThemeColors } from '../lib/editorialTheme';
 import { useVaultStore } from '../store/vault';
 import { EditorialSelect } from './editorial/EditorialSelect';
+import type { LaunchAtLoginStateDTO } from '../../../preload/apiTypes';
 
 interface SettingsModalProps {
   onClose: () => void;
@@ -27,6 +28,12 @@ const AUTO_LOCK_OPTIONS = [
   { value: '120', label: '2 hours' },
   { value: '240', label: '4 hours' },
   { value: '480', label: '8 hours' },
+  { value: 'off', label: 'Off' },
+];
+
+/** Round 123 — Start-with-Windows switch (default ON, owner-locked). */
+const STARTUP_OPTIONS = [
+  { value: 'on', label: 'On' },
   { value: 'off', label: 'Off' },
 ];
 
@@ -54,6 +61,28 @@ export function SettingsModal({ onClose, onLockNow, onVaultMoved, onSwitchToClou
   // C2l FIX 1 — `?? 10` treated the STORED "Off" (null) as "never set" and displayed 10 minutes.
   // Only a truly-absent setting falls back to the 10-minute default; an explicit Off stays Off.
   const autoLock = settings?.autoLockMinutes === undefined ? 10 : settings.autoLockMinutes;
+
+  // Round 123 — Windows launch-at-login. The section renders only when main reports the
+  // switch as available (installed builds; a dev tree hides it — Windows can only register
+  // the packaged exe). The displayed value is the registry truth returned by main after
+  // every write, never an optimistic local guess.
+  const [startupState, setStartupState] = useState<LaunchAtLoginStateDTO | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    window.dropsync.startup.get()
+      .then((state) => { if (!cancelled) setStartupState(state); })
+      .catch(() => { /* bridge failure — the section simply stays hidden */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleStartup = async (value: string) => {
+    try {
+      setStartupState(await window.dropsync.startup.set(value === 'on'));
+    } catch {
+      /* main already logged the failure; keep showing the last true state */
+    }
+  };
 
   const handleChangePassword = async () => {
     if (newPassword.length < 8) {
@@ -190,6 +219,24 @@ export function SettingsModal({ onClose, onLockNow, onVaultMoved, onSwitchToClou
               options={AUTO_LOCK_OPTIONS}
             />
           </div>
+
+          {/* Round 123 — Start with Windows (default ON; the packaged exe registers itself
+              in the user's HKCU Run key — the same list Windows shows under Apps → Startup). */}
+          {startupState?.available && (
+            <div>
+              <h3 className={`${tc.fontClass} ${tc.text} font-medium text-sm mb-3`}>Start with Windows</h3>
+              <p className={`text-xs ${tc.muted} ${tc.fontClass} mb-2`}>
+                Start DropSync automatically when you sign in to Windows. The vault always starts locked.
+              </p>
+              <EditorialSelect
+                theme={theme}
+                ariaLabel="Start with Windows"
+                value={startupState.enabled ? 'on' : 'off'}
+                onChange={(v) => void handleStartup(v)}
+                options={STARTUP_OPTIONS}
+              />
+            </div>
+          )}
 
           {/* Theme */}
           <div>
