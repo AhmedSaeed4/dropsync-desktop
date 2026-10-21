@@ -26,6 +26,8 @@ import { attachContextMenu } from './contextMenu';
 import { buildContextMenuItems, buildViewAsMenuItems, isContextMenuAttached, isViewAsLive, setViewAsAvailability, type ViewAsMenuRequest } from './contextMenu';
 // Round 118 — in-app updates (manual mode; see src/main/updater.ts).
 import { wireUpdater, checkForUpdate, downloadUpdate, cancelUpdate, installUpdate, fetchUpdateNotes } from './updater';
+// Round 123 — launch at login (default ON + the Settings switch; see src/main/launchAtLogin.ts).
+import { getLaunchAtLoginState, setLaunchAtLogin, syncLaunchAtLoginAtBoot } from './launchAtLogin';
 import { inspectArchive, importArchive, recoverInterruptedImport, desktopTypeMismatchMessage, type ImportDestination } from './vault/importer.ts';
 import { exportSpaceArchive } from './vault/exporter.ts';
 import {
@@ -8437,6 +8439,10 @@ if (!gotLock) {
     applyFrameTheme(currentTheme());
     registerMediaProtocol();
     registerIpc();
+    // Round 123 — launch-at-login boot sync (best-effort; packaged-only — a dev tree
+    // without DROPSYNC_STARTUP_DEV=1 is a silent no-op). After registerIpc so the
+    // startup:* handlers exist before any renderer can call them.
+    syncLaunchAtLoginAtBoot();
     void sit3BootUnlock().then(() => {
       createWindow();
     });
@@ -8968,6 +8974,11 @@ function registerIpc(): void {
   handle('update:download', () => downloadUpdate());
   handle('update:cancel', () => cancelUpdate());
   handle('update:install', () => installUpdate());
+
+  // ---- launch at login (round 123 — default ON + the Settings switch; the module owns
+  // the registry + the userData pref; set() returns the fresh Windows truth)
+  handle('startup:get', () => getLaunchAtLoginState());
+  handle('startup:set', (_e, enabled: boolean) => setLaunchAtLogin(enabled));
 
   // ---- settings
   handle('vault:settingsGet', () => manager.getSettings());

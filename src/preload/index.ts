@@ -99,6 +99,11 @@ const api: DropsyncBridge = {
     cancel: () => invoke('update:cancel'),
     install: () => invoke('update:install'),
   },
+  startup: {
+    // Round 123 — Windows launch-at-login; set() returns the fresh registry truth.
+    get: () => invoke('startup:get'),
+    set: (enabled: boolean) => invoke('startup:set', enabled),
+  },
   dialog: {
     pickOpen: (options?: { title?: string; extensions?: string[] }) => invoke('dialog:pickOpen', options ?? {}),
     pickOpenMultiple: (options?: { title?: string; extensions?: string[] }) => invoke('dialog:pickOpenMultiple', options ?? {}),

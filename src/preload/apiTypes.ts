@@ -115,6 +115,13 @@ export interface UpdateProgressDTO {
   bytesPerSecond: number;
 }
 
+/** Round 123 — Windows launch-at-login. `available` is false in a dev tree (the packaged
+ * exe is what Windows registers); `enabled` is the registry truth, not a stored guess. */
+export interface LaunchAtLoginStateDTO {
+  available: boolean;
+  enabled: boolean;
+}
+
 /** Expiry menu is exactly these five on desktop (LOCKED decision — 4h stays import-only). */
 export type CreateExpirationOptionDTO = '1h' | '2h' | '6h' | '24h' | 'forever';
 
@@ -296,6 +303,11 @@ export interface DropsyncBridge {
     download(): Promise<boolean>;
     cancel(): Promise<boolean>;
     install(): Promise<boolean>;
+  };
+  /** Round 123 — Windows launch-at-login (default ON + the Settings switch). */
+  startup: {
+    get(): Promise<LaunchAtLoginStateDTO>;
+    set(enabled: boolean): Promise<LaunchAtLoginStateDTO>;
   };
   dialog: {
     pickOpen(options?: { title?: string; extensions?: string[] }): Promise<string | null>;
