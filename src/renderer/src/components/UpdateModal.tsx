@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import { useEscapeClose } from '../hooks/useEscapeClose';
 import { useBodyScrollLock } from '../hooks/useBodyScrollLock';
 import { getEditorialThemeColors } from '../lib/editorialTheme';
-import { LinkedText } from './shared/DropMentionContent';
+import ReactMarkdown, { type Components } from 'react-markdown';
+import remarkBreaks from 'remark-breaks';
 
 type Theme = 'light' | 'dark' | 'minimal';
 type Phase = 'confirm' | 'downloading' | 'ready' | 'error';
@@ -18,12 +19,48 @@ function fmtMB(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Round 124 — markdown rendering for the notes box (the TextRenderSurface house pattern,
+ * TextRenderSurface.tsx:242). Elements are themed modestly at the box's text-sm scale via
+ * the factory's tc tokens. Raw HTML in the notes can NEVER render (react-markdown skips it
+ * without rehype-raw — it shows as literal text, by design). Links are plain
+ * <a target="_blank"> anchors: the main window's round-117 https-only window-open gate
+ * sends https to the default browser and denies everything else — no renderer-side
+ * navigation. Headings/bold map to themed divs (no UA heading margins inside the box). */
+function noteMarkdownComponents(tc: ReturnType<typeof getEditorialThemeColors>): Components {
+  return {
+    h1: ({ children }) => <div className={`mt-2 text-[15px] font-medium first:mt-0 ${tc.text}`}>{children}</div>,
+    h2: ({ children }) => <div className={`mt-2 text-[15px] font-medium first:mt-0 ${tc.text}`}>{children}</div>,
+    h3: ({ children }) => <div className={`mt-2 text-sm font-medium first:mt-0 ${tc.text}`}>{children}</div>,
+    p: ({ children }) => <div className="mt-1.5 first:mt-0">{children}</div>,
+    ul: ({ children }) => <ul className="mt-1.5 list-disc space-y-1 pl-5 first:mt-0">{children}</ul>,
+    ol: ({ children }) => <ol className="mt-1.5 list-decimal space-y-1 pl-5 first:mt-0">{children}</ol>,
+    li: ({ children }) => <li className="pl-1">{children}</li>,
+    a: ({ href, children }) => (
+      <a href={href} target="_blank" rel="noopener noreferrer" className="ds-link">{children}</a>
+    ),
+    code: ({ children }) => <code className="font-mono text-xs opacity-90">{children}</code>,
+    pre: ({ children }) => (
+      <pre className={`mt-1.5 overflow-x-auto rounded border ${tc.border} p-2 first:mt-0`}>{children}</pre>
+    ),
+    blockquote: ({ children }) => (
+      <div className={`mt-1.5 border-l-2 pl-2 opacity-80 first:mt-0 ${tc.border}`}>{children}</div>
+    ),
+  };
+}
+
 /**
  * Round 118 — the in-app update modal (owner lock: user clicks every step). Confirm →
  * Download (progress + cancel) → Update & restart. The "what's new" text comes from the
- * release notes via the bridge; each line renders through LinkedText so https/www URLs in
- * the notes are clickable (round 117 machinery). The release-page link opens the default
- * browser through the https-only shell:openExternal bridge.
+ * bridge as the GitHub release body's RAW markdown source (updater.ts fetchUpdateNotes)
+ * and renders as MARKDOWN (round 124: react-markdown + remark-breaks, the
+ * TextRenderSurface house pattern — release bodies are markdown-authored on GitHub).
+ * Round 124 owner rule: while the installed base predates this modal, notes are authored
+ * PLAIN-SAFE (paragraphs, "- " bullets, [label](https://…) links — no "##" headings or
+ * "**" bold), which renders clean here AND as clean plain text in every older app.
+ * Note links are real <a target="_blank"> anchors riding the round-117 https-only
+ * window-open gate (index.ts setWindowOpenHandler): https opens the default browser,
+ * everything else is denied. The release-page link opens through the https-only
+ * shell:openExternal bridge.
  */
 export function UpdateModal({ theme, currentVersion, newVersion, onClose }: UpdateModalProps) {
   const tc = getEditorialThemeColors(theme);
@@ -75,12 +112,13 @@ export function UpdateModal({ theme, currentVersion, newVersion, onClose }: Upda
           </p>
 
           {notes !== null && notes.trim().length > 0 && (
-            <div className={`mt-4 rounded-lg border ${tc.border} p-3 text-sm ${tc.text} max-h-52 overflow-y-auto whitespace-pre-line break-words`}>
-              {(notes ?? '').split('\n').map((line, i) => (
-                <div key={i} className={line.trim().length === 0 ? 'h-2' : ''}>
-                  <LinkedText text={line} />
-                </div>
-              ))}
+            <div className={`mt-4 rounded-lg border ${tc.border} p-3 text-sm ${tc.text} max-h-52 overflow-y-auto break-words`}>
+              <ReactMarkdown
+                remarkPlugins={[remarkBreaks]}
+                components={noteMarkdownComponents(tc)}
+              >
+                {notes}
+              </ReactMarkdown>
             </div>
           )}
 
