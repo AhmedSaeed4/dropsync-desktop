@@ -84,42 +84,6 @@ async function performDelete(drop: Drop, onDeleted: OnDeleted) {
   notify();
 }
 
-/**
- * FIX 17 — begin a BATCH delete through the SAME visual pipeline as the single-delete flow.
- * Every selected id is tombstoned SYNCHRONOUSLY and ONE notify() fires, so the cards leave the
- * rendered array in the very React commit that processed the confirm click — identical start
- * timing, identical unified-tree exit ({opacity:0,scale:0.9}, 200 ms, popLayout) and identical
- * neighbor glide as a per-card delete, for one selected item or twenty. The IPC deletes then run
- * behind the curtain and the parent commits each id IN PLACE via removeDropInPlace (zero visual
- * event — the tombstone already hid them), the exact contract of the undo flow's commit.
- * NO pending entries are created here: batch deletes carry no undo window and no toast (web
- * parity — requestDelete stays single-only; the web's handleBulkDelete likewise bypasses the
- * store). A failed id releases its tombstone so its card re-appears (same recovery contract as
- * performDelete). Returns true when every delete committed.
- */
-export async function performBatchDelete(drops: Drop[], onDeleted: OnDeleted): Promise<boolean> {
-  const fresh = drops.filter((d) => !tombstone.has(d.id));
-  if (fresh.length === 0) return true;
-  for (const d of fresh) tombstone.add(d.id);
-  notify(); // THE batch's visual event — synchronous, same-frame as a requestDelete hide
-  const results = await Promise.all(fresh.map(async (d) => {
-    try {
-      const ok = await window.dropsync.drop.delete(d.id);
-      if (ok) {
-        onDeleted(d.id);
-      } else {
-        tombstone.delete(d.id);
-      }
-      return ok;
-    } catch {
-      tombstone.delete(d.id);
-      return false;
-    }
-  }));
-  notify();
-  return results.every(Boolean);
-}
-
 /** Begin a single-drop delete with a 30s undo window. */
 export function requestDelete(drop: Drop, onDeleted: OnDeleted) {
   const expiresAt = Date.now() + DELETE_DELAY_MS;

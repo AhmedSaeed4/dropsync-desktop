@@ -11,7 +11,8 @@ import { Toast } from '../shared/Toast';
 import { isReminderFiredShared, isReminderGlowingForViewer, sortUnpinned, type DropSortMode } from '../../lib/dropsHelpers';
 import { dropMatchesSearchQuery } from '../../lib/youtubeLabels';
 import { useNow } from '../../hooks/useNow';
-import { usePendingDeletions, requestDelete, undo, dismiss, performBatchDelete } from '../../lib/pendingDeletions';
+import { usePendingDeletions, requestDelete, undo, dismiss } from '../../lib/pendingDeletions';
+import { startDropOperation } from '../../lib/operationCenter';
 import { invalidatePreviewPayload } from '../../lib/previewPayloadCache';
 import { getEditorialThemeColors } from '../../lib/editorialTheme';
 import { useVaultStore } from '../../store/vault';
@@ -96,20 +97,16 @@ export function EditorialDropList({
   currentSpaceKey,
   onBlockedChange,
 }: EditorialDropListProps) {
-  const { settings, updateSettings, removeDropInPlace } = useVaultStore();
+  const { settings, updateSettings, spaces, removeDropInPlace } = useVaultStore();
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  // FIX 5 (web #225) superseded 2026-09-17 (#33): the web replaced the two-tap confirm with
-  // the press-and-hold HoldToDeleteButton — this file now carries the same component and the
-  // web's deleting/holdDone sequence (D10). The undo-toast pipeline for SINGLE deletes sits
+  // D10 AMENDED (record §4 D28, 2026-10-20): the hold gesture still confirms, then the bar
+  // closes and the operations panel card takes over — the deleting/holdDone states and the
+  // 650 ms "Deleted ✓" blink are gone. The undo-toast pipeline for SINGLE deletes sits
   // downstream of its own path and is untouched.
-  const [deleting, setDeleting] = useState(false);
-  const [holdDone, setHoldDone] = useState(false);
-  // Round 107 (order §4 FIX G) — bulk move/copy: the modal's drops, the in-modal error banner
-  // (web's alert() has no desktop counterpart, D16) and the busy flag the modal's close paths veto on.
+  // Round 107 (order §4 FIX G) — the bulk move modal's drops. The old in-modal error banner
+  // + busy veto died with the D28 immediate close: failures land on the operation card now.
   const [bulkMoveDrops, setBulkMoveDrops] = useState<Drop[] | null>(null);
-  const [moveError, setMoveError] = useState<string | null>(null);
-  const [bulkMoving, setBulkMoving] = useState(false);
   const { pending: pendingDeletions, tombstone: deletedDropIds } = usePendingDeletions();
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -142,75 +139,39 @@ export function EditorialDropList({
   }, []);
 
   const selectAll = () => {
-    if (selectedIds.size === filteredDrops.length) {
+    // D17 membership form (the desktop window is always the "wide" case): off-window rows of
+    // the full filtered list count toward all-selected.
+    const allSelected = filteredDrops.length > 0 && filteredDrops.every(d => selectedIds.has(d.id));
+    if (allSelected) {
       setSelectedIds(new Set());
     } else {
       setSelectedIds(new Set(filteredDrops.map(d => d.id)));
     }
   };
 
-  const handleBulkDelete = async () => {
+  // D10 AMENDED on desktop (record §4 D28, 2026-10-20): the hold gesture still confirms,
+  // then the bar closes and the operations panel card takes over — the 650 ms "Deleted ✓"
+  // blink is gone here.
+  const handleBulkDelete = () => {
     if (selectedIds.size === 0) return;
-    setDeleting(true);
+
     const selectedDrops = filteredDrops.filter(d => selectedIds.has(d.id));
-    // FIX 17: ONE deletion pipeline. performBatchDelete tombstones every selected id
-    // SYNCHRONOUSLY inside THIS hold's commit — the same hide mechanism, start timing,
-    // exit tween and neighbor glide as the single-delete undo flow (requestDelete), for a
-    // batch of 1 or N. The IPC deletes commit behind the curtain through removeDropInPlace
-    // (zero visual event). No undo toast is created — web parity (requestDelete stays
-    // single-only; the web's bulk path likewise bypasses the undo store).
-    await performBatchDelete(selectedDrops, handleCommittedDelete);
-    selectedDrops.forEach(d => invalidatePreviewPayload(d.id));
-    setDeleting(false);
-    setHoldDone(true);
-    // D10 sequence (web parity): the green "Deleted ✓" beat plays, THEN the toolbar closes
-    // out — clear the selection, exit selection mode, drop the done beat.
-    window.setTimeout(() => {
-      setSelectedIds(new Set());
-      setSelectionMode(false);
-      setHoldDone(false);
-    }, 650);
+    if (selectedDrops.length !== selectedIds.size) return;
+
+    startDropOperation({
+      kind: 'delete',
+      drops: selectedDrops,
+      targetSpaceId: null,
+      targetName: '',
+      onItemDone: handleCommittedDelete,
+    });
+    setSelectedIds(new Set());
+    setSelectionMode(false);
   };
 
   const cancelSelection = () => {
     setSelectedIds(new Set());
     setSelectionMode(false);
-  };
-
-  // Round 107 (order §4 FIX G) — bulk move/copy. THIN by design: main owns category
-  // pre-resolution and per-drop isolation (transferDrops); this mirrors web W4's post-op
-  // contract (EditorialDropList.tsx:1356-1360/:1385-1389) — failures keep the modal open with
-  // web's exact alert wording (banner instead, D16); full success closes the modal, clears the
-  // selection, exits selection mode; moved ids leave the list silently (removeDropInPlace, D9).
-  const runBulkTransfer = async (mode: 'move' | 'copy', targetSpaceId: string) => {
-    if (!bulkMoveDrops?.length) return;
-    setBulkMoving(true);
-    try {
-      const out = await window.dropsync.drop.transfer({
-        mode, targetSpaceId, dropIds: bulkMoveDrops.map((d) => d.id),
-      });
-      if (!out.ok || !out.results) {
-        setMoveError(out.error ?? 'Failed to prepare categories. Please try again.');
-        return; // modal stays open (web parity, W4)
-      }
-      const failures = out.results.filter((r) => !r.success);
-      if (failures.length > 0) {
-        setMoveError(`${failures.length}/${out.results.length} drops failed to ${mode}: ${failures[0].error}`);
-        return;
-      }
-      // full success — web :1356-1360
-      const movedIds = mode === 'move' ? out.results.map((r) => r.id) : [];
-      setBulkMoveDrops(null);
-      setMoveError(null);
-      setSelectedIds(new Set());
-      setSelectionMode(false);
-      if (movedIds.length > 0) removeDropInPlace(movedIds); // silent in-place removal (D9)
-      onDelete();
-    } catch (error) {
-      setMoveError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBulkMoving(false);
-    }
   };
 
   // FIX 13: the behind-the-curtain commit of the undo flow — tombstone already hid the card,
@@ -411,8 +372,7 @@ export function EditorialDropList({
   const [sortMenuPos, setSortMenuPos] = useState<{ top: number; left: number } | null>(null);
   const sortTriggerRef = useRef<HTMLButtonElement>(null);
   // Round 119 — Quick Jump blocker report: this list's own overlay states + any card.
-  const listBlocked = sortMenuOpen || !!bulkMoveDrops || bulkMoving || deleting ||
-    !!confirmDeleteCategory || cardBlockedIds.size > 0;
+  const listBlocked = sortMenuOpen || !!bulkMoveDrops || !!confirmDeleteCategory || cardBlockedIds.size > 0;
   useEffect(() => {
     onBlockedChange?.(listBlocked);
     return () => onBlockedChange?.(false);
@@ -747,7 +707,7 @@ export function EditorialDropList({
                   onClick={selectAll}
                   className={`text-xs ${font} ${tc.muted} ${tc.inactivePillHoverBg} px-3 py-1.5 ${tc.roundedClass} border ${tc.border} transition-colors`}
                 >
-                  {selectedIds.size === filteredDrops.length ? 'Deselect' : 'Select all'}
+                  {(filteredDrops.length > 0 && filteredDrops.every(d => selectedIds.has(d.id))) ? 'Deselect' : 'Select all'}
                 </button>
                 <button
                   onClick={cancelSelection}
@@ -771,8 +731,8 @@ export function EditorialDropList({
                     <HoldToDeleteButton
                       variant="full"
                       count={selectedIds.size}
-                      deleting={deleting}
-                      done={holdDone}
+                      deleting={false}
+                      done={false}
                       onHoldComplete={handleBulkDelete}
                       className={`h-7 px-3 ${tc.roundedClass} hover:bg-red-600 transition-colors ${font}`}
                     />
@@ -959,15 +919,38 @@ export function EditorialDropList({
         />
       )}
 
-      {/* Bulk move/copy modal (round 107) — hosted at the component tail, mirroring the web's
-          placement (EditorialDropList.tsx:1330-1397). Close paths veto while a transfer runs. */}
+      {/* Bulk move/copy modal (round 107) — the web's D28 immediate-close shape: submit starts
+          the operation on the card and closes RIGHT AWAY; the modal never waits (failures land
+          on the operation card, not the old in-modal banner). */}
       {bulkMoveDrops && bulkMoveDrops.length > 0 && (
         <EditorialMoveDropModal
           drops={bulkMoveDrops}
-          onMove={(t) => runBulkTransfer('move', t)}
-          onCopy={(t) => runBulkTransfer('copy', t)}
-          onClose={() => { if (!bulkMoving) setBulkMoveDrops(null); }}
-          error={moveError}
+          onMove={async (t) => {
+            startDropOperation({
+              kind: 'move',
+              drops: bulkMoveDrops,
+              targetSpaceId: t,
+              targetName: spaces.find(s => s.id === t)?.name ?? 'Personal',
+              onItemDone: removeDropInPlace,
+              onSettled: onDelete,
+            });
+            setBulkMoveDrops(null);
+            setSelectedIds(new Set());
+            setSelectionMode(false);
+          }}
+          onCopy={async (t) => {
+            startDropOperation({
+              kind: 'copy',
+              drops: bulkMoveDrops,
+              targetSpaceId: t,
+              targetName: spaces.find(s => s.id === t)?.name ?? 'Personal',
+              onSettled: onDelete,
+            });
+            setBulkMoveDrops(null);
+            setSelectedIds(new Set());
+            setSelectionMode(false);
+          }}
+          onClose={() => setBulkMoveDrops(null)}
           theme={theme}
         />
       )}
