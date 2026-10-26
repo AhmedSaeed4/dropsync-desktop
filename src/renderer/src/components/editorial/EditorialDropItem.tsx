@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import type { Drop } from '../../lib/types';
 import { formatFileSize, getTimeRemaining, drawingMediaKind } from '../../lib/dropsHelpers';
 import { getYouTubeVideoId } from '../../lib/dropsHelpers';
@@ -341,7 +342,7 @@ export const EditorialDropItem = memo(function EditorialDropItem({
       {...contextMenuProps}
       className={`relative select-none ${tc.cardBg} ${tc.roundedClass} border ${tc.border} transition-all cursor-pointer group overflow-hidden ${
         tc.hoverBorder
-      }`}
+      } ${selectionMode && selected ? 'opacity-60' : ''}`}
     >
       {/* Pinned indicator */}
       {drop.pinned && (
@@ -359,11 +360,46 @@ export const EditorialDropItem = memo(function EditorialDropItem({
           </svg>
         </div>
       )}
+      {/* Selection tick — overlays the card's top-left corner (D11, mirrors the mobile
+          card): nothing is displaced while selecting — the content row below renders
+          normally. Ink-inverted when selected; covers the lock badge while selecting
+          (same trade as the mobile card). */}
+      <AnimatePresence initial={false}>
+      {selectionMode && (
+        <motion.div
+          key="tick"
+          aria-hidden="true"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          className={`absolute left-2 top-2 z-20 flex h-6 w-6 items-center justify-center rounded-lg border-[1.5px] transition-colors ${
+            selected
+              ? `${tc.activePillBg} ${tc.activePillText} border-transparent`
+              : `${tc.cardBg} ${tc.text} ${tc.border}`
+          }`}
+        >
+          {selected && (
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={3}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+            </svg>
+          )}
+        </motion.div>
+      )}
+      </AnimatePresence>
       <div className="flex flex-col sm:flex-row items-stretch min-w-0 overflow-hidden p-3 gap-3">
-        {/* Drag handle (desktop Manual mode) */}
-        {showDragHandle && (
-          <button
+        {/* Drag handle (desktop Manual mode) — drag starts only from here; hidden while
+            selecting (D11): reorder controls are out of place in selection mode. Fades and
+            scales with selection instead of a hard pop (same as the actions row). */}
+        <AnimatePresence initial={false} mode="popLayout">
+        {!selectionMode && showDragHandle && (
+          <motion.button
+            key="grip"
             type="button"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
             {...(dragHandleProps as Record<string, never>)}
             onClick={(e) => e.stopPropagation()}
             title="Drag to reorder"
@@ -374,25 +410,12 @@ export const EditorialDropItem = memo(function EditorialDropItem({
               <circle cx="1.5" cy="8" r="1.1" /><circle cx="4.5" cy="8" r="1.1" />
               <circle cx="1.5" cy="14" r="1.1" /><circle cx="4.5" cy="14" r="1.1" />
             </svg>
-          </button>
+          </motion.button>
         )}
-        {/* Selection checkbox or visual block */}
-        {selectionMode ? (
-          <button
-            onClick={(e) => { e.stopPropagation(); onSelect(drop.id); }}
-            className={`w-10 h-10 flex-shrink-0 flex items-center justify-center ${tc.roundedClass} border ${
-              selected
-                ? `border-transparent ${tc.activePillBg} ${tc.activePillText}`
-                : `${tc.border} ${tc.inactivePillHoverBg}`
-            } transition-colors`}
-          >
-            {selected && (
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="3">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-              </svg>
-            )}
-          </button>
-        ) : thumbnailSrc ? (
+        </AnimatePresence>
+        {/* Thumbnail or icon — renders NORMALLY during selection too (D11): the selection
+            tick lives on the card's corner overlay, so this column is never displaced. */}
+        {thumbnailSrc ? (
           <div className="w-full sm:w-20 h-40 sm:h-20 flex-shrink-0 overflow-hidden rounded-lg relative">
             <img
               src={thumbnailSrc}
@@ -478,7 +501,7 @@ export const EditorialDropItem = memo(function EditorialDropItem({
             </span>
           </div>
           {/* Text preview - single line truncated */}
-          {!selectionMode && drop.type === 'text' && displayContent && !thumbnailSrc && !youtubeVideoId && (
+          {drop.type === 'text' && displayContent && !thumbnailSrc && !youtubeVideoId && (
             <p className={`text-xs mt-1 ${font} ${tc.muted} line-clamp-1`}>
               <DropMentionContent
                 content={displayContent}
@@ -491,9 +514,17 @@ export const EditorialDropItem = memo(function EditorialDropItem({
           )}
         </div>
 
-        {/* Action buttons */}
+        {/* Action buttons - icon style. Fades and scales with selection instead of a hard
+            pop (the mobile bulk bar's actions idiom); AnimatePresence plays the exit. */}
+        <AnimatePresence initial={false} mode="popLayout">
         {!selectionMode && !confirmDelete && (
-          <div className={`flex flex-wrap items-center justify-end sm:justify-start gap-2 sm:gap-1 flex-shrink-0 pt-2 sm:pt-0 border-t ${tc.border} sm:border-t-0 mt-2 sm:mt-0 w-full sm:w-auto`}>
+          <motion.div
+            key="actions"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+            className={`flex flex-wrap items-center justify-end sm:justify-start gap-2 sm:gap-1 flex-shrink-0 pt-2 sm:pt-0 border-t ${tc.border} sm:border-t-0 mt-2 sm:mt-0 w-full sm:w-auto`}>
             {showMoveControls && canMoveUp && (
               <button
                 onClick={(e) => { e.stopPropagation(); onMoveUp?.(drop.id); }}
@@ -572,8 +603,9 @@ export const EditorialDropItem = memo(function EditorialDropItem({
                 <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
               </svg>
             </button>
-          </div>
+          </motion.div>
         )}
+        </AnimatePresence>
 
         {/* Inline delete confirmation */}
         {!selectionMode && confirmDelete && (
@@ -598,7 +630,7 @@ export const EditorialDropItem = memo(function EditorialDropItem({
       </div>
 
       {/* Text preview with thumbnail below the row */}
-      {!selectionMode && drop.type === 'text' && displayContent && thumbnailSrc && (
+      {drop.type === 'text' && displayContent && thumbnailSrc && (
         <div className={`px-3 pb-3 pt-0`}>
           <p className={`text-xs ${font} ${tc.muted} line-clamp-2`}>
             <DropMentionContent

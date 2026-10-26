@@ -11,6 +11,7 @@ import { EditorialHeader } from './components/editorial/EditorialHeader';
 import { EditorialStatusPanel } from './components/editorial/EditorialStatusPanel';
 import { EditorialThemeSelector } from './components/editorial/EditorialThemeSelector';
 import { EditorialDropList } from './components/editorial/EditorialDropList';
+import { OperationsPanel } from './components/OperationsPanel';
 import { EditorialPreviewModal } from './components/editorial/EditorialPreviewModal';
 import { EditorialMoveDropModal } from './components/editorial/EditorialMoveDropModal';
 import { EditorialDropZone } from './components/editorial/EditorialDropZone';
@@ -1147,6 +1148,12 @@ function AppBody({ updateInfo, localKeyboardActive }: { updateInfo: { current: s
           onDone={() => setNotifyToast(null)}
         />
       )}
+
+      {/* Round 125 — bulk operations progress cards, docked bottom-right (web D28: the web
+          mounts <OperationsPanel> at its page root; this is the App root equivalent). Lives
+          at this level so it survives every list/modal interaction; theme rides the live
+          store value the selector mutates. */}
+      <OperationsPanel theme={theme} />
     </div>
   );
 }
