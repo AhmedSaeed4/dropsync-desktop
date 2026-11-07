@@ -935,6 +935,17 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
    * the deferred re-apply and the 1 s watchdog can all call it freely — no spam, no focus steal. */
   const syncBounds = (): void => {
     if (mainWindow.isDestroyed()) return;
+    // R126 FIX — never re-assert geometry while the window is minimized. Minimized windows
+    // report degenerate content bounds (0×0), and a syncBounds call landing inside the
+    // minimize animation (the resize/move handlers fire mid-animation, plus the deferred
+    // 100/400 ms re-asserts and the 1 s watchdog) faithfully shrank the site view to
+    // nothing and shoved the pill off-screen (pillBounds x = −66 at width 0). Restoring
+    // then exposed the Local screen / themed void until the next re-assert — the owner's
+    // mode-flash (27/40 windowed restores, investigation 126). Nothing is visible while
+    // minimized, so skipping is free: every restore re-fires the resize handlers and the
+    // watchdog remains the backstop. Proven in investigation experiment X1 (0 zero-size
+    // writes, 0 reviewed flash frames across 40 cycles).
+    if (mainWindow.isMinimized()) return;
     if (view && shown) {
       const expected = siteBounds();
       const cur = view.getBounds();
