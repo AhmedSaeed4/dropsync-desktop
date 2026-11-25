@@ -270,3 +270,61 @@ select {
 .ds-text-code .hljs-type, .ds-text-code .hljs-built_in, .ds-text-code .hljs-variable { color: var(--tr-type); }
 .ds-text-code .hljs-title, .ds-text-code .hljs-name, .ds-text-code .hljs-tag { color: var(--tr-title); }
 .ds-text-code .hljs-comment, .ds-text-code .hljs-quote, .ds-text-code .hljs-meta { color: var(--tr-comment); }
+
+/* ==== ROUND 127 — frameless-shell drag affordances (repair-order-127 §4 B3) ==== */
+/* (a) App-root top band: the ONLY drag handle on header-less surfaces (unlock/create).
+   Fixed, transparent, z=0 — BELOW the EditorialHeader surface (z-40). Its height follows the
+   real WCO titlebar area (31 px measured in Phase A) with a 32 px static fallback. */
+.f127-drag-band {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 31px;
+  /* OWNER LOCK — permanent #0D0D0D (the dark-theme value, not pure black). Never changes with
+     theme, so the top section needs no repaint when the app switches light/dark/minimal. */
+  background: #0D0D0D;
+  -webkit-app-region: drag;
+  z-index: 0;
+}
+/* FINAL FIX - the Local root is padded by the SAME band height, so its content keeps the
+   original on-screen position. The padding area is covered by the permanent dark band, so
+   theme switching changes only the app below it. */
+.f127-local-root { padding-top: 31px; }
+/* FINAL FIX — instant visuals: modal backdrops (e.g. the drop preview's 300 ms colour fade)
+   must not leave the top section lagging behind the rest of the UI. Scoped to fixed full-screen
+   overlays that carry Tailwind's transition-colors token; nothing else is affected. */
+.fixed.inset-0.transition-colors { transition: none !important; }
+
+/* (b) The real Windows buttons own ~137 px at the top-right (Phase A: 137x30 @100%). Grow the
+   round-115 wide right inset by that zone, read from env() with a static fallback. */
+:root { --f127-wco-zone: calc(100vw - env(titlebar-area-width, calc(100vw - 137px))); }
+/* CORRECTION 2 / D-3: the round-115 140px wide alignment IS the wide-screen clearance and stays
+   pixel-identical. Only the <1400px header needs its smaller natural inset raised to the button
+   zone width; the main right column is never inset by us. */
+@media (max-width: 1399px) {
+  .f127-header-drag > div { --nav-pr: max(80px, var(--f127-wco-zone)) !important; }
+}
+
+/* D-49 (repair-order-127, Amendment 7; tidied in Amendment 8 / D-56) — THE HEADER IS NOT A DRAG
+   AREA IN EITHER MODE. The 31 px .f127-drag-band above it is the ONLY drag handle in Local and in
+   Cloud; the header below it (window y 31..122, logo area included) is a normal page area, as in
+   released 1.0.26, so the pill, the header buttons and the site's top bar always receive their
+   clicks. The class name keeps its history: today it carries only this rule and the narrow-window
+   inset above. Owner-ordered 2026-11-25. */
+.f127-header-drag { -webkit-app-region: no-drag; }
+
+/* D-29 SWEEP (repair-order-127, Amendment 5 P3) — the same bug class OUTSIDE the header. A
+   full-window overlay does not cut the drag area of the page underneath it, so wherever a
+   modal card rode into the top 122 px its rows there answered like a drag bar and the click
+   was swallowed — measured: the Settings and Preview close buttons, all of Quick Jump. Everything
+   inside a z-indexed full-window overlay is a click target, never a drag handle. The overlay's
+   own backdrop is NOT touched, so the band and the header stay draggable around a card; a
+   nested full-window overlay is left to the first selector as an overlay in its own right.
+   The app shell wrapper (App.tsx — no z class) is not an overlay and is not matched. */
+.fixed.inset-0[class*="z-"] > :not(.fixed.inset-0),
+.fixed.inset-0[class*="z-"] > :not(.fixed.inset-0) * { -webkit-app-region: no-drag; }
+/* Quick Jump is portaled outside the header and opens at the pointer: with the pointer resting
+   on a header button its box opens INSIDE the top 122 px, where its field was a drag-bar click. */
+.fixed[role="search"],
+.fixed[role="search"] * { -webkit-app-region: no-drag; }

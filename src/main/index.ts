@@ -19,7 +19,7 @@ import { VaultManager } from './vault/vault.ts';
 // Round 107 battery (§8.3) — the f_t107_* legs read REAL records main-side; the ride-keys
 // helper types its parameter with the record type itself.
 import type { VaultDropRecord } from './vault/vaultTypes.ts';
-import { initCloud, attachCloudResizeTracking, wireHtmlFullscreen, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_ROOM_PAD_X, CLOUD_ORIGIN, CAPTURE_DEADLINE_MS, ENTRY_CONNECT_TIMEOUT_MS, STATUS_TOP, STATUS_H, CLOUD_URL, type CloudController } from './cloud';
+import { initCloud, attachCloudResizeTracking, wireHtmlFullscreen, PILL_TOP, PILL_W, PILL_H, PILL_B_REST_W, PILL_BLOOM_PAD_X, PILL_BLOOM_PAD_Y, PILL_A_ROOM_PAD_X, CLOUD_ORIGIN, CAPTURE_DEADLINE_MS, TOP_BAND_H, ENTRY_CONNECT_TIMEOUT_MS, STATUS_TOP, STATUS_H, CLOUD_URL, type CloudController } from './cloud';
 import { attachContextMenu } from './contextMenu';
 // Round 111 §8 DEV battery — the f_29_* legs assert the builder's pure menu shape and the
 // attach-map state (main-side seams; the menu is OUR native UI, so no page-side probe exists).
@@ -105,15 +105,40 @@ const currentTheme = (): 'light' | 'dark' | 'minimal' => {
   try { return manager.getSettings().theme; } catch { return 'light'; }
 };
 // PACKAGING-1 FIX A — the window shell follows the app's theme (owner decision §3.4): the
-// frame stays NATIVE (never frame:false / titleBarStyle) but Windows tints it from
-// nativeTheme. The app theme maps onto themeSource (dark → 'dark'; light/minimal → 'light') —
-// minimal is a light-family theme — assigned ONLY when the value would change (idempotent;
-// themeSource is app-global). Wired at every seam where the main process learns the theme:
-// the vault:settingsSet write path, app boot, vault:unlock, and the pre-unlock localStorage
-// fallback in createWindow.
+// nativeTheme source still maps dark → 'dark', light/minimal → 'light' (minimal is a light-family
+// theme), assigned ONLY when the value would change (idempotent; themeSource is app-global).
+//
+// ROUND 127 (repair-order-127 §4 B1; owner decision 2026-11-20) — SUPERSEDES THE OLD "frame stays
+// NATIVE (never frame:false / titleBarStyle)" line. The native caption strip painted ON TOP of
+// everything we draw (Win10 offers no exact caption-color API), so it is REMOVED: createWindow
+// passes titleBarStyle:'hidden' and titleBarOverlay paints the THREE REAL Windows buttons at the
+// top-right of our own content surface. Phase A measured that strip as BUTTONS-ONLY (137×30 at
+// 100% DPI), never full-width, and proved the DEFAULT glyph color is BLACK - hence every pair
+// below sets symbolColor explicitly (dark uses the white/#EDEDED family).
+//
+// CORRECTION 2 / D-4 (owner ask: glyphs visible, button BACKDROP gone): the aside probe proved
+// `color: 'transparent'` is ignored on Win10 (a default gray box is drawn), but the 8-digit
+// `#00000000` renders CLEANLY in both Local and Cloud — glyphs only, no box. ADOPTED globally.
+// The overlay color is therefore a fixed transparent value; symbolColor is the only live pair.
+const FRAME_OVERLAY: Record<'light' | 'dark' | 'minimal', { color: string; symbolColor: string }> = {
+  // OWNER LOCK (final): the band is permanently #0D0D0D in BOTH modes and glyphs are always
+  // light, so switching theme changes NOTHING in the top section — no repaint, no lag.
+  light: { color: '#00000000', symbolColor: '#EDEDED' },
+  dark: { color: '#00000000', symbolColor: '#EDEDED' },
+  minimal: { color: '#00000000', symbolColor: '#EDEDED' },
+};
+const frameOverlayFor = (theme: 'light' | 'dark' | 'minimal'): { color: string; symbolColor: string } =>
+  FRAME_OVERLAY[theme] ?? FRAME_OVERLAY.light;
 const applyFrameTheme = (theme: 'light' | 'dark' | 'minimal'): void => {
   const source: 'dark' | 'light' = theme === 'dark' ? 'dark' : 'light';
   if (nativeTheme.themeSource !== source) nativeTheme.themeSource = source;
+  // Same overlay pair, same seams as the themeSource write (settingsSet, boot, unlock,
+  // pre-unlock fallback). Idempotent: Electron no-ops an identical setTitleBarOverlay.
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setTitleBarOverlay(frameOverlayFor(theme));
+  } catch { /* overlay is best-effort on shells without WCO */ }
+  // FINAL - the band is permanently dark and the glyphs fixed; no top-edge sampling exists.
+  cloudCtl?.refreshTheme?.(); // FINAL FIX — repaints the NATIVE band on a Local theme switch
 };
 
 // 1.0.5 FIX B — THE YOUTUBE REFERER STAMP. A file:// page (the packaged renderer's origin)
@@ -216,6 +241,8 @@ function createWindow(): void {
     minHeight: 640,
     show: false,
     backgroundColor: '#FAF7F2',
+    titleBarStyle: 'hidden',
+    titleBarOverlay: frameOverlayFor(currentTheme()),
     title: 'DropSync',
     webPreferences: {
       preload: join(fileURLToPath(new URL('.', import.meta.url)), '../preload/index.cjs'),
@@ -271,7 +298,10 @@ function createWindow(): void {
   // again: drain oldest-first, OVERLAY only (native already shown once at fire time); the
   // serial card pump provides the ≥NEXT_GAP_MS spacing between the greeting cards.
   // C2k — each drained card is dressed at flush time in the CURRENT theme.
-  mainWindow.on('focus', () => { cloudCtl?.drainMissed(currentTheme()); });
+  mainWindow.on('focus', () => {
+    cloudCtl?.drainMissed(currentTheme());
+    cloudCtl?.assertPillPriority(); // D-25 seam: main-window focus / modal focus changes
+  });
   // C2f FIX 2 — the pill must show the app's ACTUAL boot mode (relaunch starts Local; the
   // renderer's boot-into-last-mode may immediately flip it via mode:set). Queued until the
   // pill layer finishes loading; delivered automatically.
@@ -8566,12 +8596,17 @@ function registerIpc(): void {
   let dropListCallCount = 0;
 
   // ---- vault lifecycle
-  handle('vault:create', (_e, folder: string, password: string) => manager.create(folder, password));
+  handle('vault:create', async (_e, folder: string, password: string) => {
+    const created = await manager.create(folder, password);
+    cloudCtl?.assertPillPriority(); // D-25 seam: vault create (unlocks)
+    return created;
+  });
   handle('vault:unlock', async (_e, folder: string, password: string) => {
     await manager.unlock(folder, password);
     // PACKAGING-1 FIX A — main can only read settings AFTER unlock (assertUnlocked-guarded):
     // this is the moment a locked boot's 'light' fallback gets corrected for real.
     applyFrameTheme(manager.getSettings().theme);
+    cloudCtl?.assertPillPriority(); // D-25 seam: vault unlock
     await recoverInterruptedImport(manager); // kill-during-import rollback on next unlock
     return manager.status();
   });
@@ -8634,7 +8669,12 @@ function registerIpc(): void {
         if (next === 'local') {
           png = cloudCtl ? await withTimeout(cloudCtl.captureViewPng(), CAPTURE_DEADLINE_MS) : null;
         } else if (mainWindow && !mainWindow.isDestroyed()) {
-          const image = await withTimeout(mainWindow.webContents.capturePage(), CAPTURE_DEADLINE_MS);
+          // FLIP FIX — the fader is inset by TOP_BAND_H (siteBounds), so capture ONLY the
+          // content below the permanent band. A full-window capture displayed in the inset
+          // fader was vertically squashed → the outgoing frame shifted and blurred for ~250 ms.
+          const cb = cloudCtl?.stableBounds() ?? mainWindow.getContentBounds();
+          const rect = { x: 0, y: TOP_BAND_H, width: cb.width, height: Math.max(1, cb.height - TOP_BAND_H) };
+          const image = await withTimeout(mainWindow.webContents.capturePage(rect), CAPTURE_DEADLINE_MS);
           png = !image || image.isEmpty() ? null : `data:image/png;base64,${image.toPNG().toString('base64')}`;
         }
       } catch {
@@ -8728,7 +8768,7 @@ function registerIpc(): void {
     cloudCtl?.beginPillFlip();
     console.log('[pill] flip requested →', next);
     mainWindow.webContents.send('pill:flipRequested', next);
-    cloudCtl?.blurPill();
+    cloudCtl?.assertPillPriority(); // D-25 seam: pill flip (no main-renderer focus grab)
   };
   ipcMain.on('pill:flip', (_e, next: 'cloud' | 'local') => {
     if (next !== 'cloud' && next !== 'local') return;
@@ -9222,3 +9262,4 @@ function registerIpc(): void {
     });
   }
 }
+
