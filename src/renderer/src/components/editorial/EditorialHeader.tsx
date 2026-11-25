@@ -54,7 +54,7 @@ export function EditorialHeader({
   const tc = getEditorialThemeColors(theme);
 
   return (
-    <header className={`${tc.bg} border-b ${tc.border} relative z-40 shrink-0 transition-colors duration-500`}>
+    <header className={`${tc.bg} border-b ${tc.border} relative z-40 shrink-0 f127-header-drag`}>
       <div className="flex items-center justify-between transition-all duration-[350ms] ease-[cubic-bezier(0.4,0,0.2,1)] px-4 sm:px-6 py-4 lg:py-6 lg:pl-[var(--nav-pl)] lg:pr-[var(--nav-pr)] [--nav-pl:80px] [--nav-pr:80px] wide:[--nav-pl:120px] wide:[--nav-pr:140px]">
         {/* Left: Logo */}
         <div className="flex items-center gap-2.5 transition-all duration-[350ms] ease-[cubic-bezier(0.4,0,0.2,1)]">

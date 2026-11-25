@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>DropSync Grab Strip</title>
+    <!-- FINAL - the page of the permanent full-width top band (31 px). It only relays
+         pointerdown/up to main drag loop; the band is painted BAND_COLOR by main.
+         Strict local-only CSP, same posture as pill.html; the site is never touched (I1). -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'none'; connect-src 'none'"
+    />
+    <style>
+      html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+      #grab { position: fixed; inset: 0; width: 100%; height: 100%; background: transparent; }
+    </style>
+  </head>
+  <body>
+    <div id="grab" tabindex="-1"></div>
+    <script type="module" src="./grabstrip.ts"></script>
+  </body>
+</html>

@@ -14,6 +14,7 @@ export default defineConfig({
     // C2m: FOUR — the flip-dissolve fader layer joins with the same least-privilege shape.
     // C3: FIVE — the status layer (chip + offline veil) joins with the same least-privilege shape.
     // PAC-2: SIX — the share picker joins with the same least-privilege shape.
+    // R127: SEVEN — the grab-strip layer joins with the same least-privilege shape.
     plugins: [externalizeDepsPlugin()],
     build: {
       rollupOptions: {
@@ -24,6 +25,7 @@ export default defineConfig({
           faderPreload: resolve(__dirname, 'src/renderer/fader/faderPreload.ts'),
           statusPreload: resolve(__dirname, 'src/renderer/status/statusPreload.ts'),
           pickerPreload: resolve(__dirname, 'src/renderer/picker/pickerPreload.ts'),
+          grabstripPreload: resolve(__dirname, 'src/renderer/grabstrip/grabstripPreload.ts'),
         },
         output: {
           entryFileNames: '[name].cjs',
@@ -45,6 +47,7 @@ export default defineConfig({
     // C3: FIVE — the status layer page (chip + offline veil; zero remote assets; local css/ts only).
     // PAC-2: SIX — the share picker page (zero remote assets; local css/ts only; img-src data:
     // for the capturer thumbnails).
+    // R127: SEVEN — the grab-strip layer joins with the same least-privilege shape.
     build: {
       rollupOptions: {
         input: {
@@ -54,6 +57,7 @@ export default defineConfig({
           fader: resolve(__dirname, 'src/renderer/fader/fader.html'),
           status: resolve(__dirname, 'src/renderer/status/status.html'),
           picker: resolve(__dirname, 'src/renderer/picker/picker.html'),
+          grabstrip: resolve(__dirname, 'src/renderer/grabstrip/grabstrip.html'),
         },
       },
     },

@@ -850,7 +850,9 @@ function AppBody({ updateInfo, localKeyboardActive }: { updateInfo: { current: s
     // Round 118 hotfix-2 — the pre-unlock update sign needs this branch to carry its OWN
     // modal mount: the post-unlock tree below never renders in this state.
     return (
-      <>
+      <div className={`min-h-screen ${tc.bg} f127-local-root`}>
+        {/* FINAL FIX — invisible drag band inside the themed padding (header-less screens). */}
+        <div className="f127-drag-band" data-f127="drag-band" />
         {status === 'none' ? (
           <FirstRunSetup
             theme={theme}
@@ -890,13 +892,16 @@ function AppBody({ updateInfo, localKeyboardActive }: { updateInfo: { current: s
             onClose={() => setShowUpdate(false)}
           />
         )}
-      </>
+      </div>
     );
   }
 
   return (
-    <div className={`relative flex h-[100dvh] flex-col overflow-x-hidden ${tc.bg} transition-colors duration-500`}>
-      {/* Round 119 — Quick Jump (hotkey search bar; see component header). Mounted only
+    <div className={`relative flex h-[100dvh] flex-col overflow-x-hidden ${tc.bg} f127-local-root`}>
+      {/* FINAL FIX — the drag band lives inside the themed padding; the pill starts below it (y=41)
+          so its clicks are never swallowed by the app-region drag surface. */}
+      <div className="f127-drag-band" data-f127="drag-band" />
+      {/* Round 119 - Quick Jump (hotkey search bar; see component header). Mounted only
           while Local is the live screen with no transition in flight; its own `blocked`
           prop covers every overlay state. */}
       {localKeyboardActive && (
@@ -1157,3 +1162,6 @@ function AppBody({ updateInfo, localKeyboardActive }: { updateInfo: { current: s
     </div>
   );
 }
+
+
+

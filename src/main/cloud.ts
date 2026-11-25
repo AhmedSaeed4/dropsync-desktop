@@ -28,7 +28,7 @@
  *   aware width, always), with the 0/100/400 ms deferred re-apply on geometry events.
  */
 
-import { BrowserWindow, app, desktopCapturer, net, session, shell, WebContentsView } from 'electron';
+import { BrowserWindow, app, desktopCapturer, ipcMain, net, screen, session, shell, WebContentsView } from 'electron';
 import { join } from 'node:path';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -67,6 +67,16 @@ export const PILL_W = 112;
 export const PILL_H = 28;
 export const PILL_TOP = 10;
 export const PILL_B_REST_W = 28;
+
+/** FINAL - the ONE top-band constant (measured WCO titlebar area, 100% DPI). Every geometry
+ * site reads this constant. The native panel stays removed; OUR band is a single full-width
+ * native view at y=0, permanently painted BAND_COLOR in both modes. Local pads its root by
+ * the same height and Cloud insets its site below it, so both keep the original geometry.
+ * Fullscreen zeroes the offset and hides the band. */
+export const TOP_BAND_H = 31;
+/** OWNER LOCK (final): the top band is PERMANENTLY this colour — the exact dark-theme value,
+ * not pure black. It never follows the app theme, so a theme switch causes ZERO repaint there. */
+export const BAND_COLOR = '#0D0D0D';
 
 /** C2j — the reminder CARD layer (LEG 2): a THIRD trusted local view, sibling of the pill.
  * A due reminder must be IMPOSSIBLE to miss, so it floats over WHICHEVER world is on screen
@@ -228,6 +238,11 @@ export interface CloudController {
   /** C2d self-heal, generalized (FIX 1): re-assert the site view bounds (true full window
    * {0,0,w,h}) AND the pill overlay bounds (C2g: top-center) — idempotent, no focus steal. */
   syncBounds(): void;
+  /** D-27 - stable (maximized-safe) content bounds for the main-process capture crop. */
+  stableBounds(): Electron.Rectangle;
+  /** Called on every theme write. The band is permanently dark and the glyphs are fixed, so
+   * only the Local-side overlay needs re-asserting; no sampling or repaint happens in Cloud. */
+  refreshTheme(): void;
   /** C2f FIX 2 — tell the pill layer which mode the app is actually in (knob slides only on
    * this). Queued until the pill layer finishes loading; safe to call at any time. */
   setPillMode(mode: PillMode): void;
@@ -247,8 +262,9 @@ export interface CloudController {
   /** C2g-hotfix-1 §5 — tail of the pill layer's own console (ring buffer, last 50 lines) so the
    * battery can prove no runtime errors during load/clicks. */
   pillConsoleTail(): string[];
-  /** C2f FIX 1 — focus hygiene: give keyboard focus back after a pill click handled a flip. */
-  blurPill(): void;
+  /** D-25 - idempotent pill-priority assertion: re-add the pill as the topmost child view.
+   * NEVER calls a main-renderer focus() - that is the proven hit-test poison. */
+  assertPillPriority(): void;
   /** Probe data for DROPSYNC_CLOUD_DEV: did-finish-load latency for the site origin, if loaded. */
   probeState(): { readyMs: number | null; url: string | null };
   /** f_c1_isolationGuard — evaluate INSIDE the cloud contents (I1: no bridge may exist), now
@@ -715,6 +731,14 @@ function pillPageUrl(style: PillStyle): string {
   return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/pill/pill.html') + suffix;
 }
 
+/** FINAL - where the band page lives (cloned from pillPageUrl): dev server in dev, built
+ * multi-page output in production. The page only relays pointerdown/up over IPC for the drag. */
+function grabStripPageUrl(): string {
+  const devRoot = process.env.ELECTRON_RENDERER_URL;
+  if (devRoot) return `${devRoot}/grabstrip/grabstrip.html`;
+  return 'file://' + join(fileURLToPath(new URL('.', import.meta.url)), '../renderer/grabstrip/grabstrip.html');
+}
+
 /** C2j — where the CARD page lives (cloned from pillPageUrl): dev server in dev, built
  * multi-page output in production. No query params — the card carries no persisted state. */
 function cardPageUrl(): string {
@@ -777,6 +801,11 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   // nothing resizes at runtime, so there is nothing to arm, hold, or cancel.
   let pillStyle: PillStyle = loadPillStyle();
   const pillConsole: string[] = []; // C2g-hotfix-1 §5 — layer console ring buffer
+  // FINAL FIX — ONE full-width top band (repurposed grabstrip layer): painted by main, drag
+  // surface across the whole band; visible in both modes, hidden only in fullscreen.
+  let bandView: WebContentsView | null = null;
+  let bandDrag: { timer: ReturnType<typeof setInterval>; last: { x: number; y: number } } | null = null;
+  let fullscreenActive = false;
   // C2m — the fader layer is created EAGERLY at boot (card recipe) and NEVER removed; it is
   // collapsed 0×0 + hidden at rest, so it paints nothing and catches nothing until a melt.
   let faderView: WebContentsView | null = null;
@@ -892,11 +921,25 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     }
   };
 
-  /** C2d self-heal, generalized (FIX 1): the site view is TRUE FULL WINDOW {0,0,w,h}; the pill
-   * is glued TOP-CENTER (C2g). Pure functions of the window. */
+  /** FINAL FIX — the single offset used by EVERY geometry site; zeroed in fullscreen. */
+  const bandOffset = (): number => fullscreenActive ? 0 : TOP_BAND_H;
+
+  /** D-27 FIX 1 - STABLE geometry source. In maximized state Electron's getContentBounds()
+   * alternates between the restored 1440-wide size and the 1920 work area, which made every
+   * view teleport; use the work area of the display the window is currently on instead. */
+  const stableBounds = (): Electron.Rectangle => {
+    if (!mainWindow.isDestroyed() && mainWindow.isMaximized()) {
+      const wa = screen.getDisplayMatching(mainWindow.getBounds()).workArea;
+      return { x: wa.x, y: wa.y, width: wa.width, height: wa.height };
+    }
+    return mainWindow.getContentBounds();
+  };
+
+  /** FINAL - the site is inset below the permanent band, so its content keeps the original
+   * on-screen position and height in both modes. */
   const siteBounds = (): Electron.Rectangle => {
-    const b = mainWindow.getContentBounds();
-    return { x: 0, y: 0, width: b.width, height: b.height };
+    const b = stableBounds();
+    return { x: 0, y: bandOffset(), width: b.width, height: b.height - bandOffset() };
   };
   // PAC-5 — PERMANENT STAGES. The room is sized once per style and NEVER changes at runtime:
   // no width/height swaps, no origin moves — the twitch mechanism's required ingredient is
@@ -916,19 +959,26 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   // syncBounds, the 1 s watchdog and every resize/fullscreen handler read bounds through
   // here, so they all inherit the room (they become trivial re-asserts).
   const pillBounds = (): Electron.Rectangle => {
-    const b = mainWindow.getContentBounds();
+    const b = stableBounds();
     if (pillStyle === 'A') {
       const w = PILL_W + PILL_A_ROOM_PAD_X * 2; // 140
-      return { x: Math.round((b.width - w) / 2), y: PILL_TOP, width: w, height: PILL_H };
+      return { x: Math.round((b.width - w) / 2), y: PILL_TOP + bandOffset(), width: w, height: PILL_H };
     }
     const w = PILL_W + PILL_BLOOM_PAD_X * 2; // 132
     const h = PILL_H + PILL_BLOOM_PAD_Y * 2; // 44
     return {
       x: Math.round((b.width - w) / 2),
-      y: PILL_TOP - PILL_BLOOM_PAD_Y, // 2
+      y: PILL_TOP - PILL_BLOOM_PAD_Y + bandOffset(), // 2 + band; the pill now starts BELOW the drag band
       width: w,
       height: h,
     };
+  };
+
+  /** FINAL - ONE full-width band at y=0..TOP_BAND_H, painted permanently BAND_COLOR by main.
+   * The pill starts below it, so there is no hole and no overlap with the Local drag region. */
+  const cloudBandBounds = (): Electron.Rectangle => {
+    const b = stableBounds();
+    return { x: 0, y: 0, width: b.width, height: TOP_BAND_H };
   };
 
   /** Idempotent bounds assertion: writes (and logs) ONLY on real drift, so the resize handlers,
@@ -960,6 +1010,16 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       if (cur.x !== expected.x || cur.y !== expected.y || cur.width !== expected.width || cur.height !== expected.height) {
         pillView.setBounds(expected);
         console.log('[pill] bounds set', JSON.stringify({ from: cur, to: expected }));
+      }
+    }
+    // FINAL - the band rides the SAME idempotent 'move' -> syncBounds path as the pill (F6).
+    // R126 guard above is UNTOUCHED; the extra degenerate-width skip is band-only (minWidth 1024).
+    if (bandView && stableBounds().width >= 64) {
+      const expected = cloudBandBounds();
+      const cur = bandView.getBounds();
+      if (cur.x !== expected.x || cur.y !== expected.y || cur.width !== expected.width || cur.height !== expected.height) {
+        bandView.setBounds(expected);
+        console.log('[cloud-band] bounds set', JSON.stringify({ from: cur, to: expected }));
       }
     }
     // C2j — the card layer joins the self-heal: card rect while a card shows, collapsed 0×0
@@ -1031,7 +1091,101 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     return pillView;
   };
 
-  const setPillMode = (mode: PillMode): void => {
+  // ==== FINAL - ONE FULL-WIDTH PERMANENT TOP BAND ========================================
+  /** Eager sibling of the pill. Main paints it permanently BAND_COLOR; the site view is never
+   * styled, injected, or scripted (I1). The whole band is the drag surface. Never calls focus(). */
+  const ensureCloudBand = (): void => {
+    if (bandView || mainWindow.isDestroyed()) return;
+    const v = new WebContentsView({
+      webPreferences: {
+        preload: join(fileURLToPath(new URL('.', import.meta.url)), '../preload/grabstripPreload.cjs'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+    v.setBackgroundColor(themeBandColor(currentTheme?.()));
+    v.setVisible(bandShouldShow()); // visible in both modes; hidden only in fullscreen
+    v.webContents.on('console-message', (_e, _level, message) => console.log('[cloud-band]', message));
+    void v.webContents.loadURL(grabStripPageUrl());
+    v.setBounds(cloudBandBounds());
+    mainWindow.contentView.addChildView(v);
+    bandView = v;
+    console.log('[cloud-band] booted (full-width, h=' + TOP_BAND_H + ', color=' + BAND_COLOR + ')');
+  };
+
+  /** BRAND FIX — the band stays visible in BOTH modes so the brand is painted by ONE surface
+   * (the native band view) and renders pixel-identically after a Local↔Cloud switch. Its colour
+   * is permanent #0D0D0D, so nothing changes on a theme switch; it hides only in fullscreen. */
+  const bandShouldShow = (): boolean =>
+    !mainWindow.isDestroyed() && !mainWindow.isFullScreen();
+  const setBandVisible = (): void => {
+    if (bandView && !mainWindow.isDestroyed()) bandView.setVisible(bandShouldShow());
+  };
+  const raiseBand = (): void => {
+    if (!bandView || mainWindow.isDestroyed()) return;
+    mainWindow.contentView.removeChildView(bandView);
+    mainWindow.contentView.addChildView(bandView);
+  };
+
+  /** Manual drag over the whole band; DIP cursor deltas at <=16 ms, re-glue via move→syncBounds. */
+  const endBandDrag = (): void => {
+    if (!bandDrag) return;
+    clearInterval(bandDrag.timer);
+    bandDrag = null;
+    console.log('[cloud-band] drag ended');
+  };
+  const startBandDrag = (): void => {
+    if (bandDrag || !bandShouldShow()) return;
+    const p = screen.getCursorScreenPoint();
+    let last = { x: p.x, y: p.y };
+    const timer = setInterval(() => {
+      if (mainWindow.isDestroyed() || !bandDrag) { endBandDrag(); return; }
+      const now = screen.getCursorScreenPoint();
+      const dx = now.x - last.x, dy = now.y - last.y;
+      last = { x: now.x, y: now.y };
+      if (dx === 0 && dy === 0) return;
+      const b = mainWindow.getBounds();
+      mainWindow.setPosition(Math.round(b.x + dx), Math.round(b.y + dy));
+    }, 16);
+    bandDrag = { timer, last };
+    console.log('[cloud-band] drag started');
+  };
+
+  /** Opaque band paint for the active theme (Local + fail-open); glyph backdrop stays #00000000. */
+  const themeBandColor = (_t?: unknown): string => BAND_COLOR;
+  const frameOverlayFor = (_t?: unknown): { color: string; symbolColor: string } =>
+    ({ color: '#00000000', symbolColor: '#EDEDED' }); // light glyphs on the permanent dark band
+  const applyThemeOverlay = (): void => {
+    if (mainWindow.isDestroyed()) return;
+    const pair = frameOverlayFor(currentTheme?.());
+    try { mainWindow.setTitleBarOverlay(pair); } catch { /* best-effort */ }
+    try { bandView?.setBackgroundColor(themeBandColor(currentTheme?.())); } catch { /* best-effort */ }
+    console.log('[cloud-band] overlay', JSON.stringify(pair));
+  };
+
+  const onBandDown = (): void => { if (bandShouldShow()) startBandDrag(); };
+  const onBandUp = (): void => endBandDrag();
+  ipcMain.on('grabstrip:down', onBandDown);
+  ipcMain.on('grabstrip:up', onBandUp);
+  ipcMain.on('grabstrip:cancel', onBandUp);
+  mainWindow.on('enter-full-screen', () => {
+    fullscreenActive = true; endBandDrag(); setBandVisible(); syncBounds(); assertPillPriority();
+  });
+  mainWindow.on('leave-full-screen', () => {
+    fullscreenActive = false; setBandVisible(); syncBounds(); assertPillPriority();
+  });
+  // D-25 - window-level seams that can change child-view Z priority.
+  mainWindow.on('show', () => assertPillPriority());
+  mainWindow.on('restore', () => assertPillPriority());
+  mainWindow.once('closed', () => {
+    endBandDrag();
+    ipcMain.removeListener('grabstrip:down', onBandDown);
+    ipcMain.removeListener('grabstrip:up', onBandUp);
+    ipcMain.removeListener('grabstrip:cancel', onBandUp);
+  });
+
+const setPillMode = (mode: PillMode): void => {
     if (!pillView) ensurePill();
     if (!pillLoaded) {
       pillModeQueued = mode; // delivered on did-finish-load
@@ -1075,15 +1229,18 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     if (pillView && pillLoaded) pillView.webContents.send('pill:styleChanged', pillStyle);
   };
 
-  const blurPill = (): void => {
-    // WebContents has no blur(); handing focus back to the window's own contents is the
-    // equivalent move — keyboard returns to wherever the user was (site view or Local DOM).
-    try {
-      if (!mainWindow.isDestroyed()) mainWindow.webContents.focus();
-    } catch { /* window gone — nothing to hand focus back to */ }
+  /** D-25 - ONE idempotent pill-priority mechanism. For a WebContentsView, topmost means
+   * last in contentView.children: re-add the pill LAST only when it is not already last.
+   * No focus() call, ever - the old blurPill focus grab raised the main renderer over it. */
+  const assertPillPriority = (): void => {
+    if (mainWindow.isDestroyed() || !pillView) return;
+    // ALWAYS force the re-add. Electron's contentView.children can still report the pill as
+    // last while the native child HWND Z-order has been changed by a renderer focus/raise
+    // (measurably the case right after unlock) - a conditional early-return is NOT sufficient.
+    restackAll(); // site < band < fader < card < status < pill
   };
 
-  // ==== C2j — the reminder CARD layer (LEG 2) ===============================================
+  // ==== C2j - the reminder CARD layer (LEG 2) ===============================================
   // Third trusted local view — the pill's boot recipe mirrored exactly: EAGER creation at init
   // (never removed in normal operation), transparent background, sandboxed local page with the
   // same lockdown, DIP bounds math from getContentBounds, idempotent watchdog discipline.
@@ -1116,12 +1273,12 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
 
   /** Top-right anchor, DIP math like pillBounds(): x = contentW − CARD_W − CARD_RIGHT. */
   const cardBounds = (): Electron.Rectangle => {
-    const b = mainWindow.getContentBounds();
-    return { x: Math.round(b.width - CARD_W - CARD_RIGHT), y: CARD_TOP, width: CARD_W, height: CARD_H };
+    const b = stableBounds();
+    return { x: Math.round(b.width - CARD_W - CARD_RIGHT), y: CARD_TOP + bandOffset(), width: CARD_W, height: CARD_H };
   };
   /** Zero-footprint rest state: 0×0 at the same anchor corner (pill zero-miss discipline). */
   const cardCollapsedBounds = (): Electron.Rectangle => {
-    const b = mainWindow.getContentBounds();
+    const b = stableBounds();
     return { x: Math.round(b.width - CARD_W - CARD_RIGHT), y: CARD_TOP, width: 0, height: 0 };
   };
 
@@ -1416,11 +1573,11 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   /** Chip room: horizontally centered, y = STATUS_TOP, MEASURED width clamped to ≤60% of
    * the window, height exactly STATUS_H (D1). Zero-miss: the room equals the visible chip. */
   const statusChipBounds = (): Electron.Rectangle => {
-    const b = mainWindow.getContentBounds();
+    const b = stableBounds();
     const maxW = Math.max(1, Math.round(b.width * 0.6));
     const natural = statusLastMeasure > 0 ? statusLastMeasure : 240; // provisional until the first measure lands
     const w = Math.min(natural, maxW);
-    return { x: Math.round((b.width - w) / 2), y: STATUS_TOP, width: w, height: STATUS_H };
+    return { x: Math.round((b.width - w) / 2), y: STATUS_TOP + bandOffset(), width: w, height: STATUS_H };
   };
   /** The veil room: the FULL content area (it covers the dead site — intended, §5). */
   const statusVeilBounds = (): Electron.Rectangle => siteBounds();
@@ -1470,6 +1627,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   /** C3 — the FULL z-law re-assertion (site < fader < card < status < pill), used at boot,
    * in show(), and in beginMelt's raise chain (replaces the individual raise* calls). */
   const restackAll = (): void => {
+    raiseBand(); // FINAL: site < band < fader < card < status < pill
     raiseFader();
     raiseCard();
     raiseStatus();
@@ -2213,8 +2371,8 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     });
     // Center on the parent's CONTENT bounds (not the screen), load, and show on the page's
     // picker:ready handshake — it never flashes empty.
-    const b = mainWindow.getContentBounds();
-    pickerWin.setPosition(b.x + Math.round((b.width - 720) / 2), b.y + Math.round((b.height - 540) / 2));
+    const b = stableBounds();
+    pickerWin.setPosition(b.x + Math.round((b.width - 720) / 2), b.y + bandOffset() + Math.round((b.height - bandOffset() - 540) / 2));
     void pickerWin.loadURL(pickerPageUrl());
     pickerLog('open:', pickerPayload.sources.length, 'sources; canLoopback', pickerCanLoopback);
   };
@@ -2367,7 +2525,11 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     if (mainWindow.isDestroyed()) return;
     if (mainWindow.isFullScreen()) {
       console.log('[fullscreen] mode-flip safety exit (' + why + ')');
+      endBandDrag(); // FINAL - a flip can never leave a drag loop running
+      fullscreenActive = false;
       mainWindow.setFullScreen(false);
+      setBandVisible(); // the leave event restores this from `shown`, not from a stale flag
+      syncBounds(); // FINAL - offsets come back on the safety exit too
     }
     void mainWindow.webContents
       .executeJavaScript('try { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); } catch {}')
@@ -2401,8 +2563,11 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
       // ONE restack covers fader → card → status → pill; no call site can forget a layer).
       restackAll();
     }
+    ensureCloudBand(); // FINAL - created eagerly with the pill; idempotent on every entry
     syncBounds();
     v.setVisible(true);
+    setBandVisible(); // FINAL - band visible in both modes (hidden only in fullscreen)
+    assertPillPriority(); // D-25 seam: mode flip to Cloud
     v.webContents.focus();
     armOfflinePoll(); // cloud shown ⇒ the degraded-outage poll may be needed
     armReachProbe(); // PAC-2 FIX D — cloud shown and (below) presentation quiet ⇒ the knock listens
@@ -2410,12 +2575,20 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
 
   const hide = (): void => {
     endFullscreenIfActive('cloud hide');
+    endBandDrag(); // FINAL - a hidden band can never keep dragging the window
     if (view && shown) {
       mainWindow.contentView.removeChildView(view);
       shown = false;
     }
-    // The pill is NEVER removed (C2f contract) — it keeps floating over Local too.
-    if (mainWindow.isFocused()) mainWindow.webContents.focus();
+    setBandVisible(); // FINAL - band stays visible in Local; only fullscreen hides it
+    applyThemeOverlay(); // FINAL - re-assert the fixed glyph pair (band paint never changes)
+    syncBounds(); // FINAL - restore the +TOP_BAND_H offsets for the Local-side overlays
+    assertPillPriority(); // D-25 seam: mode flip back to Local
+                  // otherwise left the Local renderer above the pill and swallowed its clicks
+    // The pill is NEVER removed (C2f contract) - it keeps floating over Local too.
+    // FINAL FIX — DO NOT focus the main renderer here. Doing so made the main web contents win
+    // hit-testing over the pill after a Cloud→Local switch, so every pill click was swallowed.
+    // Keyboard focus returns naturally; the native pill view stays the topmost hit target.
     armOfflinePoll(); // cloud hidden ⇒ the poll is only needed while a non-OK state lingers
     armReachProbe(); // PAC-2 FIX D — cloud hidden ⇒ the knock disarms (nothing to protect)
   };
@@ -2426,6 +2599,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   const boundsWatchdog = setInterval(() => {
     if (mainWindow.isDestroyed()) return;
     syncBounds();
+    assertPillPriority(); // D-25 - covers renderer-side seams (unlock/modals) within <=1 s
   }, 1000);
   mainWindow.once('closed', () => clearInterval(boundsWatchdog));
 
@@ -2434,13 +2608,15 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
     hide,
     isVisible: () => shown,
     syncBounds,
+    stableBounds,
+    refreshTheme: (): void => { if (!shown) applyThemeOverlay(); },
     setPillMode,
     setPillBloom,
     beginPillFlip,
     setPillStyle,
     resyncPill,
     pillConsoleTail: () => [...pillConsole],
-    blurPill,
+    assertPillPriority,
     probeState: () => ({ readyMs, url: view ? CLOUD_URL : null }),
     probeIsolation: async () => {
       if (!view || !pillView || !cardView || !faderView || !statusView) {
@@ -2930,6 +3106,7 @@ export function initCloud(mainWindow: BrowserWindow, opts?: {
   ensureCard();
   ensureStatus();
   ensurePill();
+  ensureCloudBand(); // FINAL - the full-width band is an eager sibling of the pill
   restackAll(); // belt-and-braces: the law is asserted, not assumed, at boot
   console.log('[fader] layer booted (eager, collapsed 0×0, hidden)'); // C2m boot evidence
   console.log('[status] layer booted (eager, collapsed 0×0, hidden)'); // C3 boot evidence
@@ -2946,6 +3123,8 @@ export function attachCloudResizeTracking(
 ): void {
   const handler = (): void => {
     controller.syncBounds();
+    controller.assertPillPriority(); // D-25 - move/resize/maximize/minimize-restore seam
+
     setTimeout(() => controller.syncBounds(), 100);
     setTimeout(() => controller.syncBounds(), 400);
   };
@@ -2957,3 +3136,8 @@ export function attachCloudResizeTracking(
   mainWindow.on('move', handler); // the pill is center-anchored in WINDOW coords — moves are
   // free, but the deferred re-assert costs nothing and proves the glue under any WM weirdness.
 }
+
+
+
+
+
